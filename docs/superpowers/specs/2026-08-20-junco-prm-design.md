@@ -3,6 +3,7 @@
 - Date: 2026-08-20
 - Status: draft, under review. Nothing is implemented.
 - Revised 2026-08-20, twice: first to record the three answers from Matt's review, then again after a four-agent independent review of the spec. The second pass reversed the two-provider decision, deleted the identity-echo mechanism, corrected several platform facts, and rewrote the data model, tool surface, and backup design. Decisions and their reversals are recorded in "Questions resolved on review" at the end.
+- Revised again 2026-08-21, after a four-agent review of the phase 1 implementation plan sent four questions back up to the spec. The import protocol now sends each row once instead of re-transmitting the roster on every call, `people.notes` has a stated job, the backup is a local export rather than an undecided one, and the mobile-connector question was checked rather than deferred. See "Questions resolved on 2026-08-21" at the end. There are now no open questions.
 - Author: Matt (Red Madrone Solutions), drafted with Claude
 
 ## Summary
@@ -82,7 +83,7 @@ The user manages one artifact, not two, while the safety asymmetry is preserved 
 
 ### Durable tables
 
-- `people` - names including preferred name, job title, organization as plain text, notes, `archived_at`, timestamps.
+- `people` - names including preferred name, job title, organization as plain text, notes, `archived_at`, timestamps. `notes` holds **standing facts that stay true between meetings**: a dietary restriction, who introduced you, what they care about. What happened on a particular day belongs in an encounter. The two fields are both free text about a person, which is how two fields drift into meaning the same thing, so the distinction is stated here and repeated in the tool descriptions an agent actually reads.
 - `person_contacts` - email addresses and phone numbers, typed, with a verified-at where it applies. An earlier draft had nowhere to put an email address, which a roster import produces on the first row.
 - `person_links` - websites and social profiles in one table, typed by `link_type`.
 - `tags` and `person_tags`.
@@ -185,10 +186,14 @@ The second is that an MCP tool call is one-shot. There is no channel for a serve
 
 Import is therefore a protocol, and the tool contract says so:
 
-- `import_roster(source_key, format, rows, run_id?, cursor?)` returns `{run_id, imported, updated, skipped, total, next_cursor}`. The agent loops until `next_cursor` is null.
-- Each call is capped well under the free-plan limits, on the order of 200 rows, and the cap is a server constant rather than the agent's guess.
-- Parsing CSV and JSON is deterministic server code. The agent supplies column mappings and normalizes small pasted lists; it does not reserialize 798 ordinary rows through the model, which is slow, expensive, and unrepeatable.
+- `import_roster(source_key, label, source_url, format, rows, expected_total?, run_id?, offset?)` returns `{run_id, imported, updated, skipped, errors, next_offset, remaining}`. The agent loops until `remaining` is zero, then calls `finalize_import`.
+- **The first call declares `expected_total`** and carries the first chunk. The server opens a run recording that total, and every later call carries `run_id`, the `offset` it is continuing from, and only its own chunk.
+- **`offset` must equal the run's `next_offset` exactly.** A call that skips ahead is refused rather than accepted, because a gap plus a later full-coverage finalize would retire rows that are perfectly current and were simply never sent.
+- Each call is capped at a server constant well under the free-plan limits, on the order of 150 rows. A chunk larger than the cap is **rejected, not truncated**: the agent decides the chunking, so silently dropping the tail would lose rows without anything saying so.
+- Parsing CSV and JSON is deterministic server code, and the agent sends each row exactly once across the whole run. An earlier version of this contract took the entire `rows` array on every call and sliced it server-side, which meant a 798-row roster crossed the model six times. That was decided against on 2026-08-21.
 - A run can be previewed before it commits, and reports validation errors per row rather than failing whole.
+
+**What the server can and cannot verify about a resumed run.** It checks that the run exists and is open, that it belongs to the source and format being imported, that the offset is the one expected, and that a replayed chunk carrying the same `idempotency_key` returns its original result instead of advancing twice. It cannot verify that the chunk in front of it comes from the same roster the run was opened against, because it no longer sees the whole input. Retirement therefore rests on the declared count: `finalize_import` accepts `full_coverage` only from a run whose committed rows equal its `expected_total`. That is a weaker guarantee than hashing the whole input, and it is the price of not re-transmitting the roster on every call.
 
 ### Rules that make this LLM-first
 
@@ -236,7 +241,7 @@ The Worker fails closed. If the owner allowlist variable is unset, or the GitHub
 
 The supported order is: deploy the Worker, add the connector once on claude.ai or Claude Desktop, and only then use it from the phone.
 
-The reason for that order has weakened and should be re-checked before the deploy documentation is written. Anthropic's dedicated connector build guide still states that mobile clients can use custom connectors but cannot add them, while another current Anthropic page describes mobile connector installation as beta. Both cannot be describing the same rollout state. The runbook therefore documents the web or desktop path as the supported one, and does not assert that adding a connector on mobile is impossible. A user who starts on mobile and hits a wall will blame the product, and that risk is unchanged either way.
+That order was checked against Anthropic's documentation on 2026-08-21 rather than left open. Web connectors work on Claude Mobile for iOS and Android; **installing** a connector from mobile is in beta, and Anthropic names Claude Desktop and the web as the primary path for custom connectors. So the runbook documents web or desktop as the supported path and describes mobile installation as beta rather than impossible. A user who starts on mobile may succeed, and if they hit a wall the runbook has already told them where the supported path is.
 
 The connector is named `Junco PRM`. Two separate names are involved and the runbook has to set both consistently, because the project controls neither directly. Claude prompts the human to type a connector name when adding it, and GitHub separately controls the name shown on the OAuth consent screen, which comes from the OAuth application the deployer registers.
 
@@ -335,15 +340,18 @@ An earlier draft said data loss "is covered by `wrangler d1 export` plus an `exp
 
 `export_data` was also never in the tool list, so the surface was either larger than stated or the sentence was wrong. And returning the entire PRM through a tool result pushes the whole durable dataset into a conversation transcript, which is a strange thing to do deliberately. Anthropic's tool results are also capped at roughly 150,000 characters, so the export would truncate or fail exactly when there is enough data to be worth saving.
 
-Backup is three layers, and none of them is a single tool call:
+Backup is two layers, and neither of them is a single tool call:
 
-- **D1 Time Travel** for short-term recovery: point-in-time restore, 7 days on the free plan and 30 days on paid, already on and needing no setup. This covers the overwhelmingly common case, which is a bad write ten minutes ago.
-- **A durable-data export run from the CLI,** not through Claude. It selects the durable source tables explicitly, excludes the FTS5 virtual tables, and writes JSON locally. The FTS indexes are rebuilt from migrations on restore rather than being backed up, because they are derived data.
-- **A tested restore into an empty database.** An export nobody has ever restored is not a backup. The restore path is exercised as part of testing, not documented and hoped for.
+- **D1 Time Travel** for short-term recovery: point-in-time restore, 7 days on the free plan and 30 days on paid, already on and needing no setup. This covers the overwhelmingly common case, which is a bad write ten minutes ago, and it covers it without anyone having remembered anything in advance.
+- **A durable-data export run from the CLI to the operator's own machine,** not through Claude and not into another Cloudflare service. It selects the durable source tables explicitly, excludes the FTS5 virtual tables, and writes JSON to a local path the operator chooses. The FTS indexes are rebuilt from migrations on restore rather than being backed up, because they are derived data.
+
+The restore is not a third layer, it is a property the second one has to have: **an export nobody has ever restored is not a backup.** Restoring into an empty database and comparing the result against the source is part of testing, not something documented and hoped for.
+
+Nothing runs the export on a schedule. That was an open question, and on 2026-08-21 it was settled as a local export the operator runs, rather than a Worker cron writing to R2. R2 keeps the copy inside the same Cloudflare account, so it protects against a bad migration and not against the case the export exists for, and it adds a binding, and probably billing details, to a deploy this project is trying to keep within reach of a stranger. The deploy documentation names a cadence and says plainly what is lost if nobody follows it.
 
 `export_data` survives as a paginated convenience tool for "give me my data," with an explicit scope and cursor. It is not the backup story and the spec no longer calls it one.
 
-Time Travel and local exports both live inside the user's Cloudflare account, so neither survives the loss of that account. That case is covered under Operations.
+Time Travel lives inside the user's Cloudflare account and does not survive the loss of it. The local export is the only thing that does, which is the whole argument for running it. See Operations.
 
 ## Operations
 
@@ -369,7 +377,7 @@ Three different losses with three different answers, stated plainly because the 
 
 - **Losing the GitHub account** is recoverable. Resolve the new numeric user id, update the allowlist variable, redeploy. Existing grants are invalidated by the allowlist change.
 - **A leaked client secret** is recoverable. Rotate it at GitHub, set it again with `wrangler secret put`, and revoke outstanding grants by clearing the KV namespace.
-- **Losing the Cloudflare account** is not recoverable from inside the system. Everything lives there, including Time Travel. The exported JSON held somewhere else is the only answer, which is the argument for running the export on a schedule rather than once.
+- **Losing the Cloudflare account** is not recoverable from inside the system. Everything lives there, including Time Travel. The exported JSON on the operator's own machine is the only answer, and nothing automates it: the coverage is exactly as good as the operator's habit of running it. The deploy documentation says that in those words rather than implying a safety net that does not exist. An operator who never runs the export has no answer to this case, and should know that before they have data worth losing.
 
 ## Testing
 
@@ -396,7 +404,7 @@ These were verified during design and should be re-checked if implementation sta
 
 - D1 supports the FTS5 module including `fts5vocab`: https://developers.cloudflare.com/d1/sql-api/sql-statements/
 - Remote MCP connections originate from Anthropic's servers, not the user's machine; custom connectors are available on Free, Pro, Max, Team, and Enterprise, with Free limited to one: https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp
-- Claude mobile can use remote MCP servers already added via claude.ai. Whether it can now add them is unresolved: the connector build guide says it cannot, and another current Anthropic page describes mobile installation as beta. Re-check before writing the deploy documentation.
+- Claude Mobile, iOS and Android, can use web connectors, and **installing** a connector from mobile is in beta, with Claude Desktop and the web named as the primary path for custom connectors. Checked 2026-08-21, which resolved what the first two drafts recorded as contradictory: https://support.claude.com/en/articles/11176164-use-connectors-to-extend-claude-s-capabilities and https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp
 - Anthropic now documents fixed bearer tokens via connector request headers, in beta and rolling out gradually. Considered and set aside on 2026-08-20: a beta that a stranger may not have undercuts the shareability goal, so OAuth stays. Worth revisiting if it reaches general availability, because it would remove the entire authentication section.
 - D1 export does not support databases containing virtual tables, which includes FTS5. The backup design under Failure modes is written around this: https://developers.cloudflare.com/d1/best-practices/import-export-data/
 - Relevant D1 free-plan limits: 500 MB per database, 2 MB per row, 100 bound parameters per query, 100 KB per SQL statement, 30 seconds per query or batch, and 50 D1 queries per Worker invocation. Free Workers also allow 10 ms CPU per invocation: https://developers.cloudflare.com/d1/platform/limits/
@@ -410,8 +418,17 @@ The first draft closed with three open questions. Matt answered all three on 202
 - **First import:** a small committed fixture first. The WCUS prototype's 798 rows are held back as a separate scale test rather than being the first import. See Testing.
 - **Connector display name:** `Junco PRM`. See Onboarding sequence.
 
+## Questions resolved on 2026-08-21
+
+A four-agent review of the phase 1 implementation plan surfaced four decisions the plan could not take on its own. Matt took them on 2026-08-21 and the sections above are written to match.
+
+- **Import protocol:** each call carries only its own chunk. The contract previously took the entire `rows` array on every call and sliced it server-side, which re-transmitted a 798-row roster six times through the model, in direct contradiction of this spec's own argument for parsing on the server. The first call now declares `expected_total`, later calls carry `run_id` and an in-order `offset`, and `finalize_import` accepts full coverage only when committed rows equal the declared total. The cost is stated where it lands: the server can no longer prove the chunk in front of it came from the roster the run was opened against. See `import_roster` is resumable across calls.
+- **`people.notes` stays, with a job.** It holds standing facts that remain true between meetings; encounters hold what happened on a date. Left undifferentiated, the two were a drift waiting to happen. See Data model.
+- **Backup is a local CLI export the operator runs,** not a Worker cron writing to R2. R2 leaves the copy in the same account it is meant to survive, and it adds a binding and probably billing details to a deploy aimed at a stranger. See Backup and restore, and Losing access, which now says what happens to an operator who never runs it.
+- **Mobile connector installation is beta, not impossible.** Checked against Anthropic's documentation rather than left as an open question. See Onboarding sequence.
+
 ## Open questions
 
-- **Can Claude on mobile add a connector, or only use one already added?** Anthropic's own pages disagree, and the answer changes how prominently the deploy documentation has to warn a mobile-first user. It does not block the implementation plan, and it does block writing `docs/DEPLOY.md`.
-- **Does the durable export run on a schedule, and where does it write?** The Cloudflare-account-loss case is only covered if the export lands somewhere else, and nothing currently decides where. A Worker cron writing to R2 keeps it inside one vendor; writing to the owner's machine needs the owner's machine to be on. Deferred until there is data worth losing, but named because the backup argument depends on it.
-- **Should `people.notes` exist at all** now that encounters carry their own text? It may be a second place to put the same thing, which is how two fields drift. Left as designed for v1 and worth a look once there is real usage.
+None. Every question the first three drafts left open has been answered above.
+
+The next uncertainty is not a design question but an empirical one: nothing here has been run. The spec's claims about D1 limits, FTS5 behavior under D1, and the deploy sequence are researched rather than observed, and the first execution of plan 1 is what turns them into facts.
