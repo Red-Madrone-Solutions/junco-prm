@@ -10,7 +10,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-20-junco-prm-design.md`
 
-**Revised 2026-08-21** after an independent four-agent review of the first draft. Three defects were found by every reviewer that read the plan: the import loop issued one D1 query per row against a 50-query-per-invocation cap, its insert-versus-update counting read `meta.changes` and `meta.last_row_id` in a way SQLite does not support, and `listEncounters` paginated on an id cursor while ordering by date. Those are fixed here. So are a leaked-state bug in Task 3's fixtures, two check-then-act races, a promotion path that was neither atomic nor uniquely constrained, and a registry with no input schemas for plan 2 to advertise. Four decisions were taken during the revision and are recorded in "Decisions taken on review" at the end of this document.
+**Revised 2026-08-21**, in two passes. The first responded to an independent four-agent review of the draft plan. The second applied four decisions Matt took on the questions that review sent back up to the spec: the import protocol now sends each row exactly once, `people.notes` has a stated job, the backup is a local CLI export, and the mobile-connector question was checked rather than deferred. The spec was revised to match and no longer has open questions.
+
+The review's own findings: Three defects were found by every reviewer that read the plan: the import loop issued one D1 query per row against a 50-query-per-invocation cap, its insert-versus-update counting read `meta.changes` and `meta.last_row_id` in a way SQLite does not support, and `listEncounters` paginated on an id cursor while ordering by date. Those are fixed here. So are a leaked-state bug in Task 3's fixtures, two check-then-act races, a promotion path that was neither atomic nor uniquely constrained, and a registry with no input schemas for plan 2 to advertise. Four decisions were taken during the revision and are recorded in "Decisions taken on review" at the end of this document.
 
 ## Scope
 
@@ -32,7 +34,8 @@ Copied from the spec. Every task's requirements implicitly include this section.
 - **Every write returns the full affected record**, so a mistake is visible in the transcript immediately.
 - **Destructive operations against a person, a roster source, or bulk staged data are two calls.** The first returns a preview and a `confirmation_token`; the second presents that token. `deletePerson` and `purgeRosterSource` are the two tools this covers. `deleteEncounter` is deliberately outside it and deletes in one call: an encounter is a single row the user just created, `updateEncounter` handles most corrections, and a wrong encounter dictated from a phone should not need a second round trip to erase. D1 Time Travel is the backstop for a delete the user regrets.
 - **Import identity is `(roster_source_id, external_row_key)`** under a unique constraint. `external_row_key` comes from the source, or is the SHA-256 of the normalized row when the source has none.
-- **Import is resumable across calls,** capped at `IMPORT_BATCH_LIMIT = 150` rows per call. That cap is a server constant, never a caller's choice. Free-plan D1 allows 50 queries per Worker invocation and 100 bound parameters per query, and every statement inside a `db.batch()` counts individually against the query cap. A 150-row call therefore issues roughly 30 queries: one source lookup, one run read or insert, two chunked key pre-checks, 25 multi-row upserts of six rows each, and one run update. Rows per statement, and therefore the query count, are dictated by the 100-parameter cap divided by the column count of `roster_entries`.
+- **Import is resumable across calls, and each row is sent exactly once.** The first call declares `expected_total` and carries the first chunk; every later call carries `run_id`, the `offset` it continues from, and only its own rows. A chunk larger than `IMPORT_BATCH_LIMIT = 150` is **rejected, not truncated**, because the agent controls the chunking and a silently dropped tail is lost data. An `offset` that is not the run's `next_offset` is rejected outright.
+- **The import query budget is the reason for that cap.** Free-plan D1 allows 50 queries per Worker invocation and 100 bound parameters per query, and every statement inside a `db.batch()` counts individually against the query cap. A 150-row call issues roughly 30 queries: one source lookup, one run read or insert, two chunked key pre-checks, 25 multi-row upserts of six rows each, and one run update. Rows per statement, and therefore the query count, come from the 100-parameter cap divided by the column count of `roster_entries`.
 - **Timestamps are stored as UTC ISO-8601 instants.** Due dates are stored as `YYYY-MM-DD` local date strings and interpreted in `ToolContext.timezone`.
 - **People are archived, never deleted, except through the explicit two-call hard-delete path.** Encounters, roster sources, and roster entries are hard-deletable.
 - **Imported roster text is untrusted input.** It is stored and returned as data. No tool interprets it as an instruction, and no destructive action can be triggered by its content.
@@ -811,7 +814,7 @@ CREATE TABLE import_runs (
   id               TEXT PRIMARY KEY,
   roster_source_id TEXT NOT NULL REFERENCES roster_sources(id) ON DELETE CASCADE,
   format           TEXT NOT NULL CHECK (format IN ('csv', 'json', 'text')),
-  input_hash       TEXT NOT NULL,
+  input_hash       TEXT NOT NULL DEFAULT '',
   status           TEXT NOT NULL CHECK (status IN ('open', 'committed', 'abandoned')),
   full_coverage    INTEGER NOT NULL DEFAULT 0,
   expected_total   INTEGER NOT NULL,
@@ -873,7 +876,9 @@ CREATE TABLE person_roster_entries (
 
 `person_sources` deliberately has no foreign key to `roster_sources` or `roster_entries`. That absence is the point: durable provenance must survive a purge of the staged data it was copied from.
 
-Two columns in `import_runs` exist for the resumable import protocol in Tasks 12a through 12c and are worth explaining here, where they are created. `expected_total` is the row count the run was opened against, and `next_offset` is how far that run has committed. Together they are what makes a continuation checkable: a second call carrying a `run_id` must present the offset the run actually expects, and `finalizeImport` must refuse a run whose `next_offset` has not reached `expected_total`. Without them a caller can skip rows by advancing the cursor and then finalize with full coverage, which retires valid entries that were never seen.
+Two columns in `import_runs` exist for the resumable import protocol in Tasks 12a through 12c and are worth explaining here, where they are created. `expected_total` is the row count the caller declared the run would send, and `next_offset` is how many it has sent so far. Together they are the whole integrity story of a resumed import: a continuation must present the offset the run actually expects, and `finalizeImport` refuses full coverage from a run whose `next_offset` has not reached `expected_total`. Without them a caller can skip rows and then finalize with full coverage, retiring valid entries that were simply never sent.
+
+`input_hash` is vestigial and defaults to an empty string. It held a hash of the whole input under an earlier protocol that re-sent the entire roster on every call; that protocol was replaced on 2026-08-21, and no code reads the column now. It stays because dropping it costs a migration and buys nothing, and because a future protocol that hashes per chunk would want somewhere to put it.
 
 The `UNIQUE` on `person_roster_entries.roster_entry_id` is not redundant with the composite primary key. The primary key alone permits one roster row to be linked to two different people, which is the wrong direction of the many-to-many: one person may appear on many rosters, but one roster row is one human and belongs to at most one person record.
 
@@ -2573,9 +2578,9 @@ async function seedRoster() {
     .bind("rs_a", "wcus-2026", "WCUS 2026", "WCUS", "https://example.test", T)
     .run();
   await env.DB.prepare(
-    "INSERT INTO import_runs (id, roster_source_id, format, input_hash, status, started_at) VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT INTO import_runs (id, roster_source_id, format, input_hash, status, expected_total, next_offset, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind("ir_a", "rs_a", "csv", "h", "committed", T)
+    .bind("ir_a", "rs_a", "csv", "", "committed", 1, 1, T)
     .run();
   await env.DB.prepare(
     "INSERT INTO roster_entries (id, roster_source_id, external_row_key, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -3924,7 +3929,7 @@ git commit -m "feat: add follow-ups and timezone-correct list_due"
 - Test: `tests/import-state.test.ts`
 
 **Interfaces:**
-- Consumes: `roster_sources`, `import_runs` from Task 3; `hashJson`; `newId`; `assertId`.
+- Consumes: `roster_sources`, `import_runs` from Task 3; `hashJson` for content-derived row keys; `newId`; `assertId`.
 - Produces:
   - `const IMPORT_BATCH_LIMIT = 150`
   - `const UPSERT_ROWS_PER_STATEMENT = 6`
@@ -3933,11 +3938,13 @@ git commit -m "feat: add follow-ups and timezone-correct list_due"
   - `function parseCsv(text: string): Record<string, string>[]`
   - `function rowKey(row: RosterRow): Promise<string>`
   - `function ensureSource(ctx, input): Promise<string>`
-  - `function openOrResumeRun(ctx, sourceId, input, inputHash, start): Promise<RunState>`
+  - `function openOrResumeRun(ctx, sourceId, input): Promise<RunState>`
 
 Task 12 was one task in the first draft and is three here. It is the task every reviewer rejected, on three separate counts: it issued one D1 query per row against a 50-query cap, it counted inserts and updates from `meta.changes` and `meta.last_row_id` in a way SQLite does not support, and it accepted a `run_id` from the caller without checking that the continuation belonged to that run. Those are three different problems in three different layers, and a single agent holding all of it at once is how the first version came to be wrong. This task is the state layer, 12b is the write path, and 12c is finalization.
 
-**A cost worth knowing about.** The protocol takes the entire `rows` array on every call and slices it server-side, per the spec's tool contract. That makes the run's input hash checkable and the cursor meaningful, and it means a 798-row roster is re-sent by the agent on each of six calls. See the note at the end of this plan; it is the spec's contract and this plan implements it rather than quietly changing it.
+**Each row crosses the model exactly once.** The first call declares `expected_total` and carries its own chunk; every later call carries `run_id`, the `offset` it continues from, and only the next chunk. An earlier version of the spec's contract took the whole `rows` array on every call and sliced it server-side, which re-sent a 798-row roster six times. That was changed on 2026-08-21, and this task implements the current contract.
+
+**What the run state can still check, and what it cannot.** It can check that the run exists, is open, belongs to this source and format, and is being continued from exactly the offset it expects. It cannot check that the chunk in front of it came from the roster the run was opened against, because it never sees the whole input. That is why `expected_total` is declared up front and why `finalizeImport` in Task 12c refuses full coverage unless committed rows equal it: the count is the only integrity guarantee left, so it has to be enforced rather than trusted.
 
 - [ ] **Step 1: Write the failing test `tests/import-state.test.ts`**
 
@@ -3946,7 +3953,6 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
-import { hashJson } from "../src/idempotency";
 import { ensureSource, openOrResumeRun, parseCsv, rowKey } from "../src/tools/import_state";
 
 const ctx: ToolContext = {
@@ -4015,79 +4021,114 @@ describe("ensureSource", () => {
 describe("openOrResumeRun", () => {
   const rows = [{ external_row_key: "1", full_name: "Ada" }];
 
-  it("opens a run on a first call", async () => {
+  it("opens a run on a first call that declares its total", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
-    const run = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows }, await hashJson(rows), 0);
+    const run = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 3 });
     expect(run.run_id).toMatch(/^ir_/);
-    expect(run.expected_total).toBe(1);
+    expect(run.expected_total).toBe(3);
     expect(run.next_offset).toBe(0);
+  });
+
+  it("refuses a first call that declares no total", async () => {
+    const sourceId = await ensureSource(ctx, SOURCE);
+    await expect(
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows })
+    ).rejects.toThrow(ToolError);
+  });
+
+  it("refuses a declared total smaller than the first chunk", async () => {
+    const sourceId = await ensureSource(ctx, SOURCE);
+    await expect(
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 0 })
+    ).rejects.toThrow(ToolError);
   });
 
   it("refuses a first call that starts partway through", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
     await expect(
-      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows }, await hashJson(rows), 5)
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 9, offset: 5 })
     ).rejects.toThrow(ToolError);
   });
 
   it("resumes a run at the offset it expects", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
-    const hash = await hashJson(rows);
-    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows }, hash, 0);
+    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 2 });
     await env.DB.prepare("UPDATE import_runs SET next_offset = 1 WHERE id = ?")
       .bind(opened.run_id)
       .run();
 
-    const resumed = await openOrResumeRun(
-      ctx,
-      sourceId,
-      { ...SOURCE, rows, run_id: opened.run_id },
-      hash,
-      1
-    );
+    const resumed = await openOrResumeRun(ctx, sourceId, {
+      ...SOURCE,
+      rows,
+      run_id: opened.run_id,
+      offset: 1,
+    });
     expect(resumed.run_id).toBe(opened.run_id);
     expect(resumed.next_offset).toBe(1);
+    expect(resumed.expected_total).toBe(2);
   });
 
-  it("refuses a continuation whose cursor skips rows", async () => {
+  it("refuses a continuation whose offset skips rows", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
-    const hash = await hashJson(rows);
-    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows }, hash, 0);
+    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 9 });
     await expect(
-      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id }, hash, 1)
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id, offset: 1 })
     ).rejects.toThrow(ToolError);
   });
 
-  it("refuses a continuation carrying different rows", async () => {
+  it("refuses a continuation whose offset replays committed rows", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
-    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows }, await hashJson(rows), 0);
-    const tampered = [{ external_row_key: "1", full_name: "Someone Else" }];
+    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 9 });
+    await env.DB.prepare("UPDATE import_runs SET next_offset = 4 WHERE id = ?")
+      .bind(opened.run_id)
+      .run();
     await expect(
-      openOrResumeRun(
-        ctx,
-        sourceId,
-        { ...SOURCE, rows: tampered, run_id: opened.run_id },
-        await hashJson(tampered),
-        0
-      )
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id, offset: 0 })
+    ).rejects.toThrow(ToolError);
+  });
+
+  it("refuses a continuation that would exceed the declared total", async () => {
+    const sourceId = await ensureSource(ctx, SOURCE);
+    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 1 });
+    await env.DB.prepare("UPDATE import_runs SET next_offset = 1 WHERE id = ?")
+      .bind(opened.run_id)
+      .run();
+    await expect(
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id, offset: 1 })
+    ).rejects.toThrow(ToolError);
+  });
+
+  it("refuses a continuation whose format changed", async () => {
+    const sourceId = await ensureSource(ctx, SOURCE);
+    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 2 });
+    await env.DB.prepare("UPDATE import_runs SET next_offset = 1 WHERE id = ?")
+      .bind(opened.run_id)
+      .run();
+    await expect(
+      openOrResumeRun(ctx, sourceId, {
+        ...SOURCE,
+        format: "text",
+        rows,
+        run_id: opened.run_id,
+        offset: 1,
+      })
     ).rejects.toThrow(ToolError);
   });
 
   it("refuses a run belonging to another source", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
-    const hash = await hashJson(rows);
-    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows }, hash, 0);
+    const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 2 });
 
     const otherId = await ensureSource(ctx, { ...SOURCE, source_key: "wceu-2026" });
     await expect(
-      openOrResumeRun(ctx, otherId, { ...SOURCE, rows, run_id: opened.run_id }, hash, 0)
+      openOrResumeRun(ctx, otherId, { ...SOURCE, rows, run_id: opened.run_id, offset: 0 })
     ).rejects.toThrow(ToolError);
   });
 
   it("rejects a run id of the wrong kind", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
     await expect(
-      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: "rs_nope" }, await hashJson(rows), 0)
+      openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: "rs_nope", offset: 0 })
     ).rejects.toThrow(ToolError);
   });
 });
@@ -4137,10 +4178,14 @@ export interface ImportRosterInput {
   label: string;
   source_url: string;
   format: "csv" | "json" | "text";
+  /** This call's chunk only, never the whole roster. At most IMPORT_BATCH_LIMIT rows. */
   rows: RosterRow[];
+  /** Required on the first call of a run. The total the whole run will send. */
+  expected_total?: number;
   event?: string;
   run_id?: string;
-  cursor?: string;
+  /** Required on a continuation. Must equal the run's next_offset exactly. */
+  offset?: number;
   idempotency_key?: string;
 }
 
@@ -4236,27 +4281,45 @@ export async function ensureSource(
 export async function openOrResumeRun(
   ctx: ToolContext,
   sourceId: string,
-  input: ImportRosterInput,
-  inputHash: string,
-  start: number
+  input: ImportRosterInput
 ): Promise<RunState> {
+  const offset = input.offset ?? 0;
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new ToolError("invalid_input", "offset must be a non-negative integer");
+  }
+
   if (input.run_id === undefined) {
-    if (start !== 0) {
-      throw new ToolError("invalid_input", "a cursor without a run_id has nothing to continue");
+    if (offset !== 0) {
+      throw new ToolError("invalid_input", "an offset without a run_id has nothing to continue");
     }
+    const total = input.expected_total;
+    if (!Number.isInteger(total) || (total as number) < 1) {
+      throw new ToolError(
+        "invalid_input",
+        "expected_total is required on the first call and must be the number of rows the whole run will send"
+      );
+    }
+    if ((total as number) < input.rows.length) {
+      throw new ToolError(
+        "invalid_input",
+        `expected_total ${total} is smaller than this chunk of ${input.rows.length} rows`
+      );
+    }
+
     const runId = newId("ir");
     await ctx.db
       .prepare(
         `INSERT INTO import_runs
            (id, roster_source_id, format, input_hash, status, expected_total, next_offset, started_at)
-         VALUES (?, ?, ?, ?, 'open', ?, 0, ?)`
+         VALUES (?, ?, ?, '', 'open', ?, 0, ?)`
       )
-      .bind(runId, sourceId, input.format, inputHash, input.rows.length, nowIso(ctx.clock))
+      .bind(runId, sourceId, input.format, total, nowIso(ctx.clock))
       .run();
+
     return {
       run_id: runId,
       roster_source_id: sourceId,
-      expected_total: input.rows.length,
+      expected_total: total as number,
       next_offset: 0,
     };
   }
@@ -4264,14 +4327,13 @@ export async function openOrResumeRun(
   const runId = assertId("ir", input.run_id);
   const run = await ctx.db
     .prepare(
-      `SELECT id, roster_source_id, input_hash, format, status, expected_total, next_offset
+      `SELECT id, roster_source_id, format, status, expected_total, next_offset
        FROM import_runs WHERE id = ?`
     )
     .bind(runId)
     .first<{
       id: string;
       roster_source_id: string;
-      input_hash: string;
       format: string;
       status: string;
       expected_total: number;
@@ -4279,16 +4341,22 @@ export async function openOrResumeRun(
     }>();
 
   if (!run) throw new ToolError("not_found", `no import run with id ${runId}`);
-  if (
-    run.roster_source_id !== sourceId ||
-    run.input_hash !== inputHash ||
-    run.format !== input.format ||
-    run.status !== "open" ||
-    run.next_offset !== start
-  ) {
+  if (run.roster_source_id !== sourceId || run.format !== input.format || run.status !== "open") {
     throw new ToolError(
       "conflict",
       "import continuation does not match its open run; start a new run without a run_id"
+    );
+  }
+  if (offset !== run.next_offset) {
+    throw new ToolError(
+      "conflict",
+      `import run ${runId} expects offset ${run.next_offset}, not ${offset}`
+    );
+  }
+  if (run.next_offset + input.rows.length > run.expected_total) {
+    throw new ToolError(
+      "conflict",
+      `import run ${runId} was opened for ${run.expected_total} rows and this chunk would exceed it`
     );
   }
 
@@ -4301,12 +4369,21 @@ export async function openOrResumeRun(
 }
 ```
 
-Five things are checked on a continuation, and each one is a way a resumed import goes wrong. A `run_id` from another source attaches rows from roster B to roster A. A different `input_hash` means the caller changed the data mid-run, so the run's `expected_total` no longer describes what is being imported. A different format means the same. A run that is not open has already been finalized. And a cursor that does not equal `next_offset` either skips rows, which a later `finalizeImport` would then retire as missing, or replays rows already committed.
+Every check here is a way a resumed import goes wrong, and the offset checks are the ones doing the real work now that the server no longer sees the whole input.
+
+- **A `run_id` from another source** attaches rows from roster B to roster A.
+- **A changed format** means the caller is part-way through importing something else.
+- **A run that is not open** has already been finalized; continuing it would add rows the finalize never accounted for.
+- **An offset ahead of `next_offset`** skips rows. Those rows are then missing from the source's entries, and a later `finalizeImport` claiming full coverage would retire perfectly current entries as though they had vanished from the roster.
+- **An offset behind `next_offset`** replays rows already committed, double-counting them against `expected_total` and leaving the run unable to ever reach its declared total.
+- **A chunk that would carry the run past `expected_total`** means the declared total was wrong, and the total is the only integrity guarantee this protocol has left.
+
+`input_hash` is written as an empty string and no longer checked. It was the previous contract's guard, and it only worked because every call re-sent the entire roster. The column stays in the schema rather than being dropped, because a migration to remove it buys nothing and a later protocol may want it back; Task 12c does not read it either.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/import-state.test.ts`
-Expected: PASS, all fourteen cases.
+Expected: PASS, all eighteen cases. The eleven under `openOrResumeRun` are the ones that matter: they are the whole integrity story of a resumed import now that the input hash is gone.
 
 - [ ] **Step 5: Commit**
 
@@ -4326,8 +4403,10 @@ git commit -m "feat: add roster parsing, source records, and validated import ru
 **Interfaces:**
 - Consumes: everything Task 12a produces, plus `withIdempotency`.
 - Produces:
-  - `interface ImportResult { run_id: string; roster_source_id: string; imported: number; updated: number; skipped: number; total_seen: number; next_cursor: string | null; errors: { index: number; reason: string }[] }`
+  - `interface ImportResult { run_id: string; roster_source_id: string; imported: number; updated: number; skipped: number; next_offset: number; remaining: number; errors: { index: number; reason: string }[] }`
   - `function importRoster(ctx, input): Promise<ImportResult>`
+
+`remaining` is `expected_total - next_offset`. The agent loops until it is zero and then calls `finalizeImport`. There is no cursor: the offset is the cursor, and it is an integer the caller can reason about rather than an opaque token.
 
 The write path has two hard constraints and one thing that cannot be done the obvious way. The constraints are 50 D1 queries per invocation and 100 bound parameters per statement. The thing that cannot be done the obvious way is telling an insert from an update: SQLite reports one changed row for both branches of an `INSERT ... ON CONFLICT DO UPDATE`, and `last_insert_rowid()` holds whatever the last successful insert on the connection set, so neither field discriminates. The first draft's comment claiming `meta.changes` is 2 for an upsert is wrong, and its idempotency test would have failed against it.
 
@@ -4372,19 +4451,21 @@ describe("importRoster", () => {
   it("creates the source and run on the first call", async () => {
     const out = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada Lovelace", organization: "Kinsta" }],
     });
     expect(out.run_id).toMatch(/^ir_/);
     expect(out.roster_source_id).toMatch(/^rs_/);
     expect(out.imported).toBe(1);
     expect(out.updated).toBe(0);
-    expect(out.next_cursor).toBeNull();
+    expect(out.next_offset).toBe(1);
+    expect(out.remaining).toBe(0);
   });
 
   it("counts a re-import as updated, not imported", async () => {
     const rows = [{ external_row_key: "1", full_name: "Ada Lovelace" }];
-    const first = await importRoster(ctx, { ...SOURCE, rows });
-    const second = await importRoster(ctx, { ...SOURCE, rows });
+    const first = await importRoster(ctx, { ...SOURCE, expected_total: 1, rows });
+    const second = await importRoster(ctx, { ...SOURCE, expected_total: 1, rows });
     expect(first.imported).toBe(1);
     expect(second.imported).toBe(0);
     expect(second.updated).toBe(1);
@@ -4394,10 +4475,12 @@ describe("importRoster", () => {
   it("updates the stored row on re-import", async () => {
     await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada Lovelace", organization: "Kinsta" }],
     });
     await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada Lovelace", organization: "Automattic" }],
     });
     const row = await env.DB.prepare(
@@ -4410,14 +4493,15 @@ describe("importRoster", () => {
 
   it("derives a stable row key by content hash when the source has none", async () => {
     const rows = [{ full_name: "Ada Lovelace", organization: "Kinsta" }];
-    await importRoster(ctx, { ...SOURCE, rows });
-    await importRoster(ctx, { ...SOURCE, rows });
+    await importRoster(ctx, { ...SOURCE, expected_total: 1, rows });
+    await importRoster(ctx, { ...SOURCE, expected_total: 1, rows });
     expect(await countEntries()).toBe(1);
   });
 
   it("never treats a name as an identity", async () => {
     await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Chris Smith", organization: "A" },
         { external_row_key: "2", full_name: "Chris Smith", organization: "B" },
@@ -4426,45 +4510,77 @@ describe("importRoster", () => {
     expect(await countEntries()).toBe(2);
   });
 
-  it("caps a batch at the server constant and returns a cursor", async () => {
-    const rows = Array.from({ length: IMPORT_BATCH_LIMIT + 25 }, (_, i) => ({
+  it("walks a multi-chunk run to completion", async () => {
+    const all = Array.from({ length: IMPORT_BATCH_LIMIT + 25 }, (_, i) => ({
       external_row_key: String(i),
       full_name: `Person ${i}`,
     }));
-    const first = await importRoster(ctx, { ...SOURCE, rows });
+
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: all.length,
+      rows: all.slice(0, IMPORT_BATCH_LIMIT),
+    });
     expect(first.imported).toBe(IMPORT_BATCH_LIMIT);
-    expect(first.next_cursor).toBe(String(IMPORT_BATCH_LIMIT));
+    expect(first.next_offset).toBe(IMPORT_BATCH_LIMIT);
+    expect(first.remaining).toBe(25);
 
     const second = await importRoster(ctx, {
       ...SOURCE,
-      rows,
+      rows: all.slice(IMPORT_BATCH_LIMIT),
       run_id: first.run_id,
-      cursor: first.next_cursor ?? undefined,
+      offset: first.next_offset,
     });
     expect(second.imported).toBe(25);
-    expect(second.next_cursor).toBeNull();
-    expect(await countEntries()).toBe(IMPORT_BATCH_LIMIT + 25);
+    expect(second.remaining).toBe(0);
+    expect(await countEntries()).toBe(all.length);
   });
 
-  it("refuses a continuation that skips rows", async () => {
-    const rows = Array.from({ length: IMPORT_BATCH_LIMIT + 25 }, (_, i) => ({
+  it("rejects a chunk larger than the server cap instead of truncating it", async () => {
+    const rows = Array.from({ length: IMPORT_BATCH_LIMIT + 1 }, (_, i) => ({
       external_row_key: String(i),
       full_name: `Person ${i}`,
     }));
-    const first = await importRoster(ctx, { ...SOURCE, rows });
+    await expect(
+      importRoster(ctx, { ...SOURCE, expected_total: rows.length, rows })
+    ).rejects.toThrow(ToolError);
+    expect(await countEntries()).toBe(0);
+  });
+
+  it("refuses a continuation that skips rows", async () => {
+    const all = Array.from({ length: 40 }, (_, i) => ({
+      external_row_key: String(i),
+      full_name: `Person ${i}`,
+    }));
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: all.length,
+      rows: all.slice(0, 20),
+    });
     await expect(
       importRoster(ctx, {
         ...SOURCE,
-        rows,
+        rows: all.slice(30),
         run_id: first.run_id,
-        cursor: String(IMPORT_BATCH_LIMIT + 10),
+        offset: 30,
       })
+    ).rejects.toThrow(ToolError);
+  });
+
+  it("refuses a chunk that would carry the run past its declared total", async () => {
+    const rows = [
+      { external_row_key: "1", full_name: "Ada" },
+      { external_row_key: "2", full_name: "Grace" },
+    ];
+    await expect(
+      importRoster(ctx, { ...SOURCE, expected_total: 1, rows })
     ).rejects.toThrow(ToolError);
   });
 
   it("reports per-row errors instead of failing the whole batch", async () => {
     const out = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Ada Lovelace" },
         { external_row_key: "2", full_name: "   " },
@@ -4473,11 +4589,15 @@ describe("importRoster", () => {
     expect(out.imported).toBe(1);
     expect(out.skipped).toBe(1);
     expect(out.errors).toEqual([{ index: 1, reason: "full_name is required" }]);
+    // A row the server refused still counts as sent; the run can still complete.
+    expect(out.next_offset).toBe(2);
+    expect(out.remaining).toBe(0);
   });
 
   it("keeps the last of two rows sharing one key within a call", async () => {
     const out = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Ada Lovelace", organization: "First" },
         { external_row_key: "1", full_name: "Ada Lovelace", organization: "Second" },
@@ -4500,6 +4620,7 @@ describe("importRoster", () => {
   it("stores provenance on every row", async () => {
     await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada Lovelace" }],
     });
     const row = await env.DB.prepare(
@@ -4518,34 +4639,42 @@ describe("importRoster", () => {
     );
   });
 
-  it("replays under the same idempotency_key without writing twice", async () => {
-    const rows = [{ external_row_key: "1", full_name: "Ada Lovelace" }];
-    const args = { ...SOURCE, rows, idempotency_key: "k1" };
-    const first = await importRoster(ctx, args);
+  it("replays a retried chunk without advancing the run twice", async () => {
+    const all = Array.from({ length: 40 }, (_, i) => ({
+      external_row_key: String(i),
+      full_name: `Person ${i}`,
+    }));
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: all.length,
+      rows: all.slice(0, 20),
+    });
+
+    const args = {
+      ...SOURCE,
+      rows: all.slice(20),
+      run_id: first.run_id,
+      offset: first.next_offset,
+      idempotency_key: "chunk-2",
+    };
     const second = await importRoster(ctx, args);
-    expect(second).toEqual(first);
-    expect(await countEntries()).toBe(1);
+    // The client never saw the response and sent the same chunk again.
+    const retried = await importRoster(ctx, args);
+
+    expect(retried).toEqual(second);
+    expect(retried.next_offset).toBe(40);
+    expect(await countEntries()).toBe(40);
   });
 
   it("rejects a rows argument that is not an array", async () => {
     await expect(
-      importRoster(ctx, { ...SOURCE, rows: "not an array" as never })
+      importRoster(ctx, { ...SOURCE, expected_total: 1, rows: "not an array" as never })
     ).rejects.toThrow(ToolError);
-  });
-
-  it("rejects a batch larger than the server constant would allow to be requested", async () => {
-    // The cap is a server constant. A caller cannot raise it, and asking for more
-    // rows in one call simply produces a cursor rather than a bigger batch.
-    const rows = Array.from({ length: IMPORT_BATCH_LIMIT * 2 }, (_, i) => ({
-      external_row_key: String(i),
-      full_name: `Person ${i}`,
-    }));
-    const out = await importRoster(ctx, { ...SOURCE, rows });
-    expect(out.imported).toBe(IMPORT_BATCH_LIMIT);
-    expect(out.next_cursor).not.toBeNull();
   });
 });
 ```
+
+The retry case is why every chunk carries its own `idempotency_key` in practice. Without one, a client that sends chunk two, loses the response, and retries presents `offset: 20` against a run whose `next_offset` is already 40, and the run wedges: the correct offset is unknowable to the caller, and the only recovery is starting over. With the key, the retry replays the original result and the loop continues.
 
 - [ ] **Step 2: Run it to make sure it fails**
 
@@ -4558,7 +4687,7 @@ Expected: FAIL, cannot resolve `../src/tools/import`.
 import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { newId } from "../ids";
-import { hashJson, withIdempotency } from "../idempotency";
+import { withIdempotency } from "../idempotency";
 import { nowIso } from "../time";
 import {
   ensureSource,
@@ -4585,8 +4714,8 @@ export interface ImportResult {
   imported: number;
   updated: number;
   skipped: number;
-  total_seen: number;
-  next_cursor: string | null;
+  next_offset: number;
+  remaining: number;
   errors: { index: number; reason: string }[];
 }
 
@@ -4674,33 +4803,34 @@ export async function importRoster(
   if (!Array.isArray(input.rows)) {
     throw new ToolError("invalid_input", "rows must be an array");
   }
+  if (input.rows.length > IMPORT_BATCH_LIMIT) {
+    throw new ToolError(
+      "invalid_input",
+      `this call carries ${input.rows.length} rows; the limit is ${IMPORT_BATCH_LIMIT} per call. ` +
+        "Send the rest in the next call with run_id and offset."
+    );
+  }
   if (typeof input.source_key !== "string" || input.source_key.trim() === "") {
     throw new ToolError("invalid_input", "source_key is required");
-  }
-
-  const start = input.cursor === undefined ? 0 : Number(input.cursor);
-  if (!Number.isInteger(start) || start < 0) {
-    throw new ToolError("invalid_input", "cursor must be a non-negative integer");
   }
 
   const { idempotency_key, ...rest } = input;
   return withIdempotency(ctx, "import_roster", idempotency_key, rest, async () => {
     const sourceId = await ensureSource(ctx, input);
-    const inputHash = await hashJson(input.rows);
-    const run = await openOrResumeRun(ctx, sourceId, input, inputHash, start);
+    const run = await openOrResumeRun(ctx, sourceId, input);
 
     const at = nowIso(ctx.clock);
-    const slice = input.rows.slice(start, start + IMPORT_BATCH_LIMIT);
+    const start = run.next_offset;
     const errors: { index: number; reason: string }[] = [];
 
     // Prepare every row first, so validation and key derivation are done before
-    // anything is written and the whole slice can go out in one batch.
+    // anything is written and the whole chunk can go out in one batch.
     const prepared = new Map<string, PreparedRow>();
     const seenAt = new Map<string, number>();
     const order: string[] = [];
 
-    for (let offset = 0; offset < slice.length; offset++) {
-      const row = slice[offset] as RosterRow;
+    for (let offset = 0; offset < input.rows.length; offset++) {
+      const row = input.rows[offset] as RosterRow;
       const index = start + offset;
 
       if (typeof row.full_name !== "string" || row.full_name.trim() === "") {
@@ -4754,7 +4884,10 @@ export async function importRoster(
       UPSERT_ROWS_PER_STATEMENT
     ).map((part) => upsertStatement(ctx, part));
 
-    const consumed = start + slice.length;
+    // Every row the caller sent counts against the run, including ones the server
+    // refused. Otherwise a roster containing a blank name could never reach its
+    // declared total and could never be finalized with full coverage.
+    const nextOffset = start + input.rows.length;
 
     statements.push(
       ctx.db
@@ -4766,7 +4899,7 @@ export async function importRoster(
                  next_offset = ?
            WHERE id = ?`
         )
-        .bind(imported, updated, errors.length, consumed, run.run_id)
+        .bind(imported, updated, errors.length, nextOffset, run.run_id)
     );
 
     // One batch: D1 runs it as a transaction, so a failed statement rolls back the
@@ -4779,8 +4912,8 @@ export async function importRoster(
       imported,
       updated,
       skipped: errors.length,
-      total_seen: input.rows.length,
-      next_cursor: consumed < input.rows.length ? String(consumed) : null,
+      next_offset: nextOffset,
+      remaining: run.expected_total - nextOffset,
       errors,
     };
   });
@@ -4795,10 +4928,12 @@ Three things in there are worth stating plainly, because each replaces something
 
 **Duplicate keys within one call are resolved before writing.** SQLite refuses to let one `INSERT ... ON CONFLICT DO UPDATE` statement update the same row twice, and a roster pasted by hand can easily repeat a row. Last occurrence wins, the earlier one is reported as a skipped row with a reason, and the batch survives.
 
+**A refused row still advances the offset.** `next_offset` counts rows the caller sent, not rows that landed. Counting only successes would leave a run with one blank name permanently short of its `expected_total`, unable to be finalized with full coverage, and the operator with no way to retire anything from that roster ever again. The skipped rows are reported per index so the agent can fix and re-send them as an ordinary later import rather than as a continuation of this run.
+
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/import.test.ts`
-Expected: PASS, all thirteen cases.
+Expected: PASS, all fourteen cases.
 
 - [ ] **Step 5: Commit**
 
@@ -4856,6 +4991,7 @@ describe("finalizeImport", () => {
   it("retires rows the run did not see when it claims full coverage", async () => {
     const first = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Ada" },
         { external_row_key: "2", full_name: "Grace" },
@@ -4865,6 +5001,7 @@ describe("finalizeImport", () => {
 
     const second = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
     const out = await finalizeImport(ctx, { run_id: second.run_id, full_coverage: true });
@@ -4881,6 +5018,7 @@ describe("finalizeImport", () => {
   it("retires nothing for a partial paste", async () => {
     const first = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Ada" },
         { external_row_key: "2", full_name: "Grace" },
@@ -4891,19 +5029,24 @@ describe("finalizeImport", () => {
     const second = await importRoster(ctx, {
       ...SOURCE,
       format: "text",
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
     const out = await finalizeImport(ctx, { run_id: second.run_id, full_coverage: false });
     expect(out.retired).toBe(0);
   });
 
-  it("refuses full coverage for a run that has not consumed every row", async () => {
-    const rows = Array.from({ length: IMPORT_BATCH_LIMIT + 25 }, (_, i) => ({
+  it("refuses full coverage for a run that has not sent every row it declared", async () => {
+    const all = Array.from({ length: IMPORT_BATCH_LIMIT + 25 }, (_, i) => ({
       external_row_key: String(i),
       full_name: `Person ${i}`,
     }));
-    const first = await importRoster(ctx, { ...SOURCE, rows });
-    expect(first.next_cursor).not.toBeNull();
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: all.length,
+      rows: all.slice(0, IMPORT_BATCH_LIMIT),
+    });
+    expect(first.remaining).toBe(25);
 
     await expect(
       finalizeImport(ctx, { run_id: first.run_id, full_coverage: true })
@@ -4918,6 +5061,7 @@ describe("finalizeImport", () => {
   it("never retires a row that was promoted to a person", async () => {
     const first = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Ada" },
         { external_row_key: "2", full_name: "Grace" },
@@ -4943,6 +5087,7 @@ describe("finalizeImport", () => {
 
     const second = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
     const out = await finalizeImport(ctx, { run_id: second.run_id, full_coverage: true });
@@ -4952,6 +5097,7 @@ describe("finalizeImport", () => {
   it("refuses to finalize a run twice", async () => {
     const run = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
     await finalizeImport(ctx, { run_id: run.run_id, full_coverage: true });
@@ -4963,6 +5109,7 @@ describe("finalizeImport", () => {
   it("replays a finalize the client retried", async () => {
     const run = await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
     const args = { run_id: run.run_id, full_coverage: true, idempotency_key: "k1" };
@@ -5061,7 +5208,7 @@ export async function finalizeImport(
 
 Add `assertId` to the imports at the top of the file if it is not already there.
 
-Two guards here are the reason this is its own task. **A run may only claim full coverage once it has consumed every row it was opened against,** because `full_coverage: true` is what turns "this row was not in the input" into `retired_at`. A caller that imported the first 150 rows of 798 and then finalized would retire 648 rows that are perfectly current. **A promoted entry is never retired,** which the spec states and the first draft's SQL did not implement: the `NOT IN` subquery against `person_roster_entries` is what enforces it, and the test for it seeds a promotion by hand because Task 13 has not been written yet.
+Two guards here are the reason this is its own task. **A run may only claim full coverage once it has sent every row it declared,** because `full_coverage: true` is what turns "this row was not in the input" into `retired_at`. A caller that sent the first 150 rows of a declared 798 and then finalized would retire 648 rows that are perfectly current. Since the chunked protocol removed the input hash, this count check is the only thing standing between a half-finished run and mass retirement. **A promoted entry is never retired,** which the spec states and the first draft's SQL did not implement: the `NOT IN` subquery against `person_roster_entries` is what enforces it, and the test for it seeds a promotion by hand because Task 13 has not been written yet.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -5122,7 +5269,7 @@ const SOURCE = {
 };
 
 async function importOne(row: Record<string, unknown>): Promise<string> {
-  await importRoster(ctx, { ...SOURCE, rows: [row as never] });
+  await importRoster(ctx, { ...SOURCE, expected_total: 1, rows: [row as never] });
   const entry = await env.DB.prepare(
     "SELECT id FROM roster_entries ORDER BY created_at DESC LIMIT 1"
   ).first<{ id: string }>();
@@ -5705,6 +5852,7 @@ describe("listRosterSources", () => {
   it("reports entry counts and how many have been promoted", async () => {
     await importRoster(ctx, {
       ...SOURCE,
+      expected_total: 2,
       rows: [
         { external_row_key: "1", full_name: "Ada" },
         { external_row_key: "2", full_name: "Grace" },
@@ -5729,7 +5877,11 @@ describe("listRosterSources", () => {
 
 describe("purgeRosterSource", () => {
   it("previews before deleting and reports what would be lost", async () => {
-    await importRoster(ctx, { ...SOURCE, rows: [{ external_row_key: "1", full_name: "Ada" }] });
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada" }],
+    });
     const source = await env.DB.prepare("SELECT id FROM roster_sources LIMIT 1").first<{ id: string }>();
 
     const first = await purgeRosterSource(ctx, { roster_source_id: source!.id });
@@ -5742,7 +5894,11 @@ describe("purgeRosterSource", () => {
   });
 
   it("purges staged rows and leaves promoted people and their provenance", async () => {
-    await importRoster(ctx, { ...SOURCE, rows: [{ external_row_key: "1", full_name: "Ada Lovelace" }] });
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada Lovelace" }],
+    });
     const entry = await env.DB.prepare("SELECT id FROM roster_entries LIMIT 1").first<{ id: string }>();
     const promoted = await promote(ctx, { roster_entry_id: entry!.id, create_new: true });
     if (promoted.status !== "promoted") throw new Error("unreachable");
@@ -6202,7 +6358,9 @@ const personFields = {
   preferred_name: nullableStr("What they go by, if different."),
   job_title: nullableStr("Job title."),
   organization: nullableStr("Organization, as plain text."),
-  notes: nullableStr("Free-text notes."),
+  notes: nullableStr(
+    "Standing facts that stay true between meetings: a dietary restriction, who introduced you, what they care about. What happened on a particular day goes in log_encounter instead."
+  ),
 };
 
 export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
@@ -6456,7 +6614,7 @@ export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
 
     define(
       "import_roster",
-      "Import roster rows. Resumable: call again with run_id and cursor until next_cursor is null.",
+      "Import one chunk of a roster. Send expected_total and the first chunk, then call again with run_id and offset until remaining is zero, then finalize_import. Send each row exactly once.",
       false,
       obj(
         {
@@ -6466,7 +6624,9 @@ export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
           format: enumOf(["csv", "json", "text"], "Format the rows were parsed from."),
           rows: {
             type: "array",
-            description: "Every row of the roster. The server slices this and reports a cursor.",
+            maxItems: 150,
+            description:
+              "This call's rows only, never the whole roster. At most 150; a larger chunk is rejected, not truncated.",
             items: {
               type: "object",
               properties: {
@@ -6481,9 +6641,12 @@ export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
               required: ["full_name"],
             },
           },
+          expected_total: int(
+            "Required on the first call: how many rows the whole run will send. finalize_import will not accept full coverage until that many have arrived."
+          ),
           event: str("Event this roster belongs to."),
           run_id: id("ir", "Import run"),
-          cursor: str("Offset from a previous next_cursor."),
+          offset: int("Required on a continuation. Must equal the next_offset the previous call returned."),
         },
         ["source_key", "label", "source_url", "format", "rows"],
         { idempotent: true }
@@ -6492,12 +6655,14 @@ export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
     ),
     define(
       "finalize_import",
-      "Close an import run. With full_coverage, rows the run did not see are retired.",
+      "Close an import run. With full_coverage, entries this roster no longer contains are retired; it is refused until every declared row has been sent.",
       false,
       obj(
         {
           run_id: id("ir", "Import run"),
-          full_coverage: bool("True only if the rows imported were the complete roster."),
+          full_coverage: bool(
+            "True only if the rows sent were the complete roster. False for a partial paste, which retires nothing."
+          ),
         },
         ["run_id", "full_coverage"],
         { idempotent: true }
@@ -6770,11 +6935,12 @@ describe("the conference path", () => {
       event: "WCUS 2026",
       source_url: "https://example.test/attendees",
       format: "csv",
+      expected_total: rows.length,
       rows,
-    })) as { run_id: string; imported: number; next_cursor: string | null };
+    })) as { run_id: string; imported: number; remaining: number };
 
     expect(imported.imported).toBe(4);
-    expect(imported.next_cursor).toBeNull();
+    expect(imported.remaining).toBe(0);
 
     await call("finalize_import", { run_id: imported.run_id, full_coverage: true });
 
@@ -6844,6 +7010,7 @@ describe("the conference path", () => {
       label: "WordCamp US 2026",
       source_url: "https://example.test/attendees",
       format: "csv",
+      expected_total: rows.length,
       rows,
     })) as { run_id: string };
     await call("finalize_import", { run_id: imported.run_id, full_coverage: true });
@@ -6897,6 +7064,7 @@ Run once every task is complete. Nothing here is optional.
 - [ ] **Every trigger exists, not just the tables:** `npx wrangler d1 execute junco-prm --local --command "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"` lists all six: `people_fts_ai`, `people_fts_ad`, `people_fts_au`, `encounters_fts_ai`, `encounters_fts_ad`, `encounters_fts_au`. A half-applied trigger set is the failure mode this checks for, and it is silent everywhere else.
 - [ ] **No external-content FTS survived the revision:** `grep -rn "content_rowid\|content='" migrations/` returns nothing.
 - [ ] **No per-row writes survived the revision:** `grep -rn "\.run()" src/tools/import.ts` shows no call inside a `for` loop. Every roster write goes through `db.batch()`.
+- [ ] **Import never re-slices a caller's rows:** `grep -n "slice(" src/tools/import.ts` shows slicing only for batching statements, never for cutting `input.rows` down to a cap. A chunk over the cap is rejected in `importRoster`'s first few lines.
 - [ ] **No dynamic imports:** `grep -rn "await import(" src/` returns nothing. The `_read` modules exist so the import graph is static.
 - [ ] **No PRM content in logs:** `grep -rn "console\." src/` returns nothing, or only lines carrying tool name, duration, outcome, and identifiers.
 - [ ] **Every tool reachable through the registry with a schema:** `tests/contract.test.ts` passes, including the both-directions name equality.
@@ -6922,10 +7090,11 @@ Four questions came out of the 2026-08-21 review that the plan could not settle 
 - **`export_data` is built here, in Task 15.** The spec kept it in the tool surface and the first draft of this plan listed it under what it does not build. The spec wins: it is a read over tables this plan already owns, and plan 3's CLI export is a different interface for a different job.
 - **`delete_encounter` stays a single call.** It is the one destructive operation outside the two-call rule, and Global Constraints now states the exception rather than leaving the plan contradicting itself. An encounter is one row the user just dictated, `update_encounter` handles most corrections, and Time Travel covers a delete they regret.
 
-## Open question for the spec, not for this plan
+## Decisions taken from this plan's review, now in the spec
 
-`import_roster` takes the entire `rows` array on every call and slices it server-side, per the spec's tool contract, so a 798-row roster is re-sent by the agent on each of six calls. That is what makes the run's input hash checkable and the cursor meaningful, and it is a lot of tokens to spend re-transmitting rows the server already has.
+Four questions in this plan could only be answered by the spec, and Matt answered them on 2026-08-21. The spec carries the reasoning; this is what changed here.
 
-The alternative is a protocol where each call carries only its own chunk plus a declared `expected_total`, and the run's identity comes from the run id rather than from a hash of the whole input. It is cheaper and it weakens the continuation checks that Task 12a exists to provide.
-
-This plan implements the spec as written rather than quietly changing the contract. It is worth deciding before plan 2 pins the tool surface into an MCP schema.
+- **Import sends each row once.** The contract previously took the whole `rows` array on every call and sliced it server-side, which re-sent a 798-row roster six times through the model. Tasks 12a through 12c now implement a declared `expected_total`, in-order `offset` continuations, and a chunk cap that rejects rather than truncates. The input hash went with it, so the declared count is the only integrity guarantee left, and `finalizeImport` enforces it before retiring anything.
+- **`people.notes` holds standing facts,** and the tool description in Task 16 says so, because the description is what an agent reads when deciding where a sentence goes.
+- **Backup is a local CLI export in plan 3.** Nothing changes in plan 1; `export_data` in Task 15 was already a convenience read rather than a backup, and the spec now says where the real one writes.
+- **Mobile connector installation is beta,** not impossible. Plan 3's runbook can be written without re-opening it.
