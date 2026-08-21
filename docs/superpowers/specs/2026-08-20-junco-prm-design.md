@@ -1,4 +1,4 @@
-# Junco CRM - Design
+# Junco PRM - Design
 
 - Date: 2026-08-20
 - Status: draft, under review. Nothing is implemented.
@@ -7,7 +7,7 @@
 
 ## Summary
 
-Junco CRM is a small, single-user CRM whose primary interface is an MCP server rather than a web UI. It is deployed by each user to their own Cloudflare account as a Worker backed by D1 and a KV namespace, so the operator of the project hosts nothing and never receives anyone's data. Because remote MCP connectors work on Claude mobile, a deployed instance is usable from a phone, which is the requirement that drove the hosting decision.
+Junco PRM is a small, single-user personal relationship manager whose primary interface is an MCP server rather than a web UI. It is deployed by each user to their own Cloudflare account as a Worker backed by D1 and a KV namespace, so the operator of the project hosts nothing and never receives anyone's data. Because remote MCP connectors work on Claude mobile, a deployed instance is usable from a phone, which is the requirement that drove the hosting decision.
 
 The database lives in the user's own Cloudflare account. Tool results, like those of any remote MCP server, are processed under the user's own Anthropic account. See Constraints for why that distinction matters and is stated rather than glossed.
 
@@ -39,7 +39,7 @@ MCP plus mobile forces a publicly reachable HTTPS server, because a phone cannot
 
 The resolution is that the user hosts, not the project owner. Each user deploys their own Worker and D1 database into their own Cloudflare account, and the project ships code and a deploy template rather than a service.
 
-An earlier draft said "data never leaves an account the user controls." That is false and worth stating precisely, because the whole design rests on it. The project author hosts nothing and receives nothing. The database lives in the user's Cloudflare account. But every tool result travels from Cloudflare to Anthropic, by the same documented fact that forced this hosting decision in the first place: remote MCP connections originate from Anthropic's infrastructure. CRM contents are therefore processed under the user's own Anthropic account, and the deploy documentation discloses that rather than implying a closed loop.
+An earlier draft said "data never leaves an account the user controls." That is false and worth stating precisely, because the whole design rests on it. The project author hosts nothing and receives nothing. The database lives in the user's Cloudflare account. But every tool result travels from Cloudflare to Anthropic, by the same documented fact that forced this hosting decision in the first place: remote MCP connections originate from Anthropic's infrastructure. PRM contents are therefore processed under the user's own Anthropic account, and the deploy documentation discloses that rather than implying a closed loop.
 
 ## Prior art in this repo's lineage
 
@@ -132,11 +132,11 @@ An earlier draft called this "hybrid search" without defining it. There is no em
 
 - **Staged roster data must be purgeable.** The spec calls it worthless within weeks; a design with no way to remove it contradicts itself and lets a database fill with third-party contact data the user never engaged with.
 - **Encounters must be correctable and removable.** `log_encounter` is the highest-frequency write and is often dictated on a phone. A wrong one that cannot be fixed is a permanent error in the record.
-- **A hard delete path for a person must exist,** even though it is not the default and is not exposed casually. A CRM holding other people's contact details cannot answer a deletion request with "we only archive."
+- **A hard delete path for a person must exist,** even though it is not the default and is not exposed casually. A PRM holding other people's contact details cannot answer a deletion request with "we only archive."
 
 ## MCP tool surface
 
-The floor is three tools: find someone, read someone, write something down. That is a working LLM-first CRM.
+The floor is three tools: find someone, read someone, write something down. That is a working LLM-first PRM.
 
 An earlier draft fixed the shipped surface at nine and treated that count as a design constraint. It is not one. The marginal cost of one more well-named tool is close to zero, and the cost of one overloaded tool an agent misuses is a wrong write against a real person. The surface is sized by how unambiguous each choice is for an agent, not by a target number.
 
@@ -238,7 +238,7 @@ The supported order is: deploy the Worker, add the connector once on claude.ai o
 
 The reason for that order has weakened and should be re-checked before the deploy documentation is written. Anthropic's dedicated connector build guide still states that mobile clients can use custom connectors but cannot add them, while another current Anthropic page describes mobile connector installation as beta. Both cannot be describing the same rollout state. The runbook therefore documents the web or desktop path as the supported one, and does not assert that adding a connector on mobile is impossible. A user who starts on mobile and hits a wall will blame the product, and that risk is unchanged either way.
 
-The connector is named `Junco CRM`. Two separate names are involved and the runbook has to set both consistently, because the project controls neither directly. Claude prompts the human to type a connector name when adding it, and GitHub separately controls the name shown on the OAuth consent screen, which comes from the OAuth application the deployer registers.
+The connector is named `Junco PRM`. Two separate names are involved and the runbook has to set both consistently, because the project controls neither directly. Claude prompts the human to type a connector name when adding it, and GitHub separately controls the name shown on the OAuth consent screen, which comes from the OAuth application the deployer registers.
 
 Free-plan Claude users are limited to one custom connector, which is worth noting when handing this to someone.
 
@@ -246,7 +246,7 @@ This sequence is the tail of the deploy runbook rather than a separate document.
 
 ## Deployment
 
-Deployment is the whole product for anyone who is not the author. A CRM nobody can stand up is a demo. The deploy path is therefore designed as a document an agent executes rather than a tutorial a person reads, because the party handing this to a stranger is increasingly an LLM sitting in that stranger's terminal.
+Deployment is the whole product for anyone who is not the author. A PRM nobody can stand up is a demo. The deploy path is therefore designed as a document an agent executes rather than a tutorial a person reads, because the party handing this to a stranger is increasingly an LLM sitting in that stranger's terminal.
 
 ### The target
 
@@ -313,10 +313,10 @@ A one-click "Deploy to Cloudflare" template can now provision and bind both D1 a
 
 - TLS in transit, Cloudflare's encryption at rest, and account isolation.
 - No application-layer encryption of note text. Encrypted text cannot be searched with FTS5, and the threat model is the user's own Cloudflare account rather than a shared host. This is a deliberate trade, not an oversight.
-- No compression. A personal CRM is single-digit megabytes.
+- No compression. A PRM database is single-digit megabytes.
 - **Imported roster text is untrusted input.** It is written by strangers, it is fetched from the public web, and it is read back to an agent that can call write tools. A roster row whose job title reads like an instruction is the obvious prompt-injection vector, and it costs nothing to design against now. Tool results mark imported and stored free text as data rather than presenting it as narration, and the tools that act destructively require an explicit id plus a confirmation token, so injected text cannot cause a write on its own.
 - **Rate limiting on the unauthenticated surface.** The OAuth authorization, token, dynamic-registration, and `/health` routes are reachable by anyone who finds the URL. Unlimited, they burn Worker requests, D1 reads, and the deployer's own GitHub application quota. A Cloudflare rate-limiting rule on those routes is free and belongs in the deploy template rather than in a later hardening pass.
-- **Logs never contain CRM content.** Structured logs carry tool name, duration, outcome, and a request id. They do not carry names, note text, or tokens. Workers observability is enabled in the Wrangler configuration so that a deployed instance is debuggable at all, and that only helps if the logs are safe to read.
+- **Logs never contain PRM content.** Structured logs carry tool name, duration, outcome, and a request id. They do not carry names, note text, or tokens. Workers observability is enabled in the Wrangler configuration so that a deployed instance is debuggable at all, and that only helps if the logs are safe to read.
 
 ## Failure modes
 
@@ -329,11 +329,11 @@ A one-click "Deploy to Cloudflare" template can now provision and bind both D1 a
 
 ### Backup and restore
 
-An earlier draft said data loss "is covered by `wrangler d1 export` plus an `export_crm` tool." Both halves were wrong.
+An earlier draft said data loss "is covered by `wrangler d1 export` plus an `export_data` tool." Both halves were wrong.
 
 `wrangler d1 export` does not support a database containing virtual tables, and FTS5 tables are virtual tables. The command that the spec named as the backup does not run against the schema the spec specifies.
 
-`export_crm` was also never in the tool list, so the surface was either larger than stated or the sentence was wrong. And returning the entire CRM through a tool result pushes the whole durable dataset into a conversation transcript, which is a strange thing to do deliberately. Anthropic's tool results are also capped at roughly 150,000 characters, so the export would truncate or fail exactly when there is enough data to be worth saving.
+`export_data` was also never in the tool list, so the surface was either larger than stated or the sentence was wrong. And returning the entire PRM through a tool result pushes the whole durable dataset into a conversation transcript, which is a strange thing to do deliberately. Anthropic's tool results are also capped at roughly 150,000 characters, so the export would truncate or fail exactly when there is enough data to be worth saving.
 
 Backup is three layers, and none of them is a single tool call:
 
@@ -341,7 +341,7 @@ Backup is three layers, and none of them is a single tool call:
 - **A durable-data export run from the CLI,** not through Claude. It selects the durable source tables explicitly, excludes the FTS5 virtual tables, and writes JSON locally. The FTS indexes are rebuilt from migrations on restore rather than being backed up, because they are derived data.
 - **A tested restore into an empty database.** An export nobody has ever restored is not a backup. The restore path is exercised as part of testing, not documented and hoped for.
 
-`export_crm` survives as a paginated convenience tool for "give me my data," with an explicit scope and cursor. It is not the backup story and the spec no longer calls it one.
+`export_data` survives as a paginated convenience tool for "give me my data," with an explicit scope and cursor. It is not the backup story and the spec no longer calls it one.
 
 Time Travel and local exports both live inside the user's Cloudflare account, so neither survives the loss of that account. That case is covered under Operations.
 
@@ -408,7 +408,7 @@ The first draft closed with three open questions. Matt answered all three on 202
 
 - **Identity provider:** GitHub only. Answered first as "both, chosen at deploy time," then reversed on 2026-08-20 after a multi-agent review of the spec came back unanimously against carrying two providers into phase 1. Google's cost is concentrated in exactly the place the project can least afford it, the deploy a stranger performs, and supporting both would have doubled the end-to-end test matrix before either path was proven once. The provider seam went with it, on the grounds that an interface with one implementation is not an abstraction. See Authentication and Layering.
 - **First import:** a small committed fixture first. The WCUS prototype's 798 rows are held back as a separate scale test rather than being the first import. See Testing.
-- **Connector display name:** `Junco CRM`. See Onboarding sequence.
+- **Connector display name:** `Junco PRM`. See Onboarding sequence.
 
 ## Open questions
 
