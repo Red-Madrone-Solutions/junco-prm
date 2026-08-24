@@ -130,7 +130,7 @@ export async function externalRowKey(
   if (sourceRowId && sourceRowId.trim() !== "") return `k:${sourceRowId.trim()}`;
   if (row.email && row.email !== "") return `e:${row.email}`;
   return `h:${await sha256Hex(
-    canonicalJson({ full_name: row.full_name, organization: row.organization ?? null })
+    canonicalJson({ full_name: row.full_name, organization: row.organization || null })
   )}`;
 }
 

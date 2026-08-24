@@ -140,6 +140,15 @@ describe("externalRowKey", () => {
     );
   });
 
+  it("treats an empty-string organization the same as an absent one", async () => {
+    // organization: "" and organization: undefined must canonicalize to the
+    // same h: key. Otherwise the same person keys differently depending on
+    // whether a blank field arrived as "" or was omitted.
+    expect(
+      await externalRowKey({ full_name: "ada lovelace", organization: "" }, undefined)
+    ).toBe(await externalRowKey({ full_name: "ada lovelace" }, undefined));
+  });
+
   it("distinguishes two people with the same name at different organizations", async () => {
     const a = { full_name: "ada lovelace", organization: "kinsta", email: undefined };
     const b = { full_name: "ada lovelace", organization: "automattic", email: undefined };
