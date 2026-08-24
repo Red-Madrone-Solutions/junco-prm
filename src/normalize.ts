@@ -149,7 +149,11 @@ export function keyTier(key: string): "source" | "email" | "hash" | "unknown" {
  * The change-detection hash: the whole normalized row. Recomputed on every
  * import, and compared at promotion time so a commit cannot promote a person
  * from data the caller never inspected.
+ *
+ * Looser parameter type than `externalRowKey`'s on purpose: this hashes the
+ * whole row and reads no particular field, whereas `externalRowKey` reads
+ * name and organization specifically.
  */
-export async function contentHash(row: NormalizedRow): Promise<string> {
+export async function contentHash(row: Record<string, string | undefined>): Promise<string> {
   return sha256Hex(canonicalJson(row));
 }
