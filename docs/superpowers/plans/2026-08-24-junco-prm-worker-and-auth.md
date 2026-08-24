@@ -12,7 +12,15 @@
 
 **Plan 1:** `docs/superpowers/plans/2026-08-20-junco-prm-data-layer.md`
 
-**Written 2026-08-24**, against the fifth revision of the spec and the 2026-08-24 reconciliation of plan 1. It is written before plan 1 is implemented, deliberately: plan 2 depends on plan 1's registry **contract**, which is settled, not on its working code, and writing it now gives it a chance to send findings back up the way plan 1's review did.
+**Revised 2026-08-24, the same day it was written, after a four-agent review found a full account takeover.**
+
+All four agents independently led with the same finding. The authorization flow put the parsed auth request into GitHub's `state` as base64url JSON and trusted it on the way back; there was no consent screen, no cookie binding, and the redirect allowlist - written, exported and thoroughly unit-tested - was never called by any code, because the option it was passed to does not exist in the library. An attacker could start a real flow, send the owner the resulting GitHub link, and receive a bearer token carrying the owner's identity. `assertOwner` would have accepted it.
+
+Task 5 is redesigned rather than patched: the pending authorization lives in KV under a random single-use handle, a cookie binds it to the browser that started the flow, a consent screen names the client and its redirect before anything is redirected, non-owners are refused before a grant is minted, and redirect policy is enforced in `clientRegistrationCallback` against exact URIs.
+
+**The review also found that both library surfaces were substantially invented.** Three of four `OAuthProvider` options do not exist, grant props arrive on `ctx.props` rather than `env.props`, the named MCP transport is the Node one and does not take a `Request`, and `McpServer.registerTool` wants Zod where plan 1's registry holds JSON Schema. Both packages have now been installed and their types read; every API in this plan is verified against `@cloudflare/workers-oauth-provider` 0.10.3 and `@modelcontextprotocol/sdk` 1.30.0, and the findings are recorded in `docs/MEASUREMENTS.md`.
+
+**Originally written 2026-08-24**, against the fifth revision of the spec and the 2026-08-24 reconciliation of plan 1. It is written before plan 1 is implemented, deliberately: plan 2 depends on plan 1's registry **contract**, which is settled, not on its working code, and writing it now gives it a chance to send findings back up the way plan 1's review did.
 
 ## Scope
 
@@ -47,7 +55,7 @@ From the spec. Every task's requirements implicitly include this section.
 - **The owner identifier is a numeric GitHub user id, never a username.** Usernames can be changed and re-registered by someone else; the numeric id is stable for the life of the account.
 - **Logs never contain PRM content.** Structured logs carry tool name, duration, outcome, and a request id. They do not carry names, note text, contact details, or tokens. **Authentication failures are the one exception and are logged with the presented numeric id**, because a rejected identity is the only signal that someone is probing the instance.
 - **Every tool's name, description, input schema, and MCP annotations come from plan 1's `TOOLS` registry.** Plan 2 advertises what the registry says and adds nothing of its own.
-- **Errors are the closed set of seven codes** plan 1 fixed: `invalid_input`, `invalid_id`, `not_found`, `conflict`, `confirmation_required`, `confirmation_invalid`, `limit_exceeded`. Plan 2 maps `ToolError` onto MCP tool results carrying that code, its reason, its corrective next call, and its structured details. It never invents an eighth code and never flattens one into a bare string.
+- **Errors are the closed set of seven codes** plan 1 fixed: `invalid_input`, `invalid_id`, `not_found`, `conflict`, `confirmation_required`, `confirmation_invalid`, `limit_exceeded`. Plan 2 maps `ToolError` onto MCP tool results carrying that code, its reason, its corrective next call, and its structured details, and never flattens one into a bare string. **There is exactly one addition, `internal`, for a failure that is not a `ToolError` at all** - a bug in this server rather than a mistake by the caller. It carries no `next`, because there is no corrective call, and it is distinguishable by shape as well as by name. Folding it into one of the seven would tell a model to try something different when nothing different will help. See `src/mcp/errors.ts`.
 - **A tool that throws is a tool result, not a protocol error.** MCP distinguishes a failed *call* from a broken *request*. A `not_found` is the former and must reach the model as content it can act on; a malformed JSON-RPC frame is the latter.
 - **Timestamps and dates come from `ToolContext`,** which plan 2 builds per request from the `OWNER_TIMEZONE` variable and a real clock. Workers run in UTC, and every date-shaped guarantee in plan 1 depends on the zone being right.
 - **Rate limiting wraps the OAuth provider's fetch handler,** not a tool handler. `workers-oauth-provider` serves `/authorize`, `/token`, and `/register` itself, so a limiter sitting behind it never sees the routes it exists to protect.
@@ -62,7 +70,8 @@ This plan cannot start until three things are true. Each is a hard gate, and an 
 
 1. **Plan 1 is implemented and its verification section passes.** Plan 2 imports `TOOLS` and calls it. There is no useful subset of plan 2 that can be built against a registry that does not exist.
 2. **Plan 1's Task 0 has run**, and `docs/MEASUREMENTS.md` records whether a `[[ratelimits]]` binding is accepted on a free Cloudflare account. Task 8 of this plan builds one of two different things depending on that answer, and building the wrong one is a wasted task plus a failed deploy.
-3. **Matt has a GitHub OAuth App registered** and its client id and secret to hand. This is a human block, it takes one browser visit, and Task 4 cannot be tested without it. The exact navigation path belongs in plan 3's runbook; what matters here is that it is an **OAuth App**, under Developer settings, and specifically **not** a GitHub App. GitHub's interface pushes the latter harder, it is a different flow with a different token model, and both strangers and agents pick it by mistake.
+3. **Both libraries are installed and their types read**, not recalled. `@cloudflare/workers-oauth-provider` and `@modelcontextprotocol/sdk` are pinned in `package.json` and the versions this plan was verified against are in `docs/MEASUREMENTS.md`. If your installed versions differ, read the types before writing Task 5 or Task 7 - the first draft of both was written from recollection and got four API surfaces wrong, one of which silently disabled a security control.
+4. **Matt has a GitHub OAuth App registered** and its client id and secret to hand. This is a human block, it takes one browser visit, and Task 4 cannot be tested without it. The exact navigation path belongs in plan 3's runbook; what matters here is that it is an **OAuth App**, under Developer settings, and specifically **not** a GitHub App. GitHub's interface pushes the latter harder, it is a different flow with a different token model, and both strangers and agents pick it by mistake.
 
 ---
 
@@ -165,7 +174,14 @@ Plan 1 owns `src/tools/`, `src/errors.ts`, `src/ids.ts`, `src/time.ts`, `src/nor
 import { describe, expect, it } from "vitest";
 import { ConfigError, loadConfig } from "../src/config";
 
-/** A complete, valid environment. Each case below removes exactly one thing. */
+/**
+ * A complete, valid environment. Each case below removes exactly one thing.
+ *
+ * THE BINDINGS ARE PART OF "COMPLETE". An earlier version of this helper listed
+ * only the five variables, so `loadConfig` refused it for missing `DB` and
+ * `OAUTH_KV` and the supposedly-valid case failed - which would have sent
+ * whoever hit it looking at the validator rather than at the fixture.
+ */
 function validEnv() {
   return {
     GITHUB_CLIENT_ID: "Iv1.abc123",
@@ -173,6 +189,8 @@ function validEnv() {
     COOKIE_ENCRYPTION_KEY: "0".repeat(64),
     OWNER_GITHUB_USER_ID: "583231",
     OWNER_TIMEZONE: "America/Los_Angeles",
+    DB: {} as D1Database,
+    OAUTH_KV: {} as KVNamespace,
   } as never;
 }
 
@@ -426,8 +444,14 @@ declare global {
 
     // Plan 2 bindings
     OAUTH_KV: KVNamespace;
-    /** Present only if Task 0 found the binding available on the free plan. */
+    /**
+     * Two limiters, verified available on the free plan by plan 1's Task 0.
+     * `RATE_LIMITER` covers the OAuth and health routes; `MCP_RATE_LIMITER`
+     * covers /mcp at a higher ceiling, because the owner's real tool traffic
+     * lives there and an anonymous flood does too.
+     */
     RATE_LIMITER?: { limit(options: { key: string }): Promise<{ success: boolean }> };
+    MCP_RATE_LIMITER?: { limit(options: { key: string }): Promise<{ success: boolean }> };
 
     // Plan 2 variables
     GITHUB_CLIENT_ID: string;
@@ -461,10 +485,41 @@ Plan 1's file declared the Worker name, the D1 binding, the migrations directory
 
 `OWNER_TIMEZONE` defaults to `UTC` rather than to a placeholder, because it is the one variable with a defensible default: UTC is a real zone, so the Worker starts, and the consequence of leaving it is a due-date offset rather than a refusal to run. The other two are placeholders that **fail validation on purpose** - an instance deployed without them should not serve.
 
+- [ ] **Step 6b: Give the test environment real values**
+
+**Without this the entire suite fails, and not for any reason a reader would guess.** `wrangler.jsonc` carries `PLACEHOLDER_SET_BY_DEPLOY` for the two plain variables and, correctly, no secrets at all. Under `vitest-pool-workers` those are the values `loadConfig(env)` sees, so it throws - `OWNER_GITHUB_USER_ID` is not numeric and both secrets are undefined. Every test that touches a configured Worker breaks: `/health` asserting `configured: true`, OAuth metadata discovery getting a 503, and every MCP call whose helper calls `loadConfig`.
+
+Add test-only bindings to `vitest.config.ts`, alongside the migrations plan 1 already injects there:
+
+```ts
+export default defineWorkersConfig({
+  test: {
+    poolOptions: {
+      workers: {
+        miniflare: {
+          // Test-only. Never real credentials - this file is committed, and a
+          // secret in it is a secret in the repository forever.
+          bindings: {
+            GITHUB_CLIENT_ID: "Iv1.test-client-id",
+            GITHUB_CLIENT_SECRET: "test-client-secret",
+            COOKIE_ENCRYPTION_KEY: "0".repeat(64),
+            OWNER_GITHUB_USER_ID: "583231",
+            OWNER_TIMEZONE: "UTC",
+          },
+          kvNamespaces: ["OAUTH_KV"],
+        },
+      },
+    },
+  },
+});
+```
+
+`OWNER_GITHUB_USER_ID` is `583231` throughout the tests, and Task 6's fixtures use the same value. Keep them in step; a mismatch there shows up as a 403 in tests that are not about authorization at all.
+
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/config.ts tests/config.test.ts env.d.ts wrangler.jsonc
+git add src/config.ts tests/config.test.ts env.d.ts wrangler.jsonc vitest.config.ts
 git commit -m "feat: validate configuration and fail closed when it is incomplete"
 ```
 
@@ -1260,58 +1315,420 @@ git commit -m "feat: resolve the owner's numeric GitHub id and discard the token
 
 ---
 
-### Task 5: `workers-oauth-provider` and the Claude-facing server
+### Task 5: `workers-oauth-provider`, the consent flow, and the Claude-facing server
 
 **Files:**
-- Create: `src/auth/provider.ts`
+- Create: `src/auth/provider.ts`, `src/auth/transaction.ts`, `src/auth/consent.ts`
 - Modify: `src/index.ts` - the provider becomes the fetch handler
-- Test: `tests/auth-provider.test.ts`
+- Modify: `package.json` - add `@cloudflare/workers-oauth-provider`
+- Test: `tests/auth-provider.test.ts`, `tests/auth-transaction.test.ts`
 
 **Interfaces:**
 - Consumes: `Config` from Task 1, `authorizeUrl` and `completeCallback` from Task 4, `logAuthFailure` from Task 2.
 - Produces:
   - `interface GrantProps { githubUserId: string }` - **the only thing ever written into a grant**
-  - `function buildProvider(config: Config, apiHandler: ExportedHandler): { fetch(request, env, ctx): Promise<Response> }`
-  - `const ALLOWED_REDIRECT_HOSTS: readonly string[]`
+  - `function buildProvider(config: Config, apiHandler: ExportedHandler)`
+  - `function beginTransaction(env, authRequest): Promise<{ handle: string; cookie: string }>`
+  - `function consumeTransaction(env, request, handle): Promise<AuthRequest>` - single-use, browser-bound
+  - `function isAllowedRedirect(value: string): boolean`
+  - `function consentPage(client, redirectUri, handle): Response`
   - `const CLIENT_REGISTRATION_TTL_SECONDS: number`
 
-**This is the Worker being an OAuth server to Claude, and it is a configuration job rather than a build job.** `workers-oauth-provider` implements Dynamic Client Registration, PKCE, metadata discovery, and bearer token issuance and validation in full. What it does **not** do is the application's work, and the spec says so plainly: consent, CSRF protection, state validation, cookie handling, and every application-level access check remain this project's responsibility. The library validates its own issued token and explicitly leaves authorization to the handler - which is Task 6.
+---
 
-**`GrantProps` has exactly one field, and that is a security decision, not a minimalism preference.** Whatever goes into props is persisted in KV for the life of the grant. The numeric GitHub user id is all that is needed to authorize a request, so it is all that is stored. No access token, no username, no email, no avatar URL. The type is declared with one field so that adding a second is a visible edit to a named interface rather than an extra key in an object literal.
+> ## This task was redesigned on 2026-08-24 after a four-agent review found a full account takeover in the previous version.
+>
+> The old version is worth describing, because the shape of the mistake is more instructive than the fix.
+>
+> It parsed the auth request, base64-encoded it into GitHub's `state` parameter, and on the callback did `JSON.parse(atob(state))` and handed the result straight to `completeAuthorization`. There was no consent screen, no cookie, no server-side record of the pending transaction, and the redirect allowlist - written, exported and thoroughly unit-tested - **was never called by any code**, because the option it was passed to does not exist in the library.
+>
+> **The attack all four reviewers described, which needs no secrets:**
+>
+> 1. The attacker starts a real connector flow against the owner's Worker and captures the GitHub URL, which carries the attacker's own auth request in `state`.
+> 2. The attacker sends the owner that link.
+> 3. The owner is signed in to GitHub, which auto-approves after the first authorization.
+> 4. The callback decodes the attacker's `state`, resolves **the owner's** numeric id, and mints an authorization code.
+> 5. The code lands at the attacker's redirect. PKCE does not help - the attacker chose the challenge.
+> 6. The attacker holds a bearer token whose props say `githubUserId: <the owner's>`. `assertOwner` passes it. Full read and write over every person in the database.
+>
+> The reviewers' summary is the part to keep: **Task 6 is a good lock on a door whose key Task 5 was handing to strangers.** A per-request ownership check cannot help when the grant itself was minted with the right owner in it.
+>
+> The spec named the missing pieces exactly, and the previous version quoted the sentence while implementing none of it: consent, CSRF protection, state validation and cookie handling "remain the project's responsibility."
 
-**Two decisions this task has to make that the spec left open.**
+---
 
-The spec says registered clients "expire on a default lifetime, which a long-lived personal instance has to choose deliberately rather than inherit," and it says accepted redirect URIs should be constrained to Anthropic's documented callback. Neither has a value in the spec. This task sets both:
+**What the redesign does, and why each piece is load-bearing.**
 
-- **`ALLOWED_REDIRECT_HOSTS`** is `claude.ai` and `claude.com`. Anthropic's documented callback is `https://claude.ai/api/mcp/auth_callback`, and matching on host rather than on the exact URL leaves room for the path to change without a redeploy, while still refusing a registration that points somewhere else entirely. Desktop and local clients use loopback, so `127.0.0.1` and `localhost` are accepted **only over http on a loopback host**, which is the standard OAuth native-app exception.
-- **`CLIENT_REGISTRATION_TTL_SECONDS`** is **one year**, and the reasoning matters more than the number because the obvious reasoning is wrong.
+**The pending authorization lives in KV under a random single-use handle, and only the handle travels in `state`.** An attacker who starts a flow gets a handle for *their* transaction; they cannot make it describe someone else's, and they cannot forge one, because the handle is random and the record is server-side.
 
-  The tempting argument is that Dynamic Client Registration is an unauthenticated write, so registrations should not accumulate forever, so the TTL should be short. A first draft of this plan used 90 days on exactly that basis. It does not hold up.
+**A cookie binds the transaction to the browser that started it.** This is the piece that actually defeats the attack. The attacker's flow began in the attacker's browser, so the cookie lives there. When the owner clicks the attacker's link, the owner's browser presents no matching cookie and the callback refuses. Signing the state instead would not have worked, and one reviewer said so plainly: a signature proves the Worker minted that state, not that this browser started the flow, and the attacker obtains a validly signed state simply by starting a real flow.
 
-  **A short TTL defends against the wrong half of the threat.** A registration loop's real cost on a free plan is KV *writes*, which are capped daily. A TTL reclaims *storage*, and does nothing whatever about the writes - those already happened by the time any expiry is relevant. The rate limiter in Task 8 is what bounds the writes. So the thing a short TTL was chosen to defend is defended somewhere else, and what a short TTL actually buys is reclaimed storage, which is the cheap part.
+**The transaction is consumed atomically and once.** A replayed handle is refused, so a captured callback URL is not reusable.
 
-  **Meanwhile the cost of expiring too early lands on the owner.** Whether that cost is small or large depends on something this plan does not know: what a client actually experiences when its registration lapses. If Claude silently re-registers, expiry is invisible. If instead the connector simply stops working, the owner gets a PRM that broke for no visible reason and no message explaining it - which is a genuinely bad failure on a tool someone reaches for while standing in front of another person.
+**A consent screen names the client and its redirect URI.** Cloudflare's own documentation requires the application to authenticate the user, show consent, and decide scopes before `completeAuthorization`. The previous version leaned on GitHub's consent screen, which is consent to share a GitHub identity with Junco - not consent to give some downstream MCP client the owner's contacts. It is also the only thing that would let a human *see* a redirect pointing somewhere unexpected.
 
-  The asymmetry therefore runs the other way from the first draft's assumption: the downside of expiring early is real and lands on the owner, the upside of expiring at all is small and already covered. A year is long enough that the question almost never arises, while still not being "never" - an instance that has been abandoned for a year has no business holding live client registrations.
+**Non-owners are refused before a grant is minted.** `assertOwner` in Task 6 still runs on every request and is still the real gate, but there is no reason to fill KV with grants for strangers who found the URL.
 
-  **One thing to check while implementing this task, because it would settle the question properly:** read `workers-oauth-provider`'s docs or types for what a client sees when its registration lapses. If it re-registers transparently, a shorter TTL becomes defensible and this constant can come down. If it does not, a year is right and the reasoning above is the reason. Either way, record what you found in a comment - the next reader should not have to re-derive this.
+**Redirect URIs are enforced in `clientRegistrationCallback`, matched exactly.** This is a real option, unlike the one the previous version passed. Matching is against Anthropic's exact documented callback rather than any path on `claude.ai`, which is what the spec says and which the previous version loosened without saying so.
 
-**Neither of these closes the DCR hole, and the spec is explicit that they do not.** A registration still costs a KV write, and the rate limiter in Task 8 is per-location and permissive. Constraining redirect URIs bounds the *usefulness* of a junk registration; the TTL bounds its *lifetime*; the limiter bounds the *rate*. The hole is narrowed on three sides and not closed, which is the honest description.
+**Every option name here was read from the installed types**, not recalled. See `docs/MEASUREMENTS.md`: `cookieSecret`, `allowedRedirectUriHosts` and `clientRegistrationTtlSeconds` are not options this library has, and passing them silently did nothing.
 
-- [ ] **Step 1: Write the failing test `tests/auth-provider.test.ts`**
+- [ ] **Step 1: Add the dependency**
+
+```bash
+npm install @cloudflare/workers-oauth-provider@^0.10.3
+```
+
+Pin it. The previous version of this task named three options that do not exist, and an unpinned dependency makes that class of error recur silently on the next install.
+
+- [ ] **Step 2: Write the failing test `tests/auth-transaction.test.ts`**
+
+```ts
+import { env } from "cloudflare:test";
+import { beforeEach, describe, expect, it } from "vitest";
+import { beginTransaction, consumeTransaction } from "../src/auth/transaction";
+
+const authRequest = {
+  responseType: "code",
+  clientId: "client-1",
+  redirectUri: "https://claude.ai/api/mcp/auth_callback",
+  scope: [],
+  state: "claude-state",
+  codeChallenge: "abc",
+  codeChallengeMethod: "S256",
+};
+
+/** A request carrying the cookie a browser would have stored. */
+function withCookie(cookie: string): Request {
+  return new Request("https://prm.example.test/callback", {
+    headers: { cookie: cookie.split(";")[0]! },
+  });
+}
+
+beforeEach(async () => {
+  const listed = await env.OAUTH_KV.list({ prefix: "txn:" });
+  await Promise.all(listed.keys.map((k) => env.OAUTH_KV.delete(k.name)));
+});
+
+describe("beginTransaction", () => {
+  it("returns an opaque handle that is not the auth request", async () => {
+    const { handle, cookie } = await beginTransaction(env, authRequest);
+    expect(handle).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+    // The whole defect being fixed: the auth request must not be recoverable
+    // from anything that travels through GitHub.
+    expect(handle).not.toContain("claude.ai");
+    expect(atob(handle.replace(/-/g, "+").replace(/_/g, "/")) ?? "").not.toContain("clientId");
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("SameSite=Lax");
+  });
+
+  it("issues a different handle every time", async () => {
+    const a = await beginTransaction(env, authRequest);
+    const b = await beginTransaction(env, authRequest);
+    expect(a.handle).not.toBe(b.handle);
+  });
+});
+
+describe("consumeTransaction", () => {
+  it("returns the auth request when the cookie matches", async () => {
+    const { handle, cookie } = await beginTransaction(env, authRequest);
+    const out = await consumeTransaction(env, withCookie(cookie), handle);
+    expect(out.clientId).toBe("client-1");
+    expect(out.redirectUri).toBe("https://claude.ai/api/mcp/auth_callback");
+  });
+
+  it("REFUSES when the browser presents no cookie", async () => {
+    // THE TAKEOVER, IN ONE TEST.
+    //
+    // The attacker started the flow, so the attacker's browser holds the
+    // cookie. The owner clicks the attacker's link and arrives with none. If
+    // this passes, the owner's identity completes the attacker's authorization
+    // and the attacker receives a token that assertOwner will accept.
+    const { handle } = await beginTransaction(env, authRequest);
+    const noCookie = new Request("https://prm.example.test/callback");
+    await expect(consumeTransaction(env, noCookie, handle)).rejects.toThrow();
+  });
+
+  it("REFUSES a cookie from a different transaction", async () => {
+    const mine = await beginTransaction(env, authRequest);
+    const theirs = await beginTransaction(env, authRequest);
+    await expect(consumeTransaction(env, withCookie(theirs.cookie), mine.handle)).rejects.toThrow();
+  });
+
+  it("REFUSES a replay of a handle that was already consumed", async () => {
+    // A captured callback URL must not be reusable.
+    const { handle, cookie } = await beginTransaction(env, authRequest);
+    await consumeTransaction(env, withCookie(cookie), handle);
+    await expect(consumeTransaction(env, withCookie(cookie), handle)).rejects.toThrow();
+  });
+
+  it("REFUSES a handle that was never issued", async () => {
+    const { cookie } = await beginTransaction(env, authRequest);
+    await expect(consumeTransaction(env, withCookie(cookie), "not-a-handle")).rejects.toThrow();
+  });
+
+  it("REFUSES a forged state that looks like the old encoded format", async () => {
+    // The previous design's state was base64url JSON and was trusted. Anything
+    // shaped like it must now be meaningless.
+    const forged = btoa(JSON.stringify({ ...authRequest, redirectUri: "https://evil.test/cb" }))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    const { cookie } = await beginTransaction(env, authRequest);
+    await expect(consumeTransaction(env, withCookie(cookie), forged)).rejects.toThrow();
+  });
+});
+```
+
+- [ ] **Step 3: Run it to make sure it fails**
+
+Run: `npx vitest run tests/auth-transaction.test.ts`
+Expected: FAIL, cannot resolve `../src/auth/transaction`.
+
+- [ ] **Step 4: Write `src/auth/transaction.ts`**
+
+```ts
+import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
+
+/**
+ * THE PENDING AUTHORIZATION, HELD SERVER-SIDE AND BOUND TO ONE BROWSER.
+ *
+ * This module exists because of a specific attack. The previous design put the
+ * auth request itself into GitHub's `state` parameter as base64url JSON and
+ * trusted it on the way back. An attacker could start a real flow, capture the
+ * resulting GitHub URL, send it to the owner, and have the owner's GitHub
+ * identity complete the ATTACKER's authorization - handing them a token that
+ * every downstream ownership check would accept.
+ *
+ * Two properties defeat that, and both are needed:
+ *
+ *   1. Only an opaque random handle travels through GitHub. The auth request is
+ *      in KV, so nothing an attacker can craft describes a different one.
+ *   2. A cookie set when the flow starts binds the transaction to the browser
+ *      that started it. The attacker's cookie is in the attacker's browser, so
+ *      the owner arrives without it and is refused.
+ *
+ * Signing the state instead would NOT be sufficient. A signature proves this
+ * Worker minted that state; it says nothing about which browser started the
+ * flow, and an attacker gets a validly signed state just by starting a real one.
+ */
+
+const TTL_SECONDS = 600;
+const COOKIE_NAME = "junco_txn";
+
+function randomHandle(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+export class TransactionError extends Error {
+  constructor(public readonly reason: "no_cookie" | "mismatch" | "unknown" | "expired") {
+    super("this sign-in link is not valid for this browser");
+    this.name = "TransactionError";
+  }
+}
+
+/**
+ * Opens a transaction. Returns the handle to put in `state` and the `Set-Cookie`
+ * header to send with the redirect.
+ *
+ * The cookie value is a SECOND independent random value, not the handle. The
+ * handle travels through GitHub and through the user's browser history; the
+ * cookie does not. Reusing one value for both would mean anyone who saw the
+ * callback URL held the binding secret too.
+ */
+export async function beginTransaction(
+  env: Env,
+  authRequest: AuthRequest
+): Promise<{ handle: string; cookie: string }> {
+  const handle = randomHandle();
+  const secret = randomHandle();
+
+  await env.OAUTH_KV.put(
+    `txn:${handle}`,
+    JSON.stringify({ authRequest, secret }),
+    { expirationTtl: TTL_SECONDS }
+  );
+
+  const cookie =
+    `${COOKIE_NAME}=${secret}; Path=/; Max-Age=${TTL_SECONDS}; ` +
+    // HttpOnly: script cannot read it. Secure: never sent over http.
+    // SameSite=Lax rather than Strict, because the callback arrives as a
+    // top-level navigation FROM github.com and Strict would drop the cookie on
+    // exactly the request that needs it.
+    "HttpOnly; Secure; SameSite=Lax";
+
+  return { handle, cookie };
+}
+
+/**
+ * Consumes a transaction. SINGLE USE - the record is deleted before the auth
+ * request is returned, so a captured callback URL cannot be replayed.
+ */
+export async function consumeTransaction(
+  env: Env,
+  request: Request,
+  handle: string
+): Promise<AuthRequest> {
+  const presented = readCookie(request, COOKIE_NAME);
+  if (!presented) throw new TransactionError("no_cookie");
+
+  const raw = await env.OAUTH_KV.get(`txn:${handle}`);
+  // Covers a forged handle, an expired one, and a replayed one alike: in every
+  // case there is no record, and none of them deserves a different message.
+  if (!raw) throw new TransactionError("unknown");
+
+  const stored = JSON.parse(raw) as { authRequest: AuthRequest; secret: string };
+
+  // Delete BEFORE validating the secret, so a wrong-cookie attempt also burns
+  // the transaction. An attacker who can guess handles should not be able to
+  // probe them repeatedly.
+  await env.OAUTH_KV.delete(`txn:${handle}`);
+
+  if (!timingSafeEqual(stored.secret, presented)) throw new TransactionError("mismatch");
+
+  return stored.authRequest;
+}
+
+function readCookie(request: Request, name: string): string | null {
+  const header = request.headers.get("cookie");
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return rest.join("=");
+  }
+  return null;
+}
+
+/** Constant-time comparison. Both values are base64url of 32 random bytes. */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+```
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run tests/auth-transaction.test.ts`
+Expected: PASS.
+
+The case to read twice is "REFUSES when the browser presents no cookie". That single assertion is the difference between this design and a full account takeover, and there was no test anywhere in the previous version of this plan that attacked the OAuth flow at all.
+- [ ] **Step 6: Write `src/auth/consent.ts`**
+
+The one piece of HTML in a project that otherwise has no UI. It exists so a human can see *which client* is asking and *where the code will be delivered* before either happens.
+
+```ts
+/**
+ * The consent screen.
+ *
+ * Cloudflare's provider documentation requires the application to authenticate
+ * the user, show consent, and decide scopes before completeAuthorization. The
+ * previous version of this task leaned on GitHub's consent screen instead,
+ * which is a different consent for a different thing: it authorizes sharing a
+ * GitHub identity with Junco, not giving some downstream MCP client access to
+ * the owner's contacts. GitHub also shows it once and auto-approves forever.
+ *
+ * It is deliberately plain. It has one job - let a person read a hostname
+ * before approving it - and a redirect URI pointing somewhere unexpected is the
+ * single most useful thing on the page.
+ */
+export function consentPage(options: {
+  clientName: string;
+  redirectUri: string;
+  handle: string;
+  githubLoginUrl: string;
+}): Response {
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize access to your Junco PRM</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; }
+    dl { background: #f4f4f5; padding: 1rem; border-radius: .5rem; }
+    dt { font-weight: 600; font-size: .875rem; color: #52525b; }
+    dd { margin: 0 0 .75rem; font-family: ui-monospace, monospace; word-break: break-all; }
+    dd:last-child { margin-bottom: 0; }
+    button { font: inherit; padding: .625rem 1.25rem; border-radius: .375rem; border: 0; cursor: pointer; }
+    .go { background: #18181b; color: white; }
+    .no { background: transparent; color: #52525b; text-decoration: underline; }
+    .warn { color: #991b1b; }
+  </style>
+</head>
+<body>
+  <h1>Authorize access to your Junco PRM</h1>
+  <p>An application is asking for access to your personal relationship manager -
+     every person, note, encounter and contact detail it holds.</p>
+  <dl>
+    <dt>Application</dt><dd>${escapeHtml(options.clientName)}</dd>
+    <dt>Will receive the authorization at</dt><dd>${escapeHtml(options.redirectUri)}</dd>
+  </dl>
+  <p class="warn"><strong>If you did not just start this yourself, or that address
+     is not one you recognize, close this page.</strong> Approving it gives whoever
+     controls that address the same access to your PRM that you have.</p>
+  <form method="POST" action="/authorize/approve">
+    <input type="hidden" name="handle" value="${escapeHtml(options.handle)}">
+    <button class="go" type="submit">Approve and sign in with GitHub</button>
+  </form>
+  <p><a class="no" href="/authorize/deny">Cancel</a></p>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      // This page names a redirect URI and carries a transaction handle.
+      // Nothing should be able to frame it or load anything into it.
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+      "referrer-policy": "no-referrer",
+      "x-frame-options": "DENY",
+    },
+  });
+}
+
+/**
+ * The client name and redirect URI are attacker-controlled: anyone can register
+ * a client through DCR and choose both. They are rendered as text, never as
+ * markup.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+```
+
+- [ ] **Step 7: Write the failing test `tests/auth-provider.test.ts`**
 
 ```ts
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { ALLOWED_REDIRECT_HOSTS, isAllowedRedirect } from "../src/auth/provider";
+import { ALLOWED_REDIRECT_URIS, isAllowedRedirect } from "../src/auth/provider";
 
-describe("redirect URI constraints", () => {
-  it("accepts Anthropic's documented callback", () => {
+describe("redirect URI policy", () => {
+  it("accepts Anthropic's documented callback exactly", () => {
     expect(isAllowedRedirect("https://claude.ai/api/mcp/auth_callback")).toBe(true);
+    expect(isAllowedRedirect("https://claude.com/api/mcp/auth_callback")).toBe(true);
   });
 
-  it("accepts claude.com as well as claude.ai", () => {
-    expect(isAllowedRedirect("https://claude.com/api/mcp/auth_callback")).toBe(true);
+  it("REFUSES a different path on an allowed host", () => {
+    // The previous version matched on host, so any path on claude.ai passed.
+    // The spec says the documented callback; exact matching is what it asked
+    // for, and this is the value that decides where authorization codes go.
+    expect(isAllowedRedirect("https://claude.ai/anything-else")).toBe(false);
+    expect(isAllowedRedirect("https://claude.ai/")).toBe(false);
   });
 
   it("accepts a loopback callback over http, the native-app exception", () => {
@@ -1319,33 +1736,17 @@ describe("redirect URI constraints", () => {
     expect(isAllowedRedirect("http://localhost:6274/oauth/callback")).toBe(true);
   });
 
-  it("REFUSES an arbitrary host", () => {
+  it("REFUSES arbitrary and lookalike hosts", () => {
     expect(isAllowedRedirect("https://evil.test/steal")).toBe(false);
+    expect(isAllowedRedirect("https://claude.ai.evil.test/api/mcp/auth_callback")).toBe(false);
+    expect(isAllowedRedirect("https://notclaude.ai/api/mcp/auth_callback")).toBe(false);
   });
 
-  it("REFUSES a lookalike host", () => {
-    // The registration is unauthenticated, so this is the check that stops a
-    // registered client from redirecting an authorization code off-site.
-    expect(isAllowedRedirect("https://claude.ai.evil.test/cb")).toBe(false);
-    expect(isAllowedRedirect("https://notclaude.ai/cb")).toBe(false);
-  });
-
-  it("REFUSES http to a non-loopback host", () => {
+  it("REFUSES http to a non-loopback host, and non-http schemes", () => {
     expect(isAllowedRedirect("http://claude.ai/api/mcp/auth_callback")).toBe(false);
-  });
-
-  it("REFUSES a non-http scheme", () => {
     expect(isAllowedRedirect("javascript:alert(1)")).toBe(false);
-    expect(isAllowedRedirect("data:text/html,x")).toBe(false);
-  });
-
-  it("REFUSES an unparseable value rather than throwing", () => {
-    expect(isAllowedRedirect("not a url")).toBe(false);
     expect(isAllowedRedirect("")).toBe(false);
-  });
-
-  it("lists the hosts it allows, so the set is reviewable", () => {
-    expect([...ALLOWED_REDIRECT_HOSTS]).toEqual(["claude.ai", "claude.com"]);
+    expect(isAllowedRedirect("not a url")).toBe(false);
   });
 });
 
@@ -1362,15 +1763,19 @@ describe("the provider's own routes", () => {
   });
 
   it("still serves /health, which the provider must not swallow", async () => {
-    // The provider is the fetch handler now. If /health is not routed around
-    // it, an operator loses the one diagnostic that works before OAuth does.
-    const response = await SELF.fetch("https://example.test/health");
-    expect(response.status).toBe(200);
+    expect((await SELF.fetch("https://example.test/health")).status).toBe(200);
+  });
+
+  it("404s an unknown path rather than treating it as an authorization request", async () => {
+    // From this task on, the provider is the fetch handler and everything
+    // unmatched reaches the default handler. Without an explicit 404 there,
+    // /favicon.ico is parsed as an OAuth authorization request and a browser
+    // gets bounced to GitHub.
+    const response = await SELF.fetch("https://example.test/favicon.ico");
+    expect(response.status).toBe(404);
   });
 
   it("REFUSES to serve anything when configuration is incomplete", async () => {
-    // Fail closed. This is the whole security floor from Task 1, asserted at
-    // the layer that actually serves requests.
     const { default: worker } = await import("../src/index");
     const broken = { ...env, GITHUB_CLIENT_SECRET: "" } as never;
     const response = await worker.fetch(
@@ -1382,11 +1787,50 @@ describe("the provider's own routes", () => {
   });
 });
 
+describe("the consent screen", () => {
+  it("names the client and the redirect URI it will deliver to", async () => {
+    const { consentPage } = await import("../src/auth/consent");
+    const html = await consentPage({
+      clientName: "Claude",
+      redirectUri: "https://claude.ai/api/mcp/auth_callback",
+      handle: "h",
+      githubLoginUrl: "https://github.com/login/oauth/authorize",
+    }).text();
+
+    expect(html).toContain("Claude");
+    expect(html).toContain("https://claude.ai/api/mcp/auth_callback");
+  });
+
+  it("ESCAPES a client name and redirect chosen by whoever registered", async () => {
+    // Both are attacker-controlled - anyone can register a client through DCR.
+    const { consentPage } = await import("../src/auth/consent");
+    const html = await consentPage({
+      clientName: '<img src=x onerror="alert(1)">',
+      redirectUri: 'https://evil.test/"><script>alert(1)</script>',
+      handle: "h",
+      githubLoginUrl: "https://github.com/login/oauth/authorize",
+    }).text();
+
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("<script>alert");
+    expect(html).toContain("&lt;img");
+  });
+
+  it("cannot be framed", async () => {
+    const { consentPage } = await import("../src/auth/consent");
+    const response = consentPage({
+      clientName: "Claude",
+      redirectUri: "https://claude.ai/api/mcp/auth_callback",
+      handle: "h",
+      githubLoginUrl: "https://github.com/login/oauth/authorize",
+    });
+    expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    expect(response.headers.get("x-frame-options")).toBe("DENY");
+  });
+});
+
 describe("grant props", () => {
   it("carries the numeric id and NOTHING else", async () => {
-    // Whatever goes in props is persisted in KV for the life of the grant.
-    // This test is the guard on that surface: it fails if a second field is
-    // ever added, including an access token.
     const { propsFor } = await import("../src/auth/provider");
     expect(propsFor("583231")).toEqual({ githubUserId: "583231" });
     expect(Object.keys(propsFor("583231"))).toEqual(["githubUserId"]);
@@ -1394,29 +1838,30 @@ describe("grant props", () => {
 });
 ```
 
-- [ ] **Step 2: Run it to make sure it fails**
+- [ ] **Step 8: Run it to make sure it fails**
 
 Run: `npx vitest run tests/auth-provider.test.ts`
 Expected: FAIL, cannot resolve `../src/auth/provider`.
-
-- [ ] **Step 3: Write `src/auth/provider.ts`**
+- [ ] **Step 9: Write `src/auth/provider.ts`**
 
 ```ts
-import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import OAuthProvider, { type AuthRequest } from "@cloudflare/workers-oauth-provider";
 import type { Config } from "../config";
 import { logAuthFailure } from "../log";
+import { consentPage } from "./consent";
 import { authorizeUrl, completeCallback, GitHubAuthError } from "./github";
+import { beginTransaction, consumeTransaction, TransactionError } from "./transaction";
 
 /**
  * THE ONLY THING EVER WRITTEN INTO A GRANT.
  *
- * Props are persisted in KV for the life of the grant. The numeric GitHub user
- * id is all that is needed to authorize a request, so it is all that is stored:
- * no access token, no username, no email.
+ * Props are persisted in KV for the life of the grant, and reach the API
+ * handler as `ctx.props`. The numeric GitHub user id is all that is needed to
+ * authorize a request, so it is all that is stored: no access token, no
+ * username, no email.
  *
- * This is declared as a named interface with one field so that adding a second
- * is a visible edit to a type rather than an extra key in an object literal
- * somewhere in a callback.
+ * Declared as a named interface with one field so adding a second is a visible
+ * edit to a type rather than an extra key in an object literal in a callback.
  */
 export interface GrantProps {
   githubUserId: string;
@@ -1427,19 +1872,28 @@ export function propsFor(githubUserId: string): GrantProps {
 }
 
 /**
- * Anthropic's documented callback is https://claude.ai/api/mcp/auth_callback.
- * Matching on HOST rather than the exact URL leaves room for the path to change
- * without a redeploy, while still refusing a registration pointing elsewhere.
+ * EXACT URIs, not hosts.
+ *
+ * The previous version matched on hostname, so any path on claude.ai was
+ * acceptable. The spec says Anthropic's documented callback, and this is the
+ * value that decides where an authorization code gets delivered - the right
+ * cost for changing it is a reviewed edit, not a silent match.
  */
-export const ALLOWED_REDIRECT_HOSTS = ["claude.ai", "claude.com"] as const;
+export const ALLOWED_REDIRECT_URIS = [
+  "https://claude.ai/api/mcp/auth_callback",
+  "https://claude.com/api/mcp/auth_callback",
+] as const;
 
 const LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "[::1]"];
 
 /**
- * Dynamic Client Registration is an UNAUTHENTICATED WRITE - anyone who finds
- * the URL can register clients. This check does not close that hole; it bounds
- * how useful a junk registration is, by refusing one that would redirect an
- * authorization code somewhere the project does not recognize.
+ * ACTUALLY CALLED, from `clientRegistrationCallback` below.
+ *
+ * The previous version exported this, unit-tested it thoroughly, and never
+ * invoked it from anywhere - it was passed to an `allowedRedirectUriHosts`
+ * option that does not exist in this library, so the entire redirect defense
+ * was decorative. Dynamic Client Registration is an unauthenticated write, and
+ * without this check a registration can point an authorization code anywhere.
  */
 export function isAllowedRedirect(value: string): boolean {
   let url: URL;
@@ -1449,161 +1903,222 @@ export function isAllowedRedirect(value: string): boolean {
     return false;
   }
 
-  // The native-app loopback exception: http is acceptable to a loopback host
-  // and nowhere else. Desktop and local inspector clients need this.
+  // The native-app loopback exception: http to a loopback host and nowhere
+  // else. Desktop and inspector clients need it. Any port, any path - the
+  // address is unreachable from outside the machine, which is the protection.
   if (url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname)) return true;
-  if (url.protocol !== "https:") return false;
 
-  // Exact host equality, never endsWith: `claude.ai.evil.test` ends with
-  // nothing useful but `notclaude.ai` would pass a naive suffix check.
-  return (ALLOWED_REDIRECT_HOSTS as readonly string[]).includes(url.hostname);
+  return (ALLOWED_REDIRECT_URIS as readonly string[]).includes(value);
 }
 
 /**
- * ONE YEAR.
+ * One year. See docs/MEASUREMENTS.md and the note in the decisions section.
  *
- * The spec says registered clients expire on a default lifetime "which a
- * long-lived personal instance has to choose deliberately rather than inherit,"
- * and gives no number. This is the choice, and it is deliberately long.
- *
- * The obvious reasoning points the other way and is wrong. It goes: DCR is an
- * unauthenticated write, so registrations should not accumulate, so keep the
- * TTL short. But a short TTL defends the wrong half of that threat. A
- * registration loop's real cost on a free plan is KV WRITES, which are capped
- * daily and have already happened by the time any expiry matters; a TTL only
- * reclaims STORAGE, which is the cheap part. The rate limiter in Task 8 is what
- * actually bounds the writes.
- *
- * Against that small upside, expiring early costs the OWNER. What it costs
- * depends on something this plan does not know - whether a client re-registers
- * transparently when its registration lapses, or simply stops working. If the
- * latter, a short TTL means a PRM that breaks for no visible reason, on a tool
- * someone reaches for while standing in front of another person.
- *
- * So: long, but not infinite. An instance abandoned for a year has no business
- * holding live client registrations.
- *
- * TO SETTLE THIS PROPERLY: check what workers-oauth-provider does to a client
- * whose registration has lapsed. If it re-registers transparently, this can
- * come down. Record what you find here rather than leaving the next reader to
- * re-derive it.
+ * NOTE THE OPTION NAME. The library's option is `clientRegistrationTTL`, and
+ * the previous version passed `clientRegistrationTtlSeconds`, which does not
+ * exist - so the argued-for value did nothing and the library's own 90-day
+ * default applied.
  */
 export const CLIENT_REGISTRATION_TTL_SECONDS = 365 * 24 * 60 * 60;
 
-/**
- * The Worker as an OAuth SERVER to Claude.
- *
- * The library supplies protocol machinery, not an application. Consent, CSRF
- * protection, state validation, cookie handling, and every application-level
- * access check remain this project's responsibility - the library validates its
- * own issued bearer token and explicitly leaves authorization to the handler.
- * That handler is Task 6.
- */
 export function buildProvider(config: Config, apiHandler: ExportedHandler) {
   return new OAuthProvider({
-    // The MCP endpoint. Everything under it requires a valid bearer token.
     apiRoute: "/mcp",
     apiHandler,
 
-    // The provider serves these itself. A rate limiter must therefore wrap the
-    // provider, not sit behind it - see Task 8.
+    // The provider serves these itself, which is why the rate limiter in Task 8
+    // wraps the provider rather than sitting behind it.
     authorizeEndpoint: "/authorize",
     tokenEndpoint: "/token",
     clientRegistrationEndpoint: "/register",
 
     defaultHandler: githubHandler(config),
 
-    // Encrypts the consent cookie. Validated at startup by Task 1.
-    cookieSecret: config.cookieKey,
+    clientRegistrationTTL: CLIENT_REGISTRATION_TTL_SECONDS,
 
-    allowedRedirectUriHosts: [...ALLOWED_REDIRECT_HOSTS],
-    clientRegistrationTtlSeconds: CLIENT_REGISTRATION_TTL_SECONDS,
+    /**
+     * WHERE THE REDIRECT POLICY ACTUALLY LIVES. This is a real option; the one
+     * the previous version used was not.
+     */
+    clientRegistrationCallback: ({ clientMetadata }) => {
+      const uris = clientMetadata.redirect_uris;
+      if (!Array.isArray(uris) || uris.length === 0) {
+        throw new Error("redirect_uris is required");
+      }
+      for (const uri of uris) {
+        if (typeof uri !== "string" || !isAllowedRedirect(uri)) {
+          throw new Error(`redirect_uri not permitted on this instance: ${String(uri)}`);
+        }
+      }
+    },
   });
 }
 
 /**
- * The bridge between the two OAuth roles.
+ * The bridge between the two OAuth roles, and the place the takeover lived.
  *
- * The provider hands off here to get the user authenticated. This handler runs
- * the GitHub side (Task 4), gets a numeric id back, and completes the
- * provider's authorization with that id in props. It is the ONLY place the two
- * halves touch, and the only thing that crosses between them is the id.
+ * Four routes, and the ordering of the checks in each is the security:
+ *
+ *   GET  /authorize          parse, then SHOW CONSENT. No redirect yet.
+ *   POST /authorize/approve  open a bound transaction, then redirect to GitHub.
+ *   GET  /callback           consume the transaction, resolve identity, finish.
+ *   *                        404. Never fall through to parseAuthRequest.
  */
 function githubHandler(config: Config): ExportedHandler {
   return {
     async fetch(request, env, ctx) {
       const url = new URL(request.url);
+      // Set by src/index.ts so a failure here can be correlated with the
+      // request that caused it. The previous version read a `rid` query
+      // parameter that nothing ever set, so every auth failure logged "-".
+      const requestId = request.headers.get("x-junco-request-id") ?? "-";
 
-      if (url.pathname === "/callback") {
-        const code = url.searchParams.get("code");
-        const state = url.searchParams.get("state");
-        if (!code || !state) {
-          return new Response("missing code or state", { status: 400 });
+      // ---------------------------------------------------------- /authorize
+      if (url.pathname === "/authorize" && request.method === "GET") {
+        const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+
+        // Belt and braces over clientRegistrationCallback: a client registered
+        // before that callback existed, or through some path it does not
+        // cover, must still not receive a code at an address we do not allow.
+        if (!isAllowedRedirect(authRequest.redirectUri)) {
+          return new Response("redirect_uri not permitted on this instance", { status: 400 });
         }
 
-        try {
-          const { githubUserId } = await completeCallback(config, code);
-
-          // The access token is already gone - completeCallback never returned
-          // it. Only the numeric id reaches props.
-          const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-            request: decodeAuthRequest(state),
-            userId: githubUserId,
-            metadata: {},
-            scope: [],
-            props: propsFor(githubUserId),
-          });
-          return Response.redirect(redirectTo, 302);
-        } catch (e) {
-          const reason = e instanceof GitHubAuthError ? e.reason : "callback_failed";
-          logAuthFailure({ requestId: url.searchParams.get("rid") ?? "-", presentedUserId: null, reason: "invalid_token" });
-          return new Response(`sign-in failed: ${reason}`, { status: 401 });
-        }
+        const client = await env.OAUTH_PROVIDER.lookupClient(authRequest.clientId);
+        // NOTHING IS REDIRECTED YET. The user sees who is asking first.
+        return consentPage({
+          clientName: String(client?.clientName ?? authRequest.clientId),
+          redirectUri: authRequest.redirectUri,
+          handle: await stashPending(env, authRequest),
+          githubLoginUrl: "",
+        });
       }
 
-      // The provider routes /authorize here when it needs the user signed in.
-      const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
-      const callbackUrl = new URL("/callback", url.origin).toString();
-      return Response.redirect(
-        authorizeUrl(config, callbackUrl, encodeAuthRequest(authRequest)),
-        302
-      );
+      // -------------------------------------------------- /authorize/approve
+      if (url.pathname === "/authorize/approve" && request.method === "POST") {
+        const form = await request.formData();
+        const pending = String(form.get("handle") ?? "");
+        const authRequest = await readPending(env, pending);
+        if (!authRequest) return new Response("this approval has expired", { status: 400 });
+
+        // The transaction opens HERE, at the moment a human approved it, and
+        // the cookie goes to the browser that clicked. That is what binds the
+        // rest of the flow to this person.
+        const { handle, cookie } = await beginTransaction(env, authRequest);
+        const callbackUrl = new URL("/callback", url.origin).toString();
+
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: authorizeUrl(config, callbackUrl, handle),
+            "set-cookie": cookie,
+          },
+        });
+      }
+
+      if (url.pathname === "/authorize/deny") {
+        return new Response("Cancelled. Nothing was authorized.", {
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+      }
+
+      // ----------------------------------------------------------- /callback
+      if (url.pathname === "/callback") {
+        const code = url.searchParams.get("code");
+        const handle = url.searchParams.get("state");
+        if (!code || !handle) return new Response("missing code or state", { status: 400 });
+
+        let authRequest: AuthRequest;
+        try {
+          // SINGLE USE AND BROWSER-BOUND. An attacker's link fails here,
+          // because the cookie that matches this transaction is in the
+          // attacker's browser, not the owner's.
+          authRequest = await consumeTransaction(env, request, handle);
+        } catch (e) {
+          logAuthFailure({
+            requestId,
+            presentedUserId: null,
+            reason: e instanceof TransactionError ? "invalid_token" : "no_props",
+          });
+          return new Response("this sign-in link is not valid for this browser", { status: 400 });
+        }
+
+        let githubUserId: string;
+        try {
+          ({ githubUserId } = await completeCallback(config, code));
+        } catch (e) {
+          // The REASON goes to the log, where the operator can see it. The
+          // stranger who triggered it gets nothing. The previous version had
+          // this exactly backwards.
+          logAuthFailure({
+            requestId,
+            presentedUserId: null,
+            reason: e instanceof GitHubAuthError ? "invalid_token" : "no_props",
+          });
+          return new Response("sign-in failed", { status: 401 });
+        }
+
+        // NO GRANT IS MINTED FOR A STRANGER. assertOwner in Task 6 is still the
+        // real gate and still runs on every request; this stops KV filling with
+        // dormant grants for anyone who finds the URL and signs in.
+        if (githubUserId !== config.ownerGithubUserId) {
+          logAuthFailure({ requestId, presentedUserId: githubUserId, reason: "not_owner" });
+          return new Response("this instance serves exactly one account", { status: 403 });
+        }
+
+        const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+          request: authRequest,
+          userId: githubUserId,
+          metadata: {},
+          scope: [],
+          props: propsFor(githubUserId),
+        });
+        return Response.redirect(redirectTo, 302);
+      }
+
+      // 404 EVERYTHING ELSE. The previous version fell through to
+      // parseAuthRequest, so /favicon.ico either 500'd or bounced a visitor to
+      // GitHub.
+      return new Response("not found", { status: 404 });
     },
   } satisfies ExportedHandler;
 }
 
 /**
- * The provider's auth request is round-tripped through GitHub's `state`
- * parameter, which is what ties the callback back to the authorization it
- * belongs to. It is base64url over JSON - opaque to GitHub, and validated by
- * the provider when it is presented back.
+ * The consent page needs somewhere to keep the parsed request between rendering
+ * and the approval POST. Short-lived, and NOT the bound transaction - that only
+ * opens once a human has actually approved, so an unapproved page leaves no
+ * cookie anywhere.
  */
-function encodeAuthRequest(value: unknown): string {
-  const bytes = new TextEncoder().encode(JSON.stringify(value));
-  return btoa(String.fromCharCode(...bytes))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+async function stashPending(env: Env, authRequest: AuthRequest): Promise<string> {
+  const handle = crypto.randomUUID();
+  await env.OAUTH_KV.put(`pending:${handle}`, JSON.stringify(authRequest), {
+    expirationTtl: 600,
+  });
+  return handle;
 }
 
-function decodeAuthRequest(state: string): never {
-  const base64 = state.replace(/-/g, "+").replace(/_/g, "/");
-  const binary = atob(base64);
-  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-  return JSON.parse(new TextDecoder().decode(bytes)) as never;
+async function readPending(env: Env, handle: string): Promise<AuthRequest | null> {
+  if (!handle) return null;
+  const raw = await env.OAUTH_KV.get(`pending:${handle}`);
+  if (!raw) return null;
+  await env.OAUTH_KV.delete(`pending:${handle}`);
+  return JSON.parse(raw) as AuthRequest;
 }
 ```
 
-**A note for whoever implements this.** `workers-oauth-provider`'s exact option names and the shape of `parseAuthRequest` / `completeAuthorization` are the one place in this plan where the code above is written against a library API rather than against a platform primitive, and it is the thing most likely to have moved. **Read the installed package's types before writing this file**, and if a name differs, follow the package rather than this document - the *structure* here is what matters: the provider serves its three endpoints, a default handler bridges to GitHub, and only the numeric id crosses into props. Record any correction in a comment so the next reader knows the document is behind rather than wrong.
+**A note for whoever implements this.** Every option name above was read from `@cloudflare/workers-oauth-provider` **0.10.3**'s installed types on 2026-08-24, and the full option list is recorded in `docs/MEASUREMENTS.md`. The previous version of this task passed three options that do not exist - `cookieSecret`, `allowedRedirectUriHosts`, `clientRegistrationTtlSeconds` - and TypeScript's excess-property checking on an object literal would have caught two of them, which is worth knowing about how the error happened. **If your installed version differs, follow the package.** The structure is what matters: consent before any redirect, a bound single-use transaction across GitHub, an owner gate before `completeAuthorization`, redirect policy in `clientRegistrationCallback`, and a 404 for everything unmatched.
 
-- [ ] **Step 4: Rewrite `src/index.ts` so the provider is the handler**
+`COOKIE_ENCRYPTION_KEY` is still required by Task 1 and is now genuinely used - not by the library, which has no cookie option, but by this project's own transaction cookie. Note that `transaction.ts` as written uses a random secret rather than an encryption key; if you would rather derive the cookie value from `config.cookieKey`, that is a defensible change, but random-and-stored is simpler to reason about and does not depend on the key being kept.
+- [ ] **Step 10: Rewrite `src/index.ts` so the provider is the handler**
 
 ```ts
 import { buildProvider } from "./auth/provider";
 import { ConfigError, configErrorResponse, loadConfig } from "./config";
 import { health } from "./health";
 import { logRequest, newRequestId } from "./log";
-import { mcpHandler } from "./mcp/transport"; // arrives in Task 7
+import { mcpHandler } from "./mcp/transport";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1622,13 +2137,13 @@ export default {
       return response;
     };
 
-    // /health answers before configuration is checked, and it is the ONLY route
-    // that does. An operator debugging an unconfigured instance needs something
-    // to answer, and this route holds no data.
+    // /health answers before configuration is checked, and it is the ONLY
+    // route that does. An operator debugging an unconfigured instance needs
+    // something to respond, and this route holds no data.
     if (url.pathname === "/health") return finish(await health(env, requestId));
 
-    // FAIL CLOSED. Everything below this line - OAuth and tools alike - is
-    // unreachable until every secret and variable is present and valid.
+    // FAIL CLOSED. Everything below - OAuth and tools alike - is unreachable
+    // until every secret and variable is present and valid.
     let config;
     try {
       config = loadConfig(env);
@@ -1637,26 +2152,53 @@ export default {
       throw e;
     }
 
+    // The request id travels to the OAuth handler on a header, so an auth
+    // failure inside /callback can be correlated with this log line. The
+    // previous version read a `rid` query parameter that nothing ever set.
+    const tagged = new Request(request, {
+      headers: new Headers([...request.headers, ["x-junco-request-id", requestId]]),
+    });
+
     const provider = buildProvider(config, mcpHandler(config, requestId));
-    return finish(await provider.fetch(request, env, ctx));
+    return finish(await provider.fetch(tagged, env, ctx));
   },
 };
 ```
 
-- [ ] **Step 5: Run the tests**
+**Task 8 rewrites this file once more** to wrap the provider in the rate limiter, and that version is the final one. This intermediate version is complete and runnable on its own.
 
-Run: `npx vitest run tests/auth-provider.test.ts tests/health.test.ts`
-Expected: PASS. The `/health` case in both files is deliberately duplicated: Task 3 proved the route works, and this task proves the provider did not swallow it when it became the fetch handler.
+**`mcpHandler` does not exist until Task 7.** That is a real ordering problem and the previous version of this plan did not acknowledge it. Two ways through, and either is fine:
 
-- [ ] **Step 6: Commit**
+- Execute Task 7 before this step, and Task 5's tests then pass with the real handler. The two tasks are independent apart from this import.
+- Or create `src/mcp/transport.ts` now with a placeholder that returns 501, finish Task 5, and let Task 7 replace it. If you take this route, **write the placeholder before Step 7**, or Task 5's tests cannot resolve the module and the task cannot go green.
+
+```ts
+// src/mcp/transport.ts - placeholder, replaced entirely by Task 7.
+export function mcpHandler(_config: unknown, _requestId: string): ExportedHandler {
+  return {
+    async fetch(): Promise<Response> {
+      return new Response("MCP transport arrives in Task 7", { status: 501 });
+    },
+  } satisfies ExportedHandler;
+}
+```
+
+- [ ] **Step 11: Run the tests**
+
+Run: `npx vitest run tests/auth-transaction.test.ts tests/auth-provider.test.ts tests/health.test.ts`
+Expected: PASS.
+
+The `/health` case is deliberately duplicated from Task 3: that task proved the route works, and this one proves the provider did not swallow it when it became the fetch handler. The 404 case matters for the same reason in reverse - everything unmatched now reaches the default handler, and without an explicit 404 there a browser requesting `/favicon.ico` is treated as starting an OAuth flow.
+
+- [ ] **Step 12: Commit**
 
 ```bash
-git add src/auth/provider.ts src/index.ts tests/auth-provider.test.ts
-git commit -m "feat: serve OAuth to Claude and bridge sign-in to GitHub"
+git add src/auth/provider.ts src/auth/transaction.ts src/auth/consent.ts src/index.ts \
+        tests/auth-provider.test.ts tests/auth-transaction.test.ts package.json package-lock.json
+git commit -m "feat: serve OAuth to Claude with consent and a browser-bound transaction"
 ```
 
 ---
-
 ### Task 6: Per-request owner authorization
 
 **Files:**
@@ -1888,7 +2430,7 @@ git commit -m "feat: check the owner's numeric id on every request"
 - Consumes: `TOOLS` from plan 1's `src/tools/index.ts`, `ToolError` from plan 1's `src/errors.ts`, `assertOwner` from Task 6, `Config` from Task 1, `logToolCall` from Task 2.
 - Produces:
   - `function toolErrorResult(e: ToolError): CallToolResult` - the seven codes crossing the transport boundary
-  - `function buildServer(config: Config, env: Env, requestId: string): McpServer`
+  - `function buildServer(config: Config, env: Env, requestId: string): Server` - the **low-level** `Server`, not `McpServer`; see Step 4
   - `function mcpHandler(config: Config, requestId: string): ExportedHandler`
 
 **This is the task that makes everything before it usable.** Plan 1 built 28 tools nobody could reach; Tasks 1 through 6 built a Worker that authenticates but serves nothing. This connects them, and it is deliberately thin: it iterates the registry, dispatches, and maps errors. Every decision about *what* a tool does was made in plan 1.
@@ -1942,6 +2484,21 @@ export function toolErrorResult(e: ToolError): {
  * A raw exception message can carry a SQL fragment with a person's name in it,
  * which would put PRM content into a transcript and, through the log line the
  * caller writes, into an observability dashboard.
+ */
+/**
+ * `internal` IS AN EIGHTH CODE, and Global Constraints say the set is closed at
+ * seven. The exception is deliberate and is named here rather than left for a
+ * reader to notice.
+ *
+ * The seven are the codes a CALLER can act on: every one names something the
+ * agent did and implies a different next call. This one names something the
+ * server did wrong, and there is no corrective call - which is exactly why it
+ * cannot be folded into `invalid_input` or `conflict`, both of which would tell
+ * the model to try something different when nothing different will help.
+ *
+ * It is distinguishable by shape as well as by name: no `next`, no `details`,
+ * and a `request_id` no ToolError result carries. A client that binds to the
+ * closed set can therefore tell it apart rather than mistaking it for one.
  */
 export function unexpectedErrorResult(requestId: string): {
   isError: true;
@@ -2166,8 +2723,22 @@ Expected: FAIL, cannot resolve `../src/mcp/transport`.
 
 - [ ] **Step 4: Write `src/mcp/server.ts`**
 
+**The low-level `Server`, not `McpServer`, and the reason is plan 1's registry.**
+
+`McpServer.registerTool` takes a Zod raw shape. Plan 1's `ToolDefinition.inputSchema` is a plain **JSON Schema** object - `type: "object"`, `properties`, `required`, `additionalProperties: false` - and plan 1's contract test asserts exactly that shape. Passing one to the other does not work, and the previous version of this task did it anyway.
+
+Converting JSON Schema to Zod at startup would be the obvious patch and it is the wrong one: it means a second representation of every tool's input, which is the duplication plan 1 built the registry to prevent.
+
+The low-level `Server` avoids the problem entirely. MCP's wire format for `tools/list` declares `inputSchema` as `{ type: "object", properties?, required? }` - **which is already what plan 1 produces** - so `setRequestHandler(ListToolsRequestSchema, ...)` passes the registry straight through with no adapter and no conversion. It is also a closer fit for this plan's own rule that everything advertised comes from the registry and nothing is added here.
+
+The cost is that argument validation is now ours. `McpServer` would have validated against the Zod shape before calling the tool; here the JSON Schema is advertised to the client and each tool validates its own input, which is what plan 1's tools already do - every one of them calls `assertId`, checks required fields, and throws `invalid_input`. That is not a regression, it is where the validation already lived.
+
 ```ts
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import type { Config } from "../config";
 import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
@@ -2179,13 +2750,12 @@ import { toolErrorResult, unexpectedErrorResult } from "./errors";
  * Builds a server from plan 1's registry. Per request, and discarded after.
  *
  * EVERYTHING ADVERTISED COMES FROM THE REGISTRY - name, description, input
- * schema, and all three annotations. Plan 1's Task 16 built it that way
- * specifically so this file would not have to write 28 schemas next to no
- * tests. If MCP needs something the registry does not carry, the fix goes in
- * plan 1's registry, not here.
+ * schema, and all three annotations. Plan 1's Task 16 built it that way so this
+ * file would not have to write 28 schemas next to no tests. If MCP needs
+ * something the registry does not carry, the fix goes in plan 1's registry.
  */
-export function buildServer(config: Config, env: Env, requestId: string): McpServer {
-  const server = new McpServer(
+export function buildServer(config: Config, env: Env, requestId: string): Server {
+  const server = new Server(
     { name: "junco-prm", version: "1.0.0" },
     { capabilities: { tools: {} } }
   );
@@ -2199,59 +2769,84 @@ export function buildServer(config: Config, env: Env, requestId: string): McpSer
     clock: () => new Date(),
   };
 
-  for (const tool of Object.values(TOOLS)) {
-    server.registerTool(
-      tool.name,
-      {
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-        annotations: {
-          title: tool.name,
-          readOnlyHint: tool.annotations.readOnlyHint,
-          destructiveHint: tool.annotations.destructiveHint,
-          idempotentHint: tool.annotations.idempotentHint,
-          // Every tool here touches only this instance's own D1 database.
-          openWorldHint: false,
-        },
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: Object.values(TOOLS).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      // Straight through. This is the whole reason for the low-level Server.
+      inputSchema: tool.inputSchema,
+      annotations: {
+        title: tool.name,
+        readOnlyHint: tool.annotations.readOnlyHint,
+        destructiveHint: tool.annotations.destructiveHint,
+        idempotentHint: tool.annotations.idempotentHint,
+        // Every tool here touches only this instance's own D1 database.
+        openWorldHint: false,
       },
-      async (args: unknown) => {
-        const startedAt = Date.now();
-        try {
-          const result = await tool.run(ctx, args as never);
-          logToolCall({
-            requestId,
-            tool: tool.name,
-            durationMs: Date.now() - startedAt,
-            outcome: "ok",
-          });
-          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-        } catch (e) {
-          if (e instanceof ToolError) {
-            logToolCall({
-              requestId,
-              tool: tool.name,
-              durationMs: Date.now() - startedAt,
-              outcome: "error",
-              code: e.code,
-            });
-            return toolErrorResult(e);
-          }
-          // Not one of the seven codes, so it is a bug in this server. Logged
-          // with a code the operator can grep for, and reported to the model
-          // without the exception text - which can carry a SQL fragment with a
-          // person's name in it.
-          logToolCall({
-            requestId,
-            tool: tool.name,
-            durationMs: Date.now() - startedAt,
-            outcome: "error",
-            code: "internal",
-          });
-          return unexpectedErrorResult(requestId);
-        }
+    })),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const tool = TOOLS[request.params.name];
+    if (!tool) {
+      // An unknown tool is a caller mistake, not a server fault, and it is
+      // reported the same way every other refusal is - as a result the model
+      // can read and act on.
+      return {
+        isError: true as const,
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                error: {
+                  code: "not_found",
+                  reason: `no tool named ${request.params.name}`,
+                  next: "call tools/list to see what this server offers",
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+
+    const startedAt = Date.now();
+    try {
+      const result = await tool.run(ctx, (request.params.arguments ?? {}) as never);
+      logToolCall({
+        requestId,
+        tool: tool.name,
+        durationMs: Date.now() - startedAt,
+        outcome: "ok",
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    } catch (e) {
+      if (e instanceof ToolError) {
+        logToolCall({
+          requestId,
+          tool: tool.name,
+          durationMs: Date.now() - startedAt,
+          outcome: "error",
+          code: e.code,
+        });
+        return toolErrorResult(e);
       }
-    );
-  }
+      // Not one of the seven codes, so it is a bug in this server. Logged with
+      // a code the operator can grep for, and reported to the model without the
+      // exception text - which can carry a SQL fragment with a person's name.
+      logToolCall({
+        requestId,
+        tool: tool.name,
+        durationMs: Date.now() - startedAt,
+        outcome: "error",
+        code: "internal",
+      });
+      return unexpectedErrorResult(requestId);
+    }
+  });
 
   return server;
 }
@@ -2260,7 +2855,12 @@ export function buildServer(config: Config, env: Env, requestId: string): McpSer
 - [ ] **Step 5: Write `src/mcp/transport.ts`**
 
 ```ts
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+// THE WEB-STANDARD TRANSPORT, not `server/streamableHttp.js`. That one is the
+// Node transport, built on IncomingMessage/ServerResponse, and it does not take
+// a `Request` or return a `Response` - the previous version of this task named
+// it anyway. Verified against @modelcontextprotocol/sdk 1.30.0 on 2026-08-24;
+// see docs/MEASUREMENTS.md.
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { assertOwner, NotOwnerError } from "../auth/authorize";
 import type { Config } from "../config";
 import { buildServer } from "./server";
@@ -2275,13 +2875,20 @@ import { buildServer } from "./server";
  */
 export function mcpHandler(config: Config, requestId: string): ExportedHandler {
   return {
-    async fetch(request, env): Promise<Response> {
+    // `ctx` IS NOT OPTIONAL HERE. The previous version wrote `fetch(request, env)`
+    // and read `env.props`, which is not where the library puts them - so every
+    // authenticated request would have failed the ownership check and returned
+    // 403. It failed closed, so it was a functionality blocker rather than a
+    // hole, and it was invisible to the tests because they fabricated
+    // `{...env, props}` and never went through the provider.
+    async fetch(request, env, ctx): Promise<Response> {
       // AUTHORIZATION RUNS FIRST, ON EVERY REQUEST, before the body is parsed
       // and before any tool exists. workers-oauth-provider has validated the
-      // bearer token it issued and put the grant's props on env; it explicitly
-      // leaves the question of WHO that is to us.
+      // bearer token it issued and exposed the grant's props as `ctx.props`;
+      // its README is explicit that the handler "must still enforce application
+      // permissions such as scope, ownership, and tenancy."
       try {
-        assertOwner(config, (env as { props?: unknown }).props, requestId);
+        assertOwner(config, (ctx as ExecutionContext & { props?: unknown }).props, requestId);
       } catch (e) {
         if (e instanceof NotOwnerError) {
           return new Response(
@@ -2293,16 +2900,34 @@ export function mcpHandler(config: Config, requestId: string): ExportedHandler {
       }
 
       const server = buildServer(config, env, requestId);
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const transport = new WebStandardStreamableHTTPServerTransport({
+        // Stateless: no session id, no held-open GET, nothing to diverge
+        // between a client's view and the server's.
+        sessionIdGenerator: undefined,
+        // Without this the transport answers POSTs as SSE. Claude handles
+        // either, but every test in this plan calls `response.json()`, and a
+        // JSON response is simpler to reason about for a server that never
+        // streams anything.
+        enableJsonResponse: true,
+      });
 
       await server.connect(transport);
-      return transport.handleRequest(request);
+      try {
+        return await transport.handleRequest(request);
+      } finally {
+        // Stateless mode builds both per request and discards them. Closing is
+        // what releases them rather than leaving them to the isolate.
+        await transport.close();
+        await server.close();
+      }
     },
   } satisfies ExportedHandler;
 }
 ```
 
-**A note for whoever implements this.** As with Task 5, the `@modelcontextprotocol/sdk` surface here - `registerTool`, `StreamableHTTPServerTransport`, and how `handleRequest` accepts a `Request` in a Workers runtime rather than a Node `req`/`res` pair - is the part of this plan most likely to have moved. **Read the installed package's types first**, and follow the package where it differs. The structure is what matters: authorize, build a server from `TOOLS`, connect a stateless transport, answer once. If the SDK's Workers story requires an adapter, that adapter belongs in this file and nowhere else.
+**A note for whoever implements this.** Every SDK surface named here was read from `@modelcontextprotocol/sdk` **1.30.0**'s installed types on 2026-08-24, and the findings are in `docs/MEASUREMENTS.md`. The previous version of this task got two things wrong from recollection: it named `StreamableHTTPServerTransport`, which is the Node transport and does not take a `Request`, and it used `McpServer.registerTool`, which wants a Zod shape rather than the JSON Schema plan 1's registry holds.
+
+**If your installed version differs, follow the package.** The structure is what matters: authorize first, build a server from `TOOLS` with the registry's JSON Schema passed through untouched, connect a stateless web-standard transport, answer once, close both. If a future SDK removes the low-level `Server`, the replacement must still take JSON Schema directly or plan 1's registry needs an adapter - and that adapter belongs in this file and nowhere else.
 
 - [ ] **Step 6: Run the test to verify it passes**
 
@@ -2331,7 +2956,8 @@ git commit -m "feat: serve the tool registry over stateless MCP"
 **Interfaces:**
 - Consumes: Plan 1 Task 0's finding, recorded in `docs/MEASUREMENTS.md` as `RATE_LIMIT_STRATEGY`.
 - Produces:
-  - `function checkRateLimit(env: Env, request: Request): Promise<boolean>` - the same signature either way
+  - `function checkRateLimit(env: Env, request: Request, bucket: "public" | "mcp"): Promise<boolean>` - the same signature either way
+  - `const PUBLIC_LIMIT: number`, `const MCP_LIMIT: number` - two buckets, because `/mcp` carries the owner's real traffic and the OAuth routes carry none
   - `function rateLimitedResponse(requestId: string): Response`
 
 > **ANSWERED. Build Step 3a, the binding version. Skip Step 3b.**
@@ -2353,7 +2979,9 @@ One caveat that survives the answer: a local `wrangler dev` reports the binding 
 
 **Two honest caveats the spec states and this task inherits.** Cloudflare describes the binding as permissive and eventually consistent rather than exact, so this is protection against burning quota and not an accounting mechanism. And it runs *inside* the invocation, so it cannot protect the 100,000-requests-per-day Worker quota itself - only the D1 and GitHub work behind it. An attacker who simply wants to exhaust the day's request allowance can, and nothing in a Worker can stop that.
 
-**Authenticated requests are not limited.** One deployment serves one person, and rate-limiting the owner's own tool calls would be limiting the only legitimate traffic on the instance. The limiter runs on the unauthenticated surface and lets `/mcp` through, where `assertOwner` is the gate.
+**Every route is limited, `/mcp` included, at a higher threshold.** An earlier version of this task exempted `/mcp` on the grounds that one deployment serves one person and throttling the owner's own tool calls would throttle the only legitimate traffic. That confused a path with a caller: **`/mcp` is not the authenticated path, it is the path that requires authentication**, and it is reachable by anyone who finds the URL. An anonymous flood of token-shaped garbage costs a Worker invocation and a KV read per token the provider tries to validate - the exact quota this limiter defends. The correct conclusion from "the owner's traffic lives there" is a *higher* limit, not no limit.
+
+`/health` is limited too, for the same reason and because the spec names it explicitly: it is unauthenticated and costs a D1 query per hit.
 
 - [ ] **Step 1: Write the failing test `tests/ratelimit.test.ts`**
 
@@ -2451,12 +3079,25 @@ Build this **only if** `docs/MEASUREMENTS.md` records `RATE_LIMIT_STRATEGY = "bi
  * exact. It protects quota, not correctness, and this file does not pretend
  * otherwise.
  */
-export async function checkRateLimit(env: Env, request: Request): Promise<boolean> {
-  const limiter = env.RATE_LIMITER;
+/**
+ * Two buckets. `/mcp` carries the owner's real tool calls and gets a generous
+ * ceiling; the OAuth and health routes carry no legitimate volume at all.
+ */
+export const PUBLIC_LIMIT = 60;
+export const MCP_LIMIT = 600;
+
+export async function checkRateLimit(
+  env: Env,
+  request: Request,
+  bucket: "public" | "mcp"
+): Promise<boolean> {
+  const limiter = bucket === "mcp" ? env.MCP_RATE_LIMITER : env.RATE_LIMITER;
   if (!limiter) return true; // fail open - see below
 
   try {
-    const { success } = await limiter.limit({ key: clientKey(request) });
+    // The bucket is in the key as well as in the binding, so a client cannot
+    // spend the cheap bucket's allowance against the expensive one.
+    const { success } = await limiter.limit({ key: `${bucket}:${clientKey(request)}` });
     return success;
   } catch {
     // FAIL OPEN, deliberately, and against the grain of everything else here.
@@ -2484,12 +3125,13 @@ And in `wrangler.jsonc`:
 ```jsonc
 {
   "ratelimits": [
-    { "name": "RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } }
+    { "name": "RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "MCP_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } }
   ]
 }
 ```
 
-Sixty requests a minute per IP against the unauthenticated surface. A legitimate OAuth flow is a handful of requests; sixty is generous enough that nobody real will ever see a 429, and low enough that a registration loop stops being free.
+Sixty requests a minute per IP on the OAuth and health routes, six hundred on `/mcp`. A legitimate OAuth flow is a handful of requests, so sixty is generous enough that nobody real will ever see a 429 there and low enough that a registration loop stops being free. Six hundred on `/mcp` is well above any conversational tool-call rate one person can produce and still bounds an anonymous flood, each request of which costs a KV read while the provider tries to validate whatever token was presented.
 
 - [ ] **Step 3b: Write `src/ratelimit.ts` — the KV TOKEN BUCKET version**
 
@@ -2497,7 +3139,8 @@ Build this **only if** `docs/MEASUREMENTS.md` records `RATE_LIMIT_STRATEGY = "kv
 
 ```ts
 const WINDOW_SECONDS = 60;
-const LIMIT_PER_WINDOW = 60;
+export const PUBLIC_LIMIT = 60;
+export const MCP_LIMIT = 600;
 
 /**
  * A fixed-window counter over the KV namespace the deployment already has.
@@ -2518,15 +3161,20 @@ const LIMIT_PER_WINDOW = 60;
  * written down because the next reader will otherwise assume it is a real
  * limiter and rely on it for something it cannot do.
  */
-export async function checkRateLimit(env: Env, request: Request): Promise<boolean> {
+export async function checkRateLimit(
+  env: Env,
+  request: Request,
+  bucket: "public" | "mcp"
+): Promise<boolean> {
   if (!env.OAUTH_KV) return true; // fail open
 
   const window = Math.floor(Date.now() / 1000 / WINDOW_SECONDS);
-  const key = `rl:${clientKey(request)}:${window}`;
+  const key = `rl:${bucket}:${clientKey(request)}:${window}`;
+  const ceiling = bucket === "mcp" ? MCP_LIMIT : PUBLIC_LIMIT;
 
   try {
     const current = Number((await env.OAUTH_KV.get(key)) ?? "0");
-    if (current >= LIMIT_PER_WINDOW) return false;
+    if (current >= ceiling) return false;
 
     // expirationTtl is what keeps this from accumulating a key per client per
     // minute forever. Two windows of slack so a late write cannot outlive it.
@@ -2555,23 +3203,54 @@ export function rateLimitedResponse(requestId: string): Response {
 
 - [ ] **Step 4: Wrap the provider in `src/index.ts`**
 
-The limiter goes **around** the provider, not inside anything it serves. Insert between the config check and the provider call:
+The limiter goes **around** the provider, not inside anything it serves - and **above the `/health` branch**, not below it.
+
+That placement is the whole of this step. `/health` is unauthenticated, costs a D1 query per hit, and is named in the spec as one of the routes the limiter exists to protect; a limiter inserted after the early `/health` return exempts it. So the check becomes the first thing in the handler, before `/health` and before the config check, and it is the only thing in this file that runs ahead of the fail-closed floor.
+
+Replace the top of the handler, between `finish` and the `/health` branch:
 
 ```ts
-    // WRAPS THE PROVIDER. workers-oauth-provider serves /authorize, /token, and
-    // /register itself, so a limiter behind it never sees the routes this
-    // exists to protect.
+    // WRAPS THE PROVIDER, AND COVERS EVERY ROUTE INCLUDING /health AND /mcp.
     //
-    // /mcp is exempt: one deployment serves one person, and rate-limiting the
-    // owner's own tool calls would throttle the only legitimate traffic here.
-    // assertOwner is the gate on that path.
-    if (url.pathname !== "/mcp" && !(await checkRateLimit(env, request))) {
+    // The previous version exempted both, and the reasoning for each was wrong.
+    //
+    // /health was exempt because the branch above returns before this line. The
+    // spec names /health explicitly as one of the routes the limiter exists to
+    // protect, and it costs a D1 query per hit.
+    //
+    // /mcp was exempt on the grounds that "rate-limiting the owner's own tool
+    // calls would throttle the only legitimate traffic." That confused a path
+    // with a caller. /mcp is not the authenticated path, it is the path that
+    // REQUIRES authentication - and it is reachable by anyone. An anonymous
+    // flood of token-shaped garbage still costs a Worker invocation and a KV
+    // read for each token the provider tries to validate, which is exactly the
+    // quota this limiter exists to defend.
+    //
+    // The real argument was for a HIGHER limit on /mcp, not for no limit.
+    const bucket = url.pathname === "/mcp" ? "mcp" : "public";
+    if (!(await checkRateLimit(env, request, bucket))) {
       return finish(rateLimitedResponse(requestId));
     }
 
+    if (url.pathname === "/health") return finish(await health(env, requestId));
+
+    let config;
+    try {
+      config = loadConfig(env);
+    } catch (e) {
+      if (e instanceof ConfigError) return finish(configErrorResponse(e, requestId));
+      throw e;
+    }
+
+    const tagged = new Request(request, {
+      headers: new Headers([...request.headers, ["x-junco-request-id", requestId]]),
+    });
+
     const provider = buildProvider(config, mcpHandler(config, requestId));
-    return finish(await provider.fetch(request, env, ctx));
+    return finish(await provider.fetch(tagged, env, ctx));
 ```
+
+**This is the final `src/index.ts`.** Tasks 3 and 5 each wrote a complete earlier version; if you are reading these out of order, this one supersedes both.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -2784,6 +3463,15 @@ Named so a reviewer does not read the absence as an oversight.
 - **No local stdio adapter.** The spec defers it to "later, only if wanted." The tool layer stays transport-agnostic so it remains cheap, and this plan does nothing that would make it harder.
 - **No handling of a database reaching the 500 MB free-plan limit.** This is a real gap, carried forward from the spec's own deferred findings, and it is named here rather than left to be discovered. Nothing in phase 1 detects it, warns about it, or degrades gracefully when it happens.
 - **No per-tool rate limiting or quota.** One deployment serves one person; the limiter guards the unauthenticated surface, and the owner's own tool calls are unthrottled.
+
+## Decisions taken in the 2026-08-24 security redesign
+
+Four choices behind the Task 5 rewrite, each made after the review and each with a rejected alternative worth recording.
+
+- **The pending authorization lives in KV under a random single-use handle, bound to a browser cookie.** The alternative considered and rejected was signing the encoded auth request with `COOKIE_ENCRYPTION_KEY` and keeping it stateless. That does not work, and a reviewer said so precisely: a signature proves this Worker minted the state, not that this browser started the flow, and an attacker obtains a validly signed state simply by starting a real one. The cookie is what defeats the attack; the KV record is what makes the handle meaningless to forge.
+- **The Worker renders its own consent screen.** GitHub's consent screen authorizes sharing a GitHub identity with Junco - it is not consent to give a downstream MCP client the owner's contacts, and GitHub shows it once then auto-approves forever. Cloudflare's provider documentation requires the application to show consent before `completeAuthorization`. It is also the only thing that lets a human *see* a redirect URI pointing somewhere unexpected, which is why that field is the most prominent thing on the page.
+- **Redirect URIs are matched exactly, not by host.** The first draft accepted any path on `claude.ai` and `claude.com`, which was a loosening of what the spec asked for, introduced without saying so. This value decides where an authorization code gets delivered; a future path change should cost a reviewed edit. Loopback keeps the standard native-app exception, since Desktop and inspector clients need it.
+- **Dynamic Client Registration stays open, with policy in `clientRegistrationCallback`.** Closing it would break the connector, since Claude registers that way. `disallowPublicClientRegistration` exists and was considered; the narrower fix is to bound what a registration can *do* rather than whether it can happen, which is what enforcing redirect URIs achieves.
 
 ## Decisions taken while writing this plan
 

@@ -133,6 +133,67 @@ run this inside workerd, and Task 8 Step 5c now asks the implementer to.
 
 ---
 
+## Run of 2026-08-24, third: library APIs
+
+Not a measurement of anything, just reading installed types instead of trusting
+recollection. Done after a four-agent review of plan 2 found that three of the
+four options passed to `OAuthProvider` do not exist.
+
+Versions installed to check: **`@cloudflare/workers-oauth-provider` 0.10.3**,
+**`@modelcontextprotocol/sdk` 1.30.0**.
+
+### `workers-oauth-provider`
+
+The complete option set on `OAuthProviderOptions`: `apiRoute`, `apiHandler`,
+`apiHandlers`, `defaultHandler`, `authorizeEndpoint`, `tokenEndpoint`,
+`clientRegistrationEndpoint`, `accessTokenTTL`, `refreshTokenTTL`,
+`clientRegistrationTTL`, `scopesSupported`, `allowImplicitFlow`,
+`allowPlainPKCE`, `allowTokenExchangeGrant`, `enterpriseManagedAuthorization`,
+`disallowPublicClientRegistration`, `clientRegistrationCallback`,
+`tokenExchangeCallback`, `resolveExternalToken`, `onError`.
+
+Three names plan 2 used are **not among them**: `cookieSecret`,
+`allowedRedirectUriHosts`, and `clientRegistrationTtlSeconds`. The TTL option is
+`clientRegistrationTTL`. There is no cookie option at all - the library does not
+manage a consent cookie, which means `COOKIE_ENCRYPTION_KEY` had no consumer and
+the application has to do its own cookie handling. Redirect policy belongs in
+`clientRegistrationCallback`, which receives `{ clientMetadata, request }`.
+
+**Grant props reach a protected handler as `ctx.props`, not `env.props`.** The
+README is explicit that the provider validates the bearer token and exposes the
+application data through `ctx.props`, and equally explicit that the handler
+"must still enforce application permissions such as scope, ownership, and
+tenancy" - which is what `assertOwner` is for.
+
+### `@modelcontextprotocol/sdk`
+
+`WebStandardStreamableHTTPServerTransport` exists, in
+`server/webStandardStreamableHttp.js`, and its `handleRequest(req: Request,
+options?): Promise<Response>` is exactly the shape a Worker needs.
+`StreamableHTTPServerTransport`, which plan 2 originally named, is the Node
+transport built on `IncomingMessage`/`ServerResponse`. Both take
+`sessionIdGenerator` and `enableJsonResponse`.
+
+`McpServer.registerTool` takes a Zod raw shape, **not** a JSON Schema object, so
+plan 1's registry cannot feed it directly. But the wire-level `ToolSchema` in
+`types.d.ts` declares `inputSchema` as `{ type: "object", properties?, required?
+}` - which is exactly the shape plan 1 already produces. So the low-level
+`Server` with `setRequestHandler(ListToolsRequestSchema, ...)` passes the
+registry through untouched, with no adapter and no second schema. That is both
+the working path and a better fit for plan 2's own rule that everything
+advertised comes from the registry.
+
+### The lesson worth keeping
+
+Every one of these was written from recollection and stated with confidence.
+Reading two `.d.ts` files took a few minutes and would have prevented all of
+them. **This is the third time in one day** that something asserted here as fact
+turned out wrong - after the free-plan CPU limit and the SQLite cascade claim -
+and it is the only one of the three that could have been checked without
+deploying anything.
+
+---
+
 ## Constants this run set
 
 | Constant | Value | Bounded by |
