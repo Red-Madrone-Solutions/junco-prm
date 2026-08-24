@@ -3465,7 +3465,16 @@ function requireName(value: unknown): string {
   return value.trim();
 }
 
-export async function createPerson(ctx: ToolContext, input: CreatePersonInput): Promise<Person> {
+export async function createPerson(
+  ctx: ToolContext,
+  input: CreatePersonInput
+  // The intersection is not cosmetic: `possible_duplicates` is present at
+  // runtime whenever weak candidates exist, and its entire purpose is that an
+  // agent reads it and promotes the roster row instead of keeping a duplicate.
+  // Declared as bare `Promise<Person>`, a strictly-typed caller cannot see the
+  // field at all, and a returned value nobody can see the type of is one
+  // callers will not use.
+): Promise<Person & { possible_duplicates?: DuplicateCandidate[] }> {
   const { idempotency_key, ...rest } = input;
   return withIdempotency(ctx, "create_person", idempotency_key, rest, async () => {
     const full_name = requireName(input.full_name);
@@ -3586,12 +3595,21 @@ export async function updatePerson(ctx: ToolContext, input: UpdatePersonInput): 
       .bind(...values, id)
       .run();
 
-    if (result.meta.changes === 0) {
-      throw new ToolError("not_found", `no person with id ${id}`);
-    }
+      if (result.meta.changes === 0) {
+        throw new ToolError("not_found", `no person with id ${id}`);
+      }
 
-    return loadPerson(ctx, id);
-  });
+      return loadPerson(ctx, id);
+    },
+    // THE SUBJECT. An earlier revision of this file closed the call with `});`
+    // while the comment above claimed this argument was here - the comment
+    // described something the code did not do, and no test in this task would
+    // have caught it. `subject_id` is what lets `delete_person` scrub stored
+    // responses, and `response_json` holds a full copy of every person record a
+    // write returned, so an omission here means erasure leaves the person in a
+    // table no reader looks in.
+    personId
+  );
 }
 
 export async function loadPerson(ctx: ToolContext, id: string): Promise<Person> {

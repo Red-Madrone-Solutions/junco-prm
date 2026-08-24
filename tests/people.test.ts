@@ -221,6 +221,15 @@ describe("createPerson", () => {
     const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM people").first<{ n: number }>();
     expect(row?.n).toBe(1);
   });
+
+  it("records no subject_id, because the id does not exist until after the duplicate check runs", async () => {
+    await createPerson(ctx, { full_name: "Ada Lovelace", idempotency_key: "k1" });
+    const row = await env.DB
+      .prepare("SELECT subject_id FROM idempotency_keys WHERE key = ?")
+      .bind("create_person:k1")
+      .first<{ subject_id: string | null }>();
+    expect(row?.subject_id).toBeNull();
+  });
 });
 
 describe("updatePerson", () => {
@@ -253,6 +262,20 @@ describe("updatePerson", () => {
     await expect(
       updatePerson(ctx, { person_id: newId("p"), job_title: "Engineer" })
     ).rejects.toThrow(ToolError);
+  });
+
+  it("records the person id as subject_id, so a later hard-delete can scrub the stored response", async () => {
+    const created = await createPerson(ctx, { full_name: "Ada Lovelace" });
+    await updatePerson(ctx, {
+      person_id: created.id,
+      job_title: "Engineer",
+      idempotency_key: "k1",
+    });
+    const row = await env.DB
+      .prepare("SELECT subject_id FROM idempotency_keys WHERE key = ?")
+      .bind("update_person:k1")
+      .first<{ subject_id: string | null }>();
+    expect(row?.subject_id).toBe(created.id);
   });
 });
 

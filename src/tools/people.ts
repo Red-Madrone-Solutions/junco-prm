@@ -19,7 +19,7 @@ interface PersonRow {
   updated_at: string;
 }
 
-import { findDuplicateCandidates, STRONG_MATCH } from "./duplicates";
+import { findDuplicateCandidates, STRONG_MATCH, type DuplicateCandidate } from "./duplicates";
 
 export function toPerson(row: PersonRow): Person {
   return { record_kind: "person", ...row };
@@ -53,7 +53,10 @@ function requireName(value: unknown): string {
   return value.trim();
 }
 
-export async function createPerson(ctx: ToolContext, input: CreatePersonInput): Promise<Person> {
+export async function createPerson(
+  ctx: ToolContext,
+  input: CreatePersonInput
+): Promise<Person & { possible_duplicates?: DuplicateCandidate[] }> {
   const { idempotency_key, ...rest } = input;
   return withIdempotency(ctx, "create_person", idempotency_key, rest, async () => {
     const full_name = requireName(input.full_name);
