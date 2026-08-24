@@ -1321,8 +1321,14 @@ export async function externalRowKey(
 ): Promise<string> {
   if (sourceRowId && sourceRowId.trim() !== "") return `k:${sourceRowId.trim()}`;
   if (row.email && row.email !== "") return `e:${row.email}`;
+  // `||`, not `??`. `??` substitutes only for null and undefined, so an
+  // organization of "" would survive as an empty string and canonicalize to
+  // `"organization":""` where an absent one gives `"organization":null` - two
+  // different keys for the same person. `prepareRow` happens to sanitize ""
+  // away today, but a permanent key must not depend on every future caller
+  // doing that. Among strings only "" is falsy, so no real value is affected.
   return `h:${await sha256Hex(
-    canonicalJson({ full_name: row.full_name, organization: row.organization ?? null })
+    canonicalJson({ full_name: row.full_name, organization: row.organization || null })
   )}`;
 }
 
