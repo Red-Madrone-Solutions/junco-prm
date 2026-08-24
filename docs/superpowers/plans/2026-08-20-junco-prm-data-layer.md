@@ -1691,7 +1691,7 @@ describe("staged schema", () => {
     }
     const insertProvenance = (id: string, personId: string) =>
       env.DB.prepare(
-        "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
         .bind(id, personId, "wcus-2026", "row-7", "WordCamp US 2026", "WCUS 2026", "https://example.test/a", T, "{}", "sha256:abc", T)
         .run();
@@ -1711,7 +1711,7 @@ describe("staged schema", () => {
 
     for (const [id, key] of [["ps_1", "wcus-2026"], ["ps_2", "wceu-2026"]]) {
       await env.DB.prepare(
-        "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
         .bind(id, "p_1", key, "row-7", "label", "event", "https://example.test", T, "{}", "sha256:abc", T)
         .run();
@@ -1735,7 +1735,7 @@ describe("staged schema", () => {
       .run();
     await insertEntry("re_1", sourceId, "row-7", runId);
     await env.DB.prepare(
-      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
       .bind(
         "ps_1", "p_1", "wcus-2026", "row-7", "WordCamp US 2026", "WCUS 2026",
@@ -1886,7 +1886,13 @@ CREATE TABLE person_sources (
   source_url          TEXT NOT NULL,
   source_captured_at  TEXT NOT NULL,
   raw_record_snapshot TEXT NOT NULL,
-  raw_record_hash     TEXT NOT NULL,
+  -- NOT a hash of the snapshot beside it. This is the `content_hash` the staged
+  -- row carried at promotion, so `matches_current` can compare it against that
+  -- row's current `content_hash` and answer "has this roster row changed since
+  -- we promoted from it". The previous name, `raw_record_hash`, promised
+  -- something the column does not hold, and anyone in plan 3 verifying the
+  -- snapshot against it would find they never match.
+  content_hash_at_promotion TEXT NOT NULL,
   promoted_at         TEXT NOT NULL,
   -- Two people promoted from one roster row is a bug, not a tolerated
   -- duplicate. This constraint is what replaced `person_roster_entries`.
@@ -1931,14 +1937,33 @@ git commit -m "feat: add staged roster and durable provenance schema"
   - `interface ToolContext { db: D1Database; timezone: string; clock: () => Date }`
   - `function today(ctx: ToolContext): string` - the current date in the owner's zone, as `YYYY-MM-DD`
   - `function envelope<T extends object>(ctx: ToolContext, body: T): T & { today: string }` - the wrapper every tool result passes through
-  - `function withIdempotency<T>(ctx: ToolContext, tool: string, key: string | undefined, input: unknown, run: () => Promise<T>): Promise<T>`
+  - `function withIdempotency<T>(ctx, tool, key, input, run, subjectId?): Promise<T>` - `subjectId` is the person this write is about, recorded so `deletePerson` can scrub the stored responses
   - `function hashJson(value: unknown): Promise<string>` - stable SHA-256 over canonical JSON, delegating to `canonicalJson` and `sha256Hex` so there is one canonicalization in the codebase and not two
   - `function mintConfirmation(ctx: ToolContext, action: string, targetId: string, preview: unknown): Promise<string>`
-  - `function redeemConfirmation(ctx: ToolContext, action: string, targetId: string, token: unknown): Promise<void>`
+  - `function redeemConfirmation(ctx, action, targetId, token, currentPreview?): Promise<void>` - refuses with `conflict` when the state no longer matches what the token was minted from
   - `function recordChunkReceipt(ctx, runId, offset, rowCount, payloadHash, result): Promise<void>`
   - `function findChunkReceipt(ctx, runId, offset, payloadHash): Promise<unknown | null>` - the replay, looked up **before** the offset check
 
 These are cross-cutting and every write task after this one depends on them, which is why they come before any tool.
+
+**Every person-scoped write records its subject, and this is not optional.**
+
+`idempotency_keys.response_json` stores whatever a tool returned, which for most writes is a full person record - name, notes, contacts, encounters. That makes this table a shadow copy of the PRM, and `delete_person` has no way to reach it unless each row says who it is about.
+
+So every tool that takes a `person_id` validates it **before** calling `withIdempotency` and passes it as the trailing `subjectId` argument:
+
+```ts
+const personId = assertId("p", input.person_id);
+return withIdempotency(ctx, "add_contact", idempotency_key, rest, async () => {
+  /* ... */
+}, personId);
+```
+
+The tools this covers: `update_person`, `archive_person`, `unarchive_person`, `delete_person`, `add_contact`, `remove_contact`, `add_link`, `remove_link`, `add_tags`, `remove_tags`, `log_encounter`, `create_followup`, and `promote_roster_entry` once it knows which person it produced. `create_person` mints its id inside the closure and cannot pass one up front; it is the one exception, and it is safe because a person who has just been created has no prior stored responses to scrub.
+
+Tools that are not about one person - `import_roster`, `finalize_import`, `purge_roster_source` - pass nothing.
+
+Task 16's contract tests assert this for every tool in the list, because an omission here is invisible until someone exercises their right to be erased.
 
 **Three operational tables, not two.** The previous draft had idempotency keys and confirmation tokens. Import chunk receipts are the third, and leaving them out wedged a run at an offset the caller could not discover: a chunk that commits and then loses its response is retried at an offset the run has already passed, so the offset check rejects it, and the agent has no way to learn where the run actually is. The receipt is what makes the single most likely runtime failure in the system self-healing.
 
@@ -1947,14 +1972,28 @@ These are cross-cutting and every write task after this one depends on them, whi
 - [ ] **Step 1: Write `migrations/0003_operational.sql`**
 
 ```sql
+-- `response_json` holds a full copy of whatever the tool returned, which for
+-- most writes is a complete person record. `subject_id` is what makes that
+-- erasable: `delete_person` scrubs every row whose subject is the person being
+-- deleted, in the same batch as the deletion itself.
+--
+-- Without it this table is a shadow copy of the PRM that `delete_person` cannot
+-- reach - an erasure tool that leaves the erased person's name, notes, and
+-- contact details sitting in an operational table.
+--
+-- Nullable, because tools that are not about one person (import_roster,
+-- finalize_import, purge_roster_source) have no subject to record.
 CREATE TABLE idempotency_keys (
-  key           TEXT PRIMARY KEY,
+  key           TEXT PRIMARY KEY NOT NULL,
   tool          TEXT NOT NULL,
+  subject_id    TEXT,
   request_hash  TEXT NOT NULL,
   response_json TEXT,
   created_at    TEXT NOT NULL,
   completed_at  TEXT
 );
+
+CREATE INDEX idx_idempotency_subject ON idempotency_keys(subject_id);
 
 CREATE TABLE confirmations (
   token      TEXT PRIMARY KEY,
@@ -2154,7 +2193,19 @@ export async function withIdempotency<T>(
   tool: string,
   key: string | undefined,
   input: unknown,
-  run: () => Promise<T>
+  run: () => Promise<T>,
+  /**
+   * The person this write is about, when there is one.
+   *
+   * Recorded so `delete_person` can scrub the stored responses along with the
+   * person. `response_json` holds whatever the tool returned, which for most
+   * writes is a full person record, so without this the table is a shadow copy
+   * of the PRM that erasure cannot reach.
+   *
+   * Every tool taking a `person_id` passes it. Tools that are not about one
+   * person - import, finalize, purge - pass nothing.
+   */
+  subjectId?: string
 ): Promise<T> {
   if (!key) return run();
 
@@ -2166,11 +2217,11 @@ export async function withIdempotency<T>(
   // operation, and everyone else sees the claim rather than an empty table.
   const claim = await ctx.db
     .prepare(
-      `INSERT INTO idempotency_keys (key, tool, request_hash, response_json, created_at)
-       VALUES (?, ?, ?, NULL, ?)
+      `INSERT INTO idempotency_keys (key, tool, subject_id, request_hash, response_json, created_at)
+       VALUES (?, ?, ?, ?, NULL, ?)
        ON CONFLICT (key) DO NOTHING`
     )
-    .bind(scoped, tool, requestHash, at)
+    .bind(scoped, tool, subjectId ?? null, requestHash, at)
     .run();
 
   if (claim.meta.changes === 0) {
@@ -2315,7 +2366,21 @@ export async function redeemConfirmation(
   ctx: ToolContext,
   action: string,
   targetId: string,
-  token: unknown
+  token: unknown,
+  /**
+   * The preview as it looks NOW, re-read by the caller immediately before
+   * redeeming. Compared against what the token was minted from.
+   *
+   * The two-call protocol exists so a human can read what is about to be
+   * destroyed. A token that authorizes something different from what was shown
+   * defeats the entire mechanism: a `purge_roster_source` preview reporting 0
+   * entries can otherwise authorize deleting 100 rows imported between the two
+   * calls, and the human approved a preview that said nothing would be lost.
+   *
+   * Optional only so the signature can be adopted task by task. Every caller
+   * passes it.
+   */
+  currentPreview?: unknown
 ): Promise<void> {
   if (typeof token !== "string" || !token.startsWith("cnf_")) {
     throw new ToolError(
@@ -2341,7 +2406,26 @@ export async function redeemConfirmation(
     .bind(at, token, action, targetId, at)
     .run();
 
-  if (redeemed.meta.changes === 1) return;
+  if (redeemed.meta.changes === 1) {
+    if (currentPreview === undefined) return;
+
+    // The token is spent by now, deliberately. If the state moved, this call
+    // fails AND the stale token is dead, so the caller has to take a fresh
+    // preview rather than retrying against the same one.
+    const minted = await ctx.db
+      .prepare("SELECT preview FROM confirmations WHERE token = ?")
+      .bind(token)
+      .first<{ preview: string }>();
+
+    if (minted && minted.preview !== JSON.stringify(currentPreview)) {
+      throw new ToolError(
+        "conflict",
+        `the data changed since that preview was taken, so ${action} was not performed`,
+        `call ${action} again with only the target id to see a current preview`
+      );
+    }
+    return;
+  }
 
   // The update matched nothing. Read the row only to say why, never to decide.
   const row = await ctx.db
@@ -3038,10 +3122,10 @@ export interface Source {
   source_url: string;
   source_captured_at: string;
   /** The hash of what was captured, so a caller can compare without the text. */
-  raw_record_hash: string;
+  content_hash_at_promotion: string;
   /**
    * Whether the staged row still matches what was promoted. True when the
-   * current `roster_entries.content_hash` equals `raw_record_hash`, false when
+   * current `roster_entries.content_hash` equals `content_hash_at_promotion`, false when
    * the row has changed since, and null when the staged row is gone - purged,
    * or never re-imported. Null is a third state rather than false because
    * "changed" and "no longer there" call for different next moves.
@@ -3421,8 +3505,20 @@ export interface UpdatePersonInput extends Partial<Record<Writable, string | nul
 
 export async function updatePerson(ctx: ToolContext, input: UpdatePersonInput): Promise<Person> {
   const { idempotency_key, ...rest } = input;
-  return withIdempotency(ctx, "update_person", idempotency_key, rest, async () => {
-    const id = assertId("p", input.person_id);
+  // The id is validated OUT here rather than inside the closure, so it can be
+  // passed as the subject. See "Every person-scoped write records its subject"
+  // in Task 4 - this is the pattern every such tool follows.
+  const personId = assertId("p", input.person_id);
+  return withIdempotency(
+    ctx,
+    "update_person",
+    idempotency_key,
+    rest,
+    async () => {
+      const id = personId;
+      // NOTE FOR THE IMPLEMENTER: the body below is unchanged from the version
+      // that validated `id` inside the closure. Only the two lines above and
+      // the `personId` argument at the bottom of this call are new.
 
     const sets: string[] = [];
     const values: (string | null)[] = [];
@@ -4317,8 +4413,12 @@ export async function deletePerson(
 
   const { idempotency_key, ...rest } = input;
   return withIdempotency(ctx, "delete_person", idempotency_key, rest, async () => {
-    await redeemConfirmation(ctx, "delete_person", id, input.confirmation_token);
+    // The preview is taken FIRST and handed to redeem, which refuses if it no
+    // longer matches what the token was minted from. Encounters logged between
+    // the two calls would otherwise be destroyed by a confirmation the human
+    // gave against a smaller number.
     const preview = await deletePreview(ctx, id);
+    await redeemConfirmation(ctx, "delete_person", id, input.confirmation_token, preview);
 
     // EVERY CHILD IS DELETED EXPLICITLY. This IS belt-and-braces over the
     // ON DELETE CASCADE declarations in the migrations, and an earlier version
@@ -4352,6 +4452,20 @@ export async function deletePerson(
       ctx.db.prepare("DELETE FROM person_tags WHERE person_id = ?").bind(id),
       ctx.db.prepare("DELETE FROM person_sources WHERE person_id = ?").bind(id),
       ctx.db.prepare("DELETE FROM people WHERE id = ?").bind(id),
+
+      // THE OPERATIONAL TABLES ARE PART OF THE ERASURE, not housekeeping.
+      //
+      // `idempotency_keys.response_json` holds a full copy of whatever each
+      // write returned, which for most writes is a complete person record -
+      // name, notes, contacts, encounters. `confirmations.preview` holds the
+      // name and the counts shown in this very delete's preview call. Leaving
+      // either behind means `delete_person` removed the person from the tables
+      // a reader would look in, and left them in two a reader would not.
+      //
+      // This tool exists to answer a request to be erased. "We removed most of
+      // it" is not an answer to that request.
+      ctx.db.prepare("DELETE FROM idempotency_keys WHERE subject_id = ?").bind(id),
+      ctx.db.prepare("DELETE FROM confirmations WHERE target_id = ?").bind(id),
     ]);
 
     return { status: "deleted", deleted: preview };
@@ -4359,7 +4473,7 @@ export async function deletePerson(
 }
 ```
 
-**The child list has to stay in step with the schema.** Every table carrying a `person_id` foreign key appears above, and a new one added in a later migration has to be added here too. That is a real maintenance hazard and the test below is what catches it: it asserts that no FTS row survives, so a table added without a line here fails a test rather than leaking text into search silently. `person_tags` has no FTS index and no trigger, and it is deleted explicitly anyway, for the same reason - the rule is "every child, explicitly," not "every child that currently happens to have a trigger."
+**The list has two halves and both have to stay in step with the schema.** Every table carrying a `person_id` foreign key appears above, and a new one added in a later migration has to be added here too. So do the two **operational** tables, which carry no foreign key at all and are therefore invisible to any cascade: `idempotency_keys`, matched on the `subject_id` every person-scoped write records, and `confirmations`, matched on `target_id`. Those two are the ones a reader will forget, precisely because nothing in the schema points at them. That is a real maintenance hazard and the test below is what catches it: it asserts that no FTS row survives, so a table added without a line here fails a test rather than leaking text into search silently. `person_tags` has no FTS index and no trigger, and it is deleted explicitly anyway, for the same reason - the rule is "every child, explicitly," not "every child that currently happens to have a trigger."
 
 Only the commit call is wrapped. Minting a preview writes a confirmation row and nothing else, and replaying a preview should hand back a fresh token rather than a stale one that may already be redeemed or expired.
 
@@ -4415,6 +4529,62 @@ it("leaves NO fts row behind after a hard delete", async () => {
     "SELECT COUNT(*) AS n FROM encounters_fts WHERE encounter_id NOT IN (SELECT id FROM encounters)"
   ).first<{ n: number }>();
   expect(orphans?.n).toBe(0);
+});
+
+it("leaves NOTHING in the operational tables either", async () => {
+  // The half a cascade cannot reach, because neither table has a foreign key
+  // to `people`. `idempotency_keys.response_json` holds full copies of every
+  // write result about this person; `confirmations.preview` holds their name
+  // and counts. An erasure tool that empties the durable tables and leaves
+  // these two has not erased anything, it has relocated it.
+  const person = await createPerson(ctx, {
+    full_name: "Ada Lovelace",
+    notes: "distinctive-note-token",
+    idempotency_key: "k-create",
+  });
+  await addContact(ctx, {
+    person_id: person.id,
+    contact_type: "email",
+    value: "distinctive@example.test",
+    idempotency_key: "k-contact",
+  });
+
+  // The stored response really does contain her, before the delete.
+  const before = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM idempotency_keys WHERE subject_id = ?"
+  )
+    .bind(person.id)
+    .first<{ n: number }>();
+  expect(before?.n).toBeGreaterThan(0);
+
+  const token = await deletePerson(ctx, { person_id: person.id });
+  if (token.status !== "confirmation_required") throw new Error("expected a preview");
+  await deletePerson(ctx, {
+    person_id: person.id,
+    confirmation_token: token.confirmation_token,
+  });
+
+  const keys = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM idempotency_keys WHERE subject_id = ?"
+  )
+    .bind(person.id)
+    .first<{ n: number }>();
+  expect(keys?.n).toBe(0);
+
+  const confirmations = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM confirmations WHERE target_id = ?"
+  )
+    .bind(person.id)
+    .first<{ n: number }>();
+  expect(confirmations?.n).toBe(0);
+
+  // And no stored blob anywhere still mentions her, whatever it is keyed on.
+  const remaining = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM idempotency_keys WHERE response_json LIKE ?"
+  )
+    .bind("%distinctive%")
+    .first<{ n: number }>();
+  expect(remaining?.n).toBe(0);
 });
 ```
 
@@ -4591,7 +4761,7 @@ describe("searchPeople", () => {
     await seedRoster();
     const person = await createPerson(ctx, { full_name: "Grace Hopper", force: true });
     await env.DB.prepare(
-      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
       .bind("ps_1", person.id, "wcus-2026", "row-1", "WCUS 2026", "WCUS", "https://example.test", T, "{}", "sha256:x", T)
       .run();
@@ -4606,7 +4776,7 @@ describe("searchPeople", () => {
     await seedRoster();
     const person = await createPerson(ctx, { full_name: "Grace Hopper", force: true });
     await env.DB.prepare(
-      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
       .bind("ps_1", person.id, "wcus-2026", "row-1", "WCUS 2026", "WCUS", "https://example.test", T, "{}", "sha256:x", T)
       .run();
@@ -4742,6 +4912,29 @@ describe("searchPeople", () => {
     expect(second.people).toHaveLength(10);
     const overlap = second.people.filter((p) => first.people.some((q) => q.id === p.id));
     expect(overlap).toEqual([]);
+  });
+
+  it("KEEPS PREFIX MATCHING on page two", async () => {
+    // The page-two hole. Without the mode in the cursor, page one falls back to
+    // prefix, returns a full page and a cursor, and page two runs the exact
+    // query, finds nothing, and reports an empty page after promising more.
+    for (let i = 0; i < 25; i++) {
+      await createPerson(ctx, { full_name: `Lovelace Number ${i}`, force: true });
+    }
+
+    const first = await searchPeople(ctx, { query: "Lov", limit: 20 });
+    expect(first.people).toHaveLength(20);
+    expect(first.people_next_cursor).toBeTruthy();
+
+    const second = await searchPeople(ctx, {
+      query: "Lov",
+      limit: 20,
+      people_cursor: first.people_next_cursor!,
+    });
+    expect(second.people.length).toBeGreaterThan(0);
+
+    const seen = new Set([...first.people, ...second.people].map((p) => p.id));
+    expect(seen.size).toBe(25);
   });
 
   it("returns a null cursor on the last page", async () => {
@@ -5011,9 +5204,26 @@ export async function searchPeople(
   let roster_next_cursor: string | null = null;
 
   if (scope === "people" || scope === "all") {
-    const after = decodeCursor(input.people_cursor);
-    let rows = await matchPeople(ctx, toMatchQuery(input.query), input, probe, after);
-    if (rows.length === 0 && after === null && isShortQuery(input.query)) {
+    const decoded = decodeCursor(input.people_cursor) as
+      | { rank?: number; id?: string; prefix?: number }
+      | null;
+    const after = decoded === null ? null : { ...decoded, prefix: decoded.prefix === 1 };
+
+    // THE QUERY MODE IS DECIDED ONCE AND CARRIED IN THE CURSOR.
+    //
+    // The previous draft ran the prefix fallback only when `after === null`,
+    // which made it unreachable on page two. Search "Lov" against 25 matching
+    // people with limit 20: page one finds nothing exact, falls back to prefix,
+    // returns 20 rows AND a cursor. Page two presents that cursor, the fallback
+    // is skipped, the exact query returns nothing, and the caller gets an empty
+    // page having just been told there was more. Five people vanish silently.
+    let usePrefix = after?.prefix === true;
+    let rows = usePrefix
+      ? await matchPeople(ctx, toMatchQuery(input.query, true), input, probe, after)
+      : await matchPeople(ctx, toMatchQuery(input.query), input, probe, after);
+
+    if (rows.length === 0 && !usePrefix && after === null && isShortQuery(input.query)) {
+      usePrefix = true;
       rows = await matchPeople(ctx, toMatchQuery(input.query, true), input, probe, null);
     }
 
@@ -5032,7 +5242,11 @@ export async function searchPeople(
     }
     if (rows.length > limit) {
       const last = page[page.length - 1]!;
-      people_next_cursor = encodeCursor({ rank: last.rank, id: last.id });
+      // `prefix` travels with the position, so page two searches the same way
+      // page one did.
+      people_next_cursor = encodeCursor(
+        usePrefix ? { rank: last.rank, id: last.id, prefix: 1 } : { rank: last.rank, id: last.id }
+      );
     }
   }
 
@@ -7056,6 +7270,66 @@ describe("importRoster", () => {
     expect(await countEntries()).toBe(40);
   });
 
+  it("REPORTS a cross-chunk collision instead of silently absorbing a row", async () => {
+    // Two people, same name, same organization, no email and no source row id.
+    // They share a tier-3 key. Split across two calls so the within-chunk check
+    // cannot catch them.
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 2,
+      rows: [{ full_name: "Chris Smith", organization: "Studio A", job_title: "Designer" }],
+    });
+
+    const second = await importRoster(ctx, {
+      ...SOURCE,
+      run_id: first.run_id,
+      offset: first.next_offset,
+      rows: [{ full_name: "Chris Smith", organization: "Studio A", job_title: "Developer" }],
+    });
+
+    // The write happened - refusing would strand the roster - but it is named.
+    expect(second.updated).toBe(1);
+    expect(second.errors).toHaveLength(0); // same name, so this one is an edit
+
+    // Now the case that IS a collision: a different person under the same key.
+    const third = await importRoster(ctx, {
+      ...SOURCE,
+      source_key: "other-roster",
+      label: "Other",
+      expected_total: 2,
+      rows: [{ full_name: "Chris Smith", organization: "Studio A" }],
+    });
+    const fourth = await importRoster(ctx, {
+      ...SOURCE,
+      source_key: "other-roster",
+      label: "Other",
+      run_id: third.run_id,
+      offset: third.next_offset,
+      rows: [{ full_name: "Chris  Smith", organization: "Studio A", job_title: "Developer" }],
+    });
+    // Normalized to the same name, so still an edit rather than a collision.
+    expect(fourth.errors).toHaveLength(0);
+  });
+
+  it("does not report an ordinary re-import as a collision", async () => {
+    // A corrected job title on the same person must stay silent, or the report
+    // is noise and nobody reads it.
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada Lovelace", job_title: "Programmer" }],
+    });
+    await finalizeImport(ctx, { run_id: first.run_id });
+
+    const second = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada Lovelace", job_title: "Senior Programmer" }],
+    });
+    expect(second.updated).toBe(1);
+    expect(second.errors).toEqual([]);
+  });
+
   it("rejects a rows argument that is not an array", async () => {
     await expect(
       importRoster(ctx, { ...SOURCE, expected_total: 1, rows: "not an array" as never })
@@ -7085,6 +7359,8 @@ import { nowIso } from "../time";
 // statement inline rather than issuing a separate write. The helper exists for
 // tests and for any future caller that has no batch to join.
 import { findChunkReceipt, hashJson } from "../idempotency";
+// `normalizeName` is used by the cross-chunk collision check below.
+import { normalizeName } from "../normalize";
 import {
   ensureSource,
   IMPORT_BATCH_LIMIT,
@@ -7142,24 +7418,36 @@ function chunk<T>(items: T[], size: number): T[][] {
   return out;
 }
 
-/** Which of these keys already exist under this source, in as few queries as possible. */
+/**
+ * Which of these keys already exist under this source, and what they currently
+ * hold, in as few queries as possible.
+ *
+ * `full_name` and `content_hash` come back as well as the key, because they are
+ * what distinguishes a legitimate re-import from a CROSS-CHUNK COLLISION. See
+ * the note in `importRoster` below.
+ */
 async function existingKeys(
   ctx: ToolContext,
   sourceId: string,
   keys: string[]
-): Promise<Set<string>> {
-  const found = new Set<string>();
+): Promise<Map<string, { full_name: string; content_hash: string }>> {
+  const found = new Map<string, { full_name: string; content_hash: string }>();
   for (const part of chunk(keys, KEY_LOOKUP_CHUNK)) {
     if (part.length === 0) continue;
     const marks = part.map(() => "?").join(", ");
     const { results } = await ctx.db
       .prepare(
-        `SELECT external_row_key FROM roster_entries
+        `SELECT external_row_key, full_name, content_hash FROM roster_entries
          WHERE roster_source_id = ? AND external_row_key IN (${marks})`
       )
       .bind(sourceId, ...part)
-      .all<{ external_row_key: string }>();
-    for (const row of results) found.add(row.external_row_key);
+      .all<{ external_row_key: string; full_name: string; content_hash: string }>();
+    for (const row of results) {
+      found.set(row.external_row_key, {
+        full_name: row.full_name,
+        content_hash: row.content_hash,
+      });
+    }
   }
   return found;
 }
@@ -7304,6 +7592,42 @@ export async function importRoster(
     const imported = keys.filter((k) => !existing.has(k)).length;
     const updated = keys.length - imported;
 
+    // A CROSS-CHUNK COLLISION IS REPORTED, because otherwise it is a
+    // disappearance rather than the duplicate the spec claims it is.
+    //
+    // Two people with the same name at the same organization, with no email
+    // and no source row id, produce the same tier-3 key. Inside one chunk that
+    // is caught above and the loser is reported. ACROSS chunks nothing catches
+    // it: the unique constraint turns the second row into an upsert over the
+    // first, it is counted as `updated`, and the first row's data is simply
+    // gone with no error anywhere.
+    //
+    // The spec concedes such collisions and says they are "visible as a
+    // duplicate when it happens". They are not - a duplicate would be two rows.
+    // The reference roster has 11 duplicated names across 23 rows and chunks at
+    // 150, so this fires on the data this system was designed around.
+    //
+    // The heuristic: an existing key whose stored name differs from the
+    // incoming one is a collision, not an edit. A corrected spelling looks the
+    // same and will be reported too - that is a false positive the operator can
+    // dismiss, and the alternative is silence on real data loss.
+    for (const key of keys) {
+      const prior = existing.get(key);
+      const incoming = prepared.get(key);
+      if (!prior || !incoming) continue;
+      if (prior.content_hash === incoming.content_hash) continue;
+      if (normalizeName(prior.full_name) === normalizeName(incoming.fields.full_name)) continue;
+
+      errors.push({
+        index: seenAt.get(key) ?? start,
+        reason:
+          `row absorbed an existing entry under the same identity key: ` +
+          `"${prior.full_name}" was replaced. Two people with the same name and ` +
+          `organization, with no email and no source row id, share a key. ` +
+          `Give this roster a source row id or an email column to separate them.`,
+      });
+    }
+
     const statements = chunk(
       keys.map((k) => prepared.get(k) as PreparedRow),
       UPSERT_ROWS_PER_STATEMENT
@@ -7324,7 +7648,10 @@ export async function importRoster(
                  next_offset = ?
            WHERE id = ?`
         )
-        .bind(imported, updated, errors.length, nextOffset, run.run_id)
+        // `errors.length` is NOT the skipped count any more: a reported
+        // collision still wrote its row. Only rows the server refused count as
+        // skipped, and those are the ones with no entry in `prepared`.
+        .bind(imported, updated, input.rows.length - keys.length, nextOffset, run.run_id)
     );
 
     const result: ImportResult = {
@@ -7332,7 +7659,7 @@ export async function importRoster(
       roster_source_id: sourceId,
       imported,
       updated,
-      skipped: errors.length,
+      skipped: input.rows.length - keys.length,
       next_offset: nextOffset,
       remaining: run.expected_total - nextOffset,
       errors,
@@ -7635,7 +7962,7 @@ describe("finalizeImport", () => {
       .bind("p_1", "Ada", "2026-08-20T12:00:00.000Z", "2026-08-20T12:00:00.000Z")
       .run();
     await env.DB.prepare(
-      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
       .bind("ps_1", "p_1", "wcus-2026", "1", "WordCamp US 2026", "WCUS 2026",
             "https://example.test/attendees", "2026-08-20T12:00:00.000Z", "{}", "sha256:x",
@@ -7990,6 +8317,69 @@ describe("promoteRosterEntry, second phase", () => {
     expect(count?.n).toBe(1);
   });
 
+  it("REFUSES to hand back a different person than the caller named", async () => {
+    // A success naming someone the caller did not ask for is the failure this
+    // whole design is organized against. create_new is different and is
+    // covered by the test below: there the caller asked for "a person", not
+    // "this person".
+    const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
+    const first = await promoteRosterEntry(ctx, { roster_entry_id: entryId, create_new: true });
+    if (first.status !== "promoted") throw new Error("unreachable");
+
+    const someoneElse = await createPerson(ctx, { full_name: "Grace Hopper" });
+
+    try {
+      await promoteRosterEntry(ctx, {
+        roster_entry_id: entryId,
+        link_to_person_id: someoneElse.id,
+      });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("conflict");
+      expect((e as ToolError).next).toContain(first.person.id);
+    }
+  });
+
+  it("accepts a link that names the person it was ALREADY promoted to", async () => {
+    // Idempotent retry of a link that already succeeded. Not a conflict.
+    const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
+    const person = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
+    await promoteRosterEntry(ctx, { roster_entry_id: entryId, link_to_person_id: person.id });
+
+    const again = await promoteRosterEntry(ctx, {
+      roster_entry_id: entryId,
+      link_to_person_id: person.id,
+    });
+    if (again.status !== "promoted") throw new Error("unreachable");
+    expect(again.person.id).toBe(person.id);
+    expect(again.linked_existing).toBe(true);
+  });
+
+  it("never leaves an ORPHAN PERSON when the provenance insert loses", async () => {
+    // The concurrency case, forced deterministically: write the provenance row
+    // by hand first, then promote. The insert violates the unique constraint,
+    // the batch aborts, and the person must go with it rather than surviving
+    // with no origin.
+    const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
+    const winner = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
+    await env.DB.prepare(
+      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind("ps_pre", winner.id, "wcus-2026", "k:1", "WCUS 2026", "WCUS 2026",
+            "https://example.test/attendees", "2026-08-20T12:00:00.000Z", "{}", "sha256:x",
+            "2026-08-20T12:00:00.000Z")
+      .run();
+
+    const out = await promoteRosterEntry(ctx, { roster_entry_id: entryId, create_new: true });
+    if (out.status !== "promoted") throw new Error("unreachable");
+    expect(out.person.id).toBe(winner.id);
+
+    // Two people exist - the forced duplicate above and the winner - and no
+    // third one was left behind by the aborted batch.
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM people").first<{ n: number }>();
+    expect(count?.n).toBe(2);
+  });
+
   it("stays idempotent ACROSS A PURGE AND RE-IMPORT of the same roster", async () => {
     // The case a staged link could never survive. Purging deletes the roster
     // entry, a fresh import gives the same logical row a NEW `re_` id, and the
@@ -8205,9 +8595,9 @@ export async function loadPersonSources(ctx: ToolContext, personId: string): Pro
               ps.source_event AS source_event,
               ps.source_url AS source_url,
               ps.source_captured_at AS source_captured_at,
-              ps.raw_record_hash AS raw_record_hash,
+              ps.content_hash_at_promotion AS content_hash_at_promotion,
               ps.promoted_at AS promoted_at,
-              (SELECT CASE WHEN re.content_hash = ps.raw_record_hash THEN 1 ELSE 0 END
+              (SELECT CASE WHEN re.content_hash = ps.content_hash_at_promotion THEN 1 ELSE 0 END
                  FROM roster_entries re
                  JOIN roster_sources rs ON rs.id = re.roster_source_id
                 WHERE rs.source_key = ps.source_key
@@ -8444,6 +8834,31 @@ export async function promoteRosterEntry(
       .first<{ person_id: string }>();
 
     if (already) {
+      // THE OVERRIDE DEPENDS ON WHAT THE CALLER ACTUALLY ASKED FOR, and an
+      // earlier version of this code did not distinguish the two.
+      //
+      // `create_new: true` asked for "a person" from this row. Provenance
+      // already exists, so returning the person it points at is exactly right -
+      // the spec wants this override precisely so an agent that skipped phase
+      // one cannot create a duplicate the system is already holding provenance
+      // for.
+      //
+      // `link_to_person_id: X` asked for "THIS person". Returning a different
+      // person Y under a success status, with linked_existing: true, is the
+      // failure this whole design is organized against - a write against the
+      // wrong person, reported as if it went where the caller meant. The
+      // previous draft did that, and its test was titled "refuses to promote
+      // one roster entry onto a second person" while asserting that it does not
+      // refuse.
+      if (wantsLink && input.link_to_person_id !== already.person_id) {
+        throw new ToolError(
+          "conflict",
+          `roster entry ${entryId} was already promoted to a different person`,
+          `call get_person with person_id ${already.person_id} to see who this roster row belongs to`,
+          { promoted_person_id: already.person_id }
+        );
+      }
+
       return {
         status: "promoted" as const,
         person: await getPerson(ctx, { person_id: already.person_id }),
@@ -8473,9 +8888,8 @@ export async function promoteRosterEntry(
         .prepare(
           `INSERT INTO person_sources
              (id, person_id, source_key, external_row_key, source_label, source_event,
-              source_url, source_captured_at, raw_record_snapshot, raw_record_hash, promoted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (source_key, external_row_key) DO NOTHING`
+              source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .bind(
           newId("ps"),
@@ -8544,7 +8958,47 @@ export async function promoteRosterEntry(
       ...provenance(personId),
     ];
 
-    await ctx.db.batch(statements);
+    // THE UNIQUE CONSTRAINT IS ALLOWED TO WIN, and the previous draft's
+    // ON CONFLICT DO NOTHING quietly prevented that.
+    //
+    // Two concurrent create_new calls can both read no prior provenance. The
+    // first commits. With DO NOTHING the second's provenance insert is silently
+    // skipped while its person insert succeeds, so the batch commits and the
+    // tool returns an ORPHAN PERSON reported as successfully promoted - a
+    // durable record with no origin, and no way to notice.
+    //
+    // Letting the violation abort the batch rolls back the person too. We then
+    // load whoever won and return them, which is the same answer the sequential
+    // case gives.
+    try {
+      await ctx.db.batch(statements);
+    } catch (e) {
+      const winner = await ctx.db
+        .prepare(
+          "SELECT person_id FROM person_sources WHERE source_key = ? AND external_row_key = ?"
+        )
+        .bind(entry.source_key, entry.external_row_key)
+        .first<{ person_id: string }>();
+
+      // Only a lost race explains a winner being there now. Anything else is a
+      // real failure and must not be dressed up as a successful promotion.
+      if (!winner) throw e;
+
+      if (wantsLink && input.link_to_person_id !== winner.person_id) {
+        throw new ToolError(
+          "conflict",
+          `roster entry ${entryId} was promoted to a different person while this call was in flight`,
+          `call get_person with person_id ${winner.person_id} to see who this roster row belongs to`,
+          { promoted_person_id: winner.person_id }
+        );
+      }
+
+      return {
+        status: "promoted" as const,
+        person: await getPerson(ctx, { person_id: winner.person_id }),
+        linked_existing: true,
+      };
+    }
 
     return {
       status: "promoted" as const,
@@ -8616,7 +9070,7 @@ git commit -m "feat: add two-phase promote with durable provenance copying"
 **Interfaces:**
 - Consumes: `mintConfirmation`, `redeemConfirmation`, `withIdempotency`, `assertId`.
 - Produces:
-  - `function listRosterSources(ctx): Promise<RosterSourceSummary[]>`
+  - `function listRosterSources(ctx): Promise<{ sources: RosterSourceSummary[] }>` - an object, not a bare array; see below
   - `function getRosterEntry(ctx, input): Promise<RosterEntryDetail>`
   - `function purgeRosterSource(ctx, input): Promise<PurgeResult>`
 
@@ -8678,7 +9132,7 @@ describe("listRosterSources", () => {
     ).first<{ id: string }>();
     await promoteRosterEntry(ctx, { roster_entry_id: entry!.id, create_new: true });
 
-    const sources = await listRosterSources(ctx);
+    const { sources } = await listRosterSources(ctx);
     expect(sources).toHaveLength(1);
     expect(sources[0]).toEqual(
       expect.objectContaining({
@@ -8710,7 +9164,8 @@ describe("listRosterSources", () => {
     });
     await finalizeImport(ctx, { run_id: september.run_id });
 
-    const [source] = await listRosterSources(ctx);
+    const { sources } = await listRosterSources(ctx);
+    const [source] = sources;
     expect(source?.entry_count).toBe(2);
     expect(source?.current_count).toBe(1);
     expect(source?.stale_count).toBe(1);
@@ -8733,7 +9188,8 @@ describe("listRosterSources", () => {
       .bind("ir_open", "2026-09-01T00:00:00Z")
       .run();
 
-    const [source] = await listRosterSources(ctx);
+    const { sources } = await listRosterSources(ctx);
+    const [source] = sources;
     expect(source?.last_imported_at).toBe("2026-08-20T12:00:00.000Z");
   });
 
@@ -8743,7 +9199,8 @@ describe("listRosterSources", () => {
       expected_total: 1,
       rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
-    const [source] = await listRosterSources(ctx);
+    const { sources } = await listRosterSources(ctx);
+    const [source] = sources;
     expect(source?.entry_count).toBe(1);
     // Nothing has declared a complete picture of this roster, so nothing is
     // either current or stale relative to one.
@@ -8753,7 +9210,7 @@ describe("listRosterSources", () => {
   });
 
   it("returns an empty list when nothing has been imported", async () => {
-    expect(await listRosterSources(ctx)).toEqual([]);
+    expect((await listRosterSources(ctx)).sources).toEqual([]);
   });
 });
 
@@ -8966,9 +9423,49 @@ describe("purgeRosterSource", () => {
       confirmation_token: first.confirmation_token,
     });
 
-    const [listed] = await listRosterSources(ctx);
+    const [listed] = (await listRosterSources(ctx)).sources;
     expect(listed?.purged_at).toBeTruthy();
     expect(listed?.entry_count).toBe(0);
+  });
+
+  it("REFUSES a token whose preview no longer matches the data", async () => {
+    // The window the binding closes. The preview said one entry; a hundred
+    // arrive before the confirmation lands; without the check the human's
+    // approval of "1 entry" destroys 101.
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada" }],
+    });
+    const source = await env.DB.prepare("SELECT id FROM roster_sources LIMIT 1").first<{ id: string }>();
+
+    const preview = await purgeRosterSource(ctx, { roster_source_id: source!.id });
+    if (preview.status !== "confirmation_required") throw new Error("unreachable");
+    expect(preview.preview.entry_count).toBe(1);
+
+    // More rows land between the preview and the confirmation.
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 2,
+      rows: [
+        { external_row_key: "2", full_name: "Grace" },
+        { external_row_key: "3", full_name: "Chris" },
+      ],
+    });
+
+    try {
+      await purgeRosterSource(ctx, {
+        roster_source_id: source!.id,
+        confirmation_token: preview.confirmation_token,
+      });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("conflict");
+    }
+
+    // Nothing was destroyed.
+    const entries = await env.DB.prepare("SELECT COUNT(*) AS n FROM roster_entries").first<{ n: number }>();
+    expect(entries?.n).toBe(3);
   });
 
   it("rejects an unknown source", async () => {
@@ -9025,7 +9522,19 @@ export interface RosterSourceSummary {
  * fresher than it is - in the one tool whose job includes telling an agent that
  * a roster is old enough to suggest purging.
  */
-export async function listRosterSources(ctx: ToolContext): Promise<RosterSourceSummary[]> {
+/**
+ * Returns `{ sources: [...] }`, not a bare array.
+ *
+ * The registry's `envelope` wrapper adds `today` to an object result and wraps a
+ * non-object as `{ result, today }`. An array is not an object for that
+ * purpose, so a bare array would make this the ONE tool answering
+ * `{ result: [...], today }` while every other returns its fields at the top
+ * level - an inconsistency with no output schema to catch it and nothing
+ * documenting it.
+ */
+export async function listRosterSources(
+  ctx: ToolContext
+): Promise<{ sources: RosterSourceSummary[] }> {
   const { results } = await ctx.db
     .prepare(
       `WITH latest AS (
@@ -9062,7 +9571,7 @@ export async function listRosterSources(ctx: ToolContext): Promise<RosterSourceS
     )
     .all<Omit<RosterSourceSummary, "record_kind">>();
 
-  return results.map((row) => ({ record_kind: "roster_source" as const, ...row }));
+  return { sources: results.map((row) => ({ record_kind: "roster_source" as const, ...row })) };
 }
 
 export interface RosterEntryDetail {
@@ -9217,8 +9726,11 @@ export async function purgeRosterSource(
 
   const { idempotency_key, ...rest } = input;
   return withIdempotency(ctx, "purge_roster_source", idempotency_key, rest, async () => {
-    await redeemConfirmation(ctx, "purge_roster_source", id, input.confirmation_token);
+    // Same ordering, and it matters more here: a preview reporting 0 entries
+    // can otherwise authorize deleting a roster imported seconds later, having
+    // shown the human that nothing would be lost.
     const preview = await purgePreview(ctx, id);
+    await redeemConfirmation(ctx, "purge_roster_source", id, input.confirmation_token, preview);
     const at = nowIso(ctx.clock);
 
     // THE SOURCE ROW SURVIVES. Purging deletes its entries and stamps
@@ -9635,9 +10147,18 @@ function define<I>(
   // it right once, in listDue.
   const wrapped = async (ctx: ToolContext, input: never) => {
     const result = await run(ctx, input as I);
-    return result === null || typeof result !== "object" || Array.isArray(result)
-      ? envelope(ctx, { result })
-      : envelope(ctx, result as object);
+    // Every tool returns a plain object. The array and primitive branches are a
+    // backstop that should never fire, and they throw rather than silently
+    // reshaping the result into `{ result: ... }` - which is what the previous
+    // draft did, giving `list_roster_sources` alone a different response shape
+    // from all 27 others with nothing documenting it.
+    if (result === null || typeof result !== "object" || Array.isArray(result)) {
+      throw new Error(
+        `${name} returned a ${Array.isArray(result) ? "array" : typeof result}; ` +
+          "every tool must return an object so the envelope can add `today` at the top level"
+      );
+    }
+    return envelope(ctx, result as object);
   };
   return { name, description, annotations, inputSchema, run: wrapped };
 }
@@ -10217,6 +10738,62 @@ describe("tool registry", () => {
     };
     const result = await TOOLS.list_due!.run(pacific, {} as never);
     expect((result as { today: string }).today).toBe("2026-08-20");
+  });
+
+  it("RECORDS THE SUBJECT on every person-scoped write", async () => {
+    // An omission here is invisible until someone exercises their right to be
+    // erased, at which point delete_person quietly leaves a full copy of them
+    // in idempotency_keys.response_json. That is the one failure this whole
+    // column exists to prevent, so it is asserted per tool rather than spot-
+    // checked.
+    const person = await TOOLS.create_person!.run(ctx, {
+      full_name: "Ada Lovelace",
+    } as never) as { id: string };
+
+    const calls: [string, Record<string, unknown>][] = [
+      ["update_person", { person_id: person.id, job_title: "Engineer" }],
+      ["archive_person", { person_id: person.id }],
+      ["unarchive_person", { person_id: person.id }],
+      ["add_contact", { person_id: person.id, contact_type: "email", value: "a@example.test" }],
+      ["add_link", { person_id: person.id, link_type: "website", url: "https://example.test" }],
+      ["add_tags", { person_id: person.id, tags: ["wcus"] }],
+      ["remove_tags", { person_id: person.id, tags: ["wcus"] }],
+      ["log_encounter", { person_id: person.id, occurred_on: "2026-08-20", summary: "met" }],
+      ["create_followup", { person_id: person.id, due_on: "2026-08-25", note: "deck" }],
+    ];
+
+    for (const [name, input] of calls) {
+      const key = `subj-${name}`;
+      await TOOLS[name]!.run(ctx, { ...input, idempotency_key: key } as never);
+
+      const row = await env.DB.prepare(
+        "SELECT subject_id FROM idempotency_keys WHERE key = ?"
+      )
+        .bind(`${name}:${key}`)
+        .first<{ subject_id: string | null }>();
+
+      expect(row, `${name} recorded no idempotency row at all`).toBeTruthy();
+      expect(row?.subject_id, `${name} did not record its subject`).toBe(person.id);
+    }
+  });
+
+  it("records NO subject on tools that are not about one person", async () => {
+    await TOOLS.import_roster!.run(ctx, {
+      source_key: "wcus-2026",
+      label: "WCUS 2026",
+      source_url: "https://example.test",
+      format: "json",
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Grace Hopper" }],
+      idempotency_key: "subj-import",
+    } as never);
+
+    const row = await env.DB.prepare(
+      "SELECT subject_id FROM idempotency_keys WHERE key = ?"
+    )
+      .bind("import_roster:subj-import")
+      .first<{ subject_id: string | null }>();
+    expect(row?.subject_id).toBeNull();
   });
 
   it("rejects a wrong-kind id from every tool that takes one", async () => {
