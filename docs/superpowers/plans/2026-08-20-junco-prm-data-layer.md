@@ -158,12 +158,12 @@ Two tables, shaped like the real ones only where the shape affects the measureme
 
 ```sql
 CREATE TABLE IF NOT EXISTS probe (
-  id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY NOT NULL,
   n  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS shaped (
-  id                 TEXT PRIMARY KEY,
+  id                 TEXT PRIMARY KEY NOT NULL,
   roster_source_id   TEXT NOT NULL,
   external_row_key   TEXT NOT NULL,
   content_hash       TEXT NOT NULL,
@@ -470,9 +470,27 @@ describe("durable core schema", () => {
   });
 
   it("rejects a person row with no id", async () => {
+    // THIS IS WHY EVERY `id` COLUMN CARRIES AN EXPLICIT NOT NULL.
+    //
+    // SQLite permits NULL in a PRIMARY KEY column unless it is INTEGER PRIMARY
+    // KEY or the table is WITHOUT ROWID. That is documented bug-compatibility
+    // with very old versions, not an edge case, and `id TEXT PRIMARY KEY`
+    // alone would accept this insert - after which `people_fts_ai` would
+    // cheerfully index a row whose id is null, and every read keyed on that id
+    // would miss it.
     await expect(
       env.DB.prepare("INSERT INTO people (full_name, created_at, updated_at) VALUES (?, ?, ?)")
         .bind("No Id", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
+        .run()
+    ).rejects.toThrow();
+  });
+
+  it("rejects an explicitly null id too", async () => {
+    await expect(
+      env.DB.prepare(
+        "INSERT INTO people (id, full_name, created_at, updated_at) VALUES (?, ?, ?, ?)"
+      )
+        .bind(null, "Null Id", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
         .run()
     ).rejects.toThrow();
   });
@@ -488,7 +506,7 @@ Expected: FAIL with `no such table: people`. The `migrations/` directory exists 
 
 ```sql
 CREATE TABLE people (
-  id                TEXT PRIMARY KEY,
+  id                TEXT PRIMARY KEY NOT NULL,
   full_name         TEXT NOT NULL,
   preferred_name    TEXT,
   job_title         TEXT,
@@ -508,7 +526,7 @@ CREATE INDEX idx_people_organization ON people(organization);
 -- compared as folded, and deriving one from the other at query time would mean
 -- SQLite's ASCII-only LOWER() standing in for NFKC.
 CREATE TABLE person_contacts (
-  id               TEXT PRIMARY KEY,
+  id               TEXT PRIMARY KEY NOT NULL,
   person_id        TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
   contact_type     TEXT NOT NULL CHECK (contact_type IN ('email', 'phone')),
   value            TEXT NOT NULL,
@@ -528,7 +546,7 @@ CREATE INDEX idx_person_contacts_person ON person_contacts(person_id);
 CREATE INDEX idx_person_contacts_normalized ON person_contacts(contact_type, normalized_value);
 
 CREATE TABLE person_links (
-  id         TEXT PRIMARY KEY,
+  id         TEXT PRIMARY KEY NOT NULL,
   person_id  TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
   link_type  TEXT NOT NULL,
   url        TEXT NOT NULL,
@@ -539,7 +557,7 @@ CREATE TABLE person_links (
 CREATE INDEX idx_person_links_person ON person_links(person_id);
 
 CREATE TABLE tags (
-  id         TEXT PRIMARY KEY,
+  id         TEXT PRIMARY KEY NOT NULL,
   name       TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
@@ -564,13 +582,57 @@ Add to `tests/schema.test.ts`:
 
 ```ts
 it("enforces the person foreign key on contacts", async () => {
+  // EVERY NOT NULL COLUMN IS SUPPLIED, deliberately.
+  //
+  // An earlier version of this test omitted `normalized_value`, which is
+  // NOT NULL with no default. The insert threw on that constraint before the
+  // foreign key was ever consulted, so the test passed identically with
+  // foreign keys OFF - while claiming to be the thing every later cascade
+  // rests on. A test that throws for the wrong reason is worse than no test,
+  // because it stops anyone looking.
   await expect(
     env.DB.prepare(
-      "INSERT INTO person_contacts (id, person_id, contact_type, value, created_at) VALUES (?, ?, ?, ?, ?)"
+      `INSERT INTO person_contacts
+         (id, person_id, contact_type, value, normalized_value, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
     )
-      .bind("pc_1", "p_missing", "email", "nobody@example.com", "2026-08-20T00:00:00Z")
+      .bind(
+        "pc_1",
+        "p_missing",
+        "email",
+        "nobody@example.com",
+        "nobody@example.com",
+        "2026-08-20T00:00:00Z"
+      )
       .run()
   ).rejects.toThrow();
+});
+
+it("accepts the same row once the person exists, proving the FK was the cause", async () => {
+  // The other half of the pair. Without it, the test above still passes when
+  // the insert fails for some reason nobody has noticed.
+  await env.DB.prepare(
+    "INSERT INTO people (id, full_name, created_at, updated_at) VALUES (?, ?, ?, ?)"
+  )
+    .bind("p_real", "Ada Lovelace", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
+    .run();
+
+  await expect(
+    env.DB.prepare(
+      `INSERT INTO person_contacts
+         (id, person_id, contact_type, value, normalized_value, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        "pc_2",
+        "p_real",
+        "email",
+        "ada@example.test",
+        "ada@example.test",
+        "2026-08-20T00:00:00Z"
+      )
+      .run()
+  ).resolves.toBeTruthy();
 });
 ```
 
@@ -1612,7 +1674,7 @@ Expected: FAIL, no such table `roster_sources`.
 -- a 2027 row. That is a silent write against the wrong person, which the spec
 -- names as its most likely real failure.
 CREATE TABLE roster_sources (
-  id         TEXT PRIMARY KEY,
+  id         TEXT PRIMARY KEY NOT NULL,
   source_key TEXT NOT NULL UNIQUE,
   label      TEXT NOT NULL,
   event      TEXT,
@@ -1626,7 +1688,7 @@ CREATE TABLE roster_sources (
 -- whole input, so a hash of it cannot exist.
 -- There is no `full_coverage` and no `retired_count`. Nothing is ever retired.
 CREATE TABLE import_runs (
-  id               TEXT PRIMARY KEY,
+  id               TEXT PRIMARY KEY NOT NULL,
   roster_source_id TEXT NOT NULL REFERENCES roster_sources(id) ON DELETE CASCADE,
   format           TEXT NOT NULL CHECK (format IN ('csv', 'json', 'text')),
   status           TEXT NOT NULL CHECK (status IN ('open', 'committed', 'abandoned')),
@@ -1653,7 +1715,7 @@ CREATE INDEX idx_import_runs_latest_completed
 -- There is no `retired_at`. A row the latest completed run did not see is
 -- derived as stale from `last_seen_run_id`, and nothing acts on it.
 CREATE TABLE roster_entries (
-  id                 TEXT PRIMARY KEY,
+  id                 TEXT PRIMARY KEY NOT NULL,
   roster_source_id   TEXT NOT NULL REFERENCES roster_sources(id) ON DELETE CASCADE,
   external_row_key   TEXT NOT NULL,
   content_hash       TEXT NOT NULL,
@@ -1691,7 +1753,7 @@ CREATE INDEX idx_roster_entries_email ON roster_entries(email);
 -- `source_label` and `source_event` are copied as they read at promotion time,
 -- for the same reason: they must survive the source being relabelled.
 CREATE TABLE person_sources (
-  id                  TEXT PRIMARY KEY,
+  id                  TEXT PRIMARY KEY NOT NULL,
   person_id           TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
   source_key          TEXT NOT NULL,
   external_row_key    TEXT NOT NULL,
@@ -2490,7 +2552,7 @@ git commit -m "feat: add FTS5 people index with trigger-maintained sync"
   - `src/types.ts`, holding every record type the tool module returns: `Person`, `PersonDetail`, `Contact`, `Link`, `Source`, `Encounter`, `Followup`.
   - `src/tools/duplicates.ts`, holding the one duplicate check both `createPerson` and `promoteRosterEntry` run:
     - `interface DuplicateCandidate { record_kind: "person" | "roster_entry"; id: string; full_name: string; organization: string | null; evidence: string[]; score: number }`
-    - `const STRONG_MATCH = 3`
+    - `const STRONG_MATCH = 2` - a name plus an organization reaches it; either alone does not
     - `function findDuplicateCandidates(ctx, probe: { full_name: string; organization?: string; email?: string }, opts?: { excludeRosterEntryId?: string }): Promise<DuplicateCandidate[]>`
   - `function createPerson(ctx, input): Promise<Person>` - throws `ToolError("conflict", ...)` carrying the candidates in `details` when it refuses
   - `function updatePerson(ctx, input): Promise<Person>`
@@ -2502,9 +2564,11 @@ Task 7 fills `contacts`, `links`, `tags`; Task 10 fills `recent_encounters`, `en
 
 **What counts as strong, and what this deliberately does not catch.** Evidence is scored rather than matched, because a name is not an identity: the reference roster carries 11 duplicated names across 23 rows, so refusing on a name alone would make "add Chris Smith" impossible on a roster holding two of them.
 
-- A shared normalized email scores 3 and is strong on its own. It is the closest thing to an identity a person carries.
-- A shared normalized name plus a shared normalized organization scores 3 together and is strong.
-- A shared name alone scores 1, and a shared organization alone scores 1. Either is returned as a candidate and neither refuses.
+- A shared normalized email scores 2 and is strong on its own. It is the closest thing to an identity a person carries.
+- A shared normalized name plus a shared normalized organization scores 1 each and so sum to 2, which is strong.
+- A shared name alone, or a shared organization alone, scores 1. Either is returned as a candidate and neither refuses.
+
+`STRONG_MATCH` is therefore 2. An earlier draft of this task wrote the same three sentences with the numbers 3, 3 and 1, which is not arithmetic that works: name plus organization summed to 2 against a threshold of 3, so the check could only ever fire on an email, and six of the tests below asserted a refusal the code could not produce. The module now checks its own constants at load.
 
 **The refusal is a `conflict` error carrying the candidates, not a union return type.** Two shapes were available. A discriminated union - `{status: "created"} | {status: "duplicate_candidates"}` - reads well in isolation and was rejected, because `createPerson` is the fixture every later task builds its test data with, and a union makes 40-odd call sites narrow a result they do not care about. The spec's own error contract already carries exactly what is needed: a machine-readable code, a reason, and the corrective next call. `ToolError` grows one optional `details` field to hold the candidates, and `promote_roster_entry` stays the only tool that returns candidates as a success, which is right, because surfacing them is that tool's entire first phase rather than its refusal.
 
@@ -2520,7 +2584,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
 import { newId } from "../src/ids";
-import type { DuplicateCandidate } from "../src/tools/duplicates";
+import {
+  SCORE_EMAIL,
+  SCORE_NAME,
+  SCORE_ORGANIZATION,
+  STRONG_MATCH,
+  type DuplicateCandidate,
+} from "../src/tools/duplicates";
 import { createPerson, getPerson, updatePerson } from "../src/tools/people";
 
 const ctx: ToolContext = {
@@ -2577,6 +2647,26 @@ async function seedRosterEntry(row: {
     )
     .run();
 }
+
+describe("duplicate scoring arithmetic", () => {
+  // There was no test here, and the constants disagreed: STRONG_MATCH was 3
+  // while a name and an organization scored 1 each. The check could only ever
+  // fire on an email, six tests below asserted refusals the code could not
+  // produce, and nothing failed until a human read it. This test is cheap and
+  // it fails the moment the numbers stop adding up.
+  it("lets a name plus an organization reach the threshold", () => {
+    expect(SCORE_NAME + SCORE_ORGANIZATION).toBeGreaterThanOrEqual(STRONG_MATCH);
+  });
+
+  it("lets an email reach it alone", () => {
+    expect(SCORE_EMAIL).toBeGreaterThanOrEqual(STRONG_MATCH);
+  });
+
+  it("does NOT let a bare name or a bare organization reach it", () => {
+    expect(SCORE_NAME).toBeLessThan(STRONG_MATCH);
+    expect(SCORE_ORGANIZATION).toBeLessThan(STRONG_MATCH);
+  });
+});
 
 describe("createPerson", () => {
   it("returns the full record with a prefixed id", async () => {
@@ -2893,13 +2983,23 @@ export interface DuplicateCandidate {
  * At or above this, `createPerson` refuses. Below it, the candidate is still
  * returned as evidence but nothing is blocked.
  *
- * The threshold is 3 because an email alone is worth 3 and a name plus an
- * organization is worth 3 together, while a bare name is worth 1. A name is not
- * an identity - the reference roster carries 11 duplicated names across 23 rows -
- * so refusing on one would make "add Chris Smith" impossible on a roster holding
- * two of them.
+ * TWO IS DELIBERATE AND THE ARITHMETIC IS THE WHOLE POINT. A bare name scores 1
+ * and a bare organization scores 1, so neither refuses on its own. A name AND an
+ * organization on the same record sum to 2 and do refuse. An email scores 2 by
+ * itself, because it is the closest thing to an identity a person carries.
+ *
+ * An earlier version of this file set the threshold to 3 while name and
+ * organization each scored 1. That is 2, so the check could never fire for
+ * anything except an email, and six of Task 6's tests asserted a refusal the
+ * code could not produce. It is worth stating because the failure was silent in
+ * exactly the wrong direction: the duplicate check appeared to exist, was
+ * documented at length, and did nothing.
+ *
+ * If you change any value in SCORE, re-derive this threshold by hand and check
+ * it against Task 6's tests. There is no test that asserts the arithmetic
+ * itself, and the review that caught this was reading, not running.
  */
-export const STRONG_MATCH = 3;
+export const STRONG_MATCH = 2;
 
 /**
  * The one signal only `promoteRosterEntry` can produce: an existing
@@ -2910,7 +3010,26 @@ export const STRONG_MATCH = 3;
  */
 export const SCORE_PROVENANCE = 5;
 
-const SCORE = { email: 3, name: 1, organization: 1, provenance: SCORE_PROVENANCE } as const;
+/** Exported individually so Task 6's tests can assert the arithmetic holds. */
+export const SCORE_EMAIL = 2;
+export const SCORE_NAME = 1;
+export const SCORE_ORGANIZATION = 1;
+
+const SCORE = {
+  email: SCORE_EMAIL,
+  name: SCORE_NAME,
+  organization: SCORE_ORGANIZATION,
+  provenance: SCORE_PROVENANCE,
+} as const;
+
+// Sanity check on the arithmetic above, because getting it wrong is silent and
+// disables the whole check. Runs once at module load, costs nothing.
+if (SCORE.name + SCORE.organization < STRONG_MATCH || SCORE.email < STRONG_MATCH) {
+  throw new Error(
+    "duplicates.ts: SCORE and STRONG_MATCH disagree - a name plus an organization, " +
+      "and an email alone, must each reach STRONG_MATCH"
+  );
+}
 
 /**
  * Scans people and staged roster entries. Both, always: the whole point is that
@@ -3245,7 +3364,7 @@ Expected: PASS with no type errors.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/types.ts src/tools/people.ts tests/people.test.ts
+git add src/types.ts src/tools/duplicates.ts src/tools/people.ts tests/people.test.ts
 git commit -m "feat: add create, update, and get for people"
 ```
 
@@ -3902,9 +4021,11 @@ describe("deletePerson", () => {
   it("cascades to contacts, links, and tags", async () => {
     const person = await createPerson(ctx, { full_name: "Ada" });
     await env.DB.prepare(
-      "INSERT INTO person_contacts (id, person_id, contact_type, value, created_at) VALUES (?, ?, ?, ?, ?)"
+      `INSERT INTO person_contacts
+         (id, person_id, contact_type, value, normalized_value, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
     )
-      .bind("pc_x", person.id, "email", "a@example.test", "2026-08-20T00:00:00Z")
+      .bind("pc_x", person.id, "email", "a@example.test", "a@example.test", "2026-08-20T00:00:00Z")
       .run();
 
     const first = await deletePerson(ctx, { person_id: person.id });
@@ -3928,7 +4049,7 @@ Expected: FAIL, `archivePerson` is not exported.
 
 ```sql
 CREATE TABLE encounters (
-  id           TEXT PRIMARY KEY,
+  id           TEXT PRIMARY KEY NOT NULL,
   person_id    TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
   occurred_on  TEXT NOT NULL,
   occurred_at  TEXT,
@@ -3943,7 +4064,7 @@ CREATE INDEX idx_encounters_person ON encounters(person_id, occurred_on DESC, id
 CREATE INDEX idx_encounters_event ON encounters(event);
 
 CREATE TABLE followups (
-  id           TEXT PRIMARY KEY,
+  id           TEXT PRIMARY KEY NOT NULL,
   person_id    TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
   due_on       TEXT NOT NULL,
   note         TEXT,
@@ -4164,9 +4285,9 @@ git commit -m "feat: add archive and two-call hard delete for people"
 **Interfaces:**
 - Consumes: `people_fts` from Task 5, `ToolError`.
 - Produces:
-  - `type SearchScope = "contacts" | "roster" | "all"`
+  - `type SearchScope = "people" | "roster" | "all"` - **`people`**, not `contacts`; see below
   - `interface PersonHit { record_kind: "person"; id: string; full_name: string; organization: string | null; job_title: string | null; archived_at: string | null; last_encounter_on: string | null; tags: string[] }`
-  - `interface RosterHit { record_kind: "roster_entry"; id: string; full_name: string; organization: string | null; job_title: string | null; source_key: string; promoted_person_id: string | null }`
+  - `interface RosterHit { record_kind: "roster_entry"; id: string; full_name: string; organization: string | null; job_title: string | null; source_key: string; promoted_person_id: string | null; stale: boolean | null; source_last_imported_at: string | null }`
   - `interface SearchResult { scope: SearchScope; people: PersonHit[]; roster_entries: RosterHit[]; people_next_cursor: string | null; roster_next_cursor: string | null }`
   - `function searchPeople(ctx, input): Promise<SearchResult>`
 
@@ -6166,7 +6287,19 @@ Expected: FAIL, cannot resolve `../src/tools/import_state`.
 import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { assertId, newId } from "../ids";
-import { hashJson } from "../idempotency";
+// `prepareRow` is the only consumer of these, and every one of them is a pinned
+// rule. `hashJson` from ../idempotency is deliberately NOT imported here:
+// identity and change detection hash a canonicalized subset of the row, not an
+// arbitrary value, and routing them through a general-purpose helper is how the
+// two hashes drift apart again.
+import {
+  contentHash,
+  externalRowKey,
+  normalizeEmail,
+  normalizeName,
+  normalizeText,
+  type NormalizedRow,
+} from "../normalize";
 import { nowIso } from "../time";
 
 /**
@@ -6384,8 +6517,8 @@ export async function openOrResumeRun(
     await ctx.db
       .prepare(
         `INSERT INTO import_runs
-           (id, roster_source_id, format, input_hash, status, expected_total, next_offset, started_at)
-         VALUES (?, ?, ?, '', 'open', ?, 0, ?)`
+           (id, roster_source_id, format, status, expected_total, next_offset, started_at)
+         VALUES (?, ?, ?, 'open', ?, 0, ?)`
       )
       .bind(runId, sourceId, input.format, total, nowIso(ctx.clock))
       .run();
@@ -6452,7 +6585,7 @@ Every check here is a way a resumed import goes wrong, and the offset checks are
 - **An offset behind `next_offset`** replays rows already committed, double-counting them against `expected_total` and leaving the run unable to ever reach its declared total.
 - **A chunk that would carry the run past `expected_total`** means the declared total was wrong, and the total is the only integrity guarantee this protocol has left.
 
-`input_hash` is written as an empty string and no longer checked. It was the previous contract's guard, and it only worked because every call re-sent the entire roster. The column stays in the schema rather than being dropped, because a migration to remove it buys nothing and a later protocol may want it back; Task 12c does not read it either.
+**There is no `input_hash`.** An earlier contract hashed the whole input and checked it on every continuation, which only worked because every call re-sent the entire roster. Under the chunked protocol the server never sees the whole input, so such a hash cannot exist, and Task 3's schema does not create the column. The 2026-08-24 reconciliation dropped it from the migration and this `INSERT` kept referencing it for a while, which is a good illustration of why a plan's SQL and its schema have to be read against each other rather than each on its own.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -6760,7 +6893,8 @@ Expected: FAIL, cannot resolve `../src/tools/import`.
 ```ts
 import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
-import { newId } from "../ids";
+// `assertId` is used by `finalizeImport`, which Task 12c adds to this file.
+import { assertId, newId } from "../ids";
 import { withIdempotency } from "../idempotency";
 import { nowIso } from "../time";
 // `recordChunkReceipt` is deliberately NOT imported. The receipt must go out in
@@ -7483,7 +7617,7 @@ import { newId } from "../src/ids";
 import { addContact } from "../src/tools/attributes";
 import { importRoster } from "../src/tools/import";
 import { createPerson, getPerson } from "../src/tools/people";
-import { promote } from "../src/tools/promote";
+import { promoteRosterEntry } from "../src/tools/promote";
 
 const ctx: ToolContext = {
   db: env.DB,
@@ -7537,7 +7671,7 @@ describe("promoteRosterEntry, first phase", () => {
     if (out.status !== "candidates") throw new Error("unreachable");
     expect(out.candidates).toHaveLength(1);
     expect(out.candidates[0]?.evidence).toEqual(
-      expect.arrayContaining(["same name", "same organization"])
+      expect.arrayContaining(["shared name", "shared organization"])
     );
   });
 
@@ -7556,8 +7690,9 @@ describe("promoteRosterEntry, first phase", () => {
 
     const out = await promoteRosterEntry(ctx, { roster_entry_id: entryId });
     if (out.status !== "candidates") throw new Error("unreachable");
-    expect(out.candidates[0]?.person_id).toBe(person.id);
-    expect(out.candidates[0]?.evidence).toContain("same email");
+    expect(out.candidates[0]?.id).toBe(person.id);
+    expect(out.candidates[0]?.record_kind).toBe("person");
+    expect(out.candidates[0]?.evidence).toContain("shared email");
   });
 
   it("returns no candidates for a genuinely new person", async () => {
@@ -7573,7 +7708,7 @@ describe("promoteRosterEntry, first phase", () => {
   });
 });
 
-describe("promote, second phase", () => {
+describe("promoteRosterEntry, second phase", () => {
   it("creates a new person and copies provenance into durable storage", async () => {
     const entryId = await importOne({
       external_row_key: "1",
@@ -7793,7 +7928,7 @@ describe("promote, second phase", () => {
       expect.objectContaining({
         source_key: "wcus-2026",
         external_row_key: "1",
-        source_label: "WordCamp US 2026",
+        source_label: "WCUS 2026",
       })
     );
     // Not false. The staged row is gone, which is a different situation from
