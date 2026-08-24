@@ -43,4 +43,19 @@ describe("confirmation tokens", () => {
     await expect(redeemConfirmation(ctx, "delete_person", "p_1", undefined)).rejects.toThrow(ToolError);
     await expect(redeemConfirmation(ctx, "delete_person", "p_1", "nonsense")).rejects.toThrow(ToolError);
   });
+
+  it("rejects a null token at the database layer", async () => {
+    // THIS IS WHY `token` CARRIES AN EXPLICIT NOT NULL.
+    //
+    // SQLite permits NULL in a PRIMARY KEY column unless it is INTEGER PRIMARY
+    // KEY or the table is WITHOUT ROWID. Without NOT NULL, this insert would
+    // succeed and leave an unredeemable, invisible confirmation row.
+    await expect(
+      env.DB.prepare(
+        "INSERT INTO confirmations (token, action, target_id, preview, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+        .bind(null, "delete_person", "p_1", "{}", "2026-08-20T12:00:00Z", "2026-08-20T12:30:00Z")
+        .run()
+    ).rejects.toThrow();
+  });
 });

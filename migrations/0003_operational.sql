@@ -22,7 +22,7 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idx_idempotency_subject ON idempotency_keys(subject_id);
 
 CREATE TABLE confirmations (
-  token      TEXT PRIMARY KEY,
+  token      TEXT PRIMARY KEY NOT NULL,
   action     TEXT NOT NULL,
   target_id  TEXT NOT NULL,
   preview    TEXT NOT NULL,
