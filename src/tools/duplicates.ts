@@ -68,10 +68,15 @@ if (SCORE.name + SCORE.organization < STRONG_MATCH || SCORE.email < STRONG_MATCH
  * Scans people and staged roster entries. Both, always: the whole point is that
  * "add Jane" must see the roster row nobody has promoted yet.
  *
- * Staged rows are not FTS-indexed, by design in the spec, so this is a bounded
- * LIKE scan over `roster_entries`. At the scale this system is built for - a few
- * hundred to a few thousand staged rows, with indexes on `full_name` and `email`
- * from Task 3 - that is fast enough, and an FTS index over staged data would
+ * Staged rows are not FTS-indexed, by design in the spec, so this is a
+ * bounded scan over `roster_entries`. NOTE: it is a FULL SCAN. The
+ * LOWER(col) = ? predicates cannot use the plain indexes on full_name and
+ * email - SQLite needs an expression index on LOWER(...) for that, and
+ * there is none. At the scale this system is built for, a few hundred to a
+ * few thousand staged rows, a full scan is sub-millisecond and that is
+ * fine. It is stated plainly because an earlier version of this comment
+ * credited indexes that do nothing, and the first person to trust it would
+ * have been debugging the wrong thing. An FTS index over staged data would
  * fire triggers on every imported row, spending exactly the CPU budget the
  * import protocol is fighting for.
  *
