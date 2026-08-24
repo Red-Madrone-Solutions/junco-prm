@@ -50,7 +50,7 @@ Copied from the spec. Every task's requirements implicitly include this section.
 - **Every tool declares MCP's static annotations** - `readOnlyHint`, `destructiveHint`, `idempotentHint` - because clients use them to decide what to approve and what to run without asking, and a surface this size should not make a client guess.
 - **Timestamps are stored as UTC ISO-8601 instants.** Due dates are stored as `YYYY-MM-DD` local date strings and interpreted in `ToolContext.timezone`.
 - **People are archived, never deleted, except through the explicit two-call hard-delete path.** Encounters, roster entries, and a roster source's staged entries are hard-deletable. A `roster_sources` row is never deleted: purging stamps `purged_at` and leaves the row as a tombstone, so its key can never be recycled onto different data.
-- **`deletePerson` deletes children explicitly, in application code, inside the same batch.** SQLite is explicit that foreign key actions are unaffected by the recursive-triggers setting, so rows removed by a cascade may not fire the `AFTER DELETE` triggers that maintain the FTS indexes. Left to cascades, a hard-deleted person's encounter text stays in the search index forever, which is the worst possible place for it given that `deletePerson` exists to satisfy erasure requests.
+- **`deletePerson` deletes children explicitly, in application code, inside the same batch.** The original reason given for this was wrong and is corrected here: an earlier draft claimed that rows removed by a cascade may not fire the `AFTER DELETE` triggers maintaining the FTS indexes. **They do fire.** Tested on 2026-08-24 against SQLite 3.51 with `foreign_keys = ON` and `recursive_triggers = OFF`: a cascaded child delete removed its FTS row. The misreading was of a real sentence in SQLite's documentation - foreign key actions are unaffected by the recursive-triggers setting - which means those actions happen regardless, not that they skip triggers. The explicit deletes stay, for weaker but honest reasons: D1 runs its own SQLite build inside workerd and this was not tested there, an explicit delete states the intent at the call site rather than in a schema three files away, and `deletePerson` exists to satisfy erasure requests where the cost of being wrong is a deleted person's text left in a search index. The FTS assertion in Task 8 is what actually guarantees the outcome.
 - **Imported roster text is untrusted input.** It is stored and returned as data. Marking it as data is a convention rather than a boundary, and the claim that injected text "cannot cause a write" is too strong and is not made here. What the design provides is that destructive operations need an explicit id plus a token minted by a preview a human can read, and that the highest-volume untrusted text never reaches the model at all.
 - **Logs never contain PRM content.** No name, note, organization, or contact detail is ever passed to `console.log`. Tool name, duration, outcome, and identifiers only.
 - **Migrations are additive within a major version** and are applied with `--remote` against a deployment.
@@ -964,7 +964,8 @@ git commit -m "feat: add prefixed ids, tool errors, and timezone-aware dates"
   - `function normalizePhone(value: string): string` - digits with an optional leading `+`; **not** a pinned key rule, see below
   - `function canonicalJson(value: unknown): string` - UTF-8 canonical JSON with object keys sorted
   - `function sha256Hex(text: string): Promise<string>`
-  - `function externalRowKey(row: NormalizedRow, sourceKey: string | undefined): Promise<string>` - the three-tier identity rule
+  - `function externalRowKey(row: NormalizedRow, sourceKey: string | undefined): Promise<string>` - the three-tier identity rule, each tier **namespaced** by a prefix: `k:` source id, `e:` email, `h:` name+org digest
+  - `function keyTier(key: string): "source" | "email" | "hash" | "unknown"`
   - `function contentHash(row: NormalizedRow): Promise<string>` - SHA-256 of the whole normalized row
   - `const HONORIFIC_SUFFIXES: ReadonlySet<string>`
   - `function encodeCursor(value: Record<string, string | number>): string`
@@ -985,6 +986,7 @@ import {
   canonicalJson,
   contentHash,
   externalRowKey,
+  keyTier,
   normalizeEmail,
   normalizeName,
   normalizeText,
@@ -1057,22 +1059,58 @@ describe("externalRowKey", () => {
     job_title: "programmer",
   };
 
-  it("prefers the source's own row identifier", async () => {
-    expect(await externalRowKey(row, "row-7")).toBe("row-7");
+  it("prefers the source's own row identifier, namespaced", async () => {
+    expect(await externalRowKey(row, "row-7")).toBe("k:row-7");
   });
 
   it("falls back to the normalized email when the source has no key", async () => {
-    expect(await externalRowKey(row, undefined)).toBe("ada@example.test");
+    expect(await externalRowKey(row, undefined)).toBe("e:ada@example.test");
   });
 
   it("falls back to a hash of name plus organization when there is no email", async () => {
     const keyless = { ...row, email: undefined };
     const key = await externalRowKey(keyless, undefined);
     expect(key).toBe(
-      await sha256Hex(
+      `h:${await sha256Hex(
         canonicalJson({ full_name: "ada lovelace", organization: "analytical society" })
-      )
+      )}`
     );
+  });
+
+  it("NEVER lets one tier's key collide with another's", async () => {
+    // A source that emits an email address as its own row id. Unprefixed, this
+    // is the same string as the tier-2 key for a different row, and two
+    // different people merge silently.
+    const sourceIdIsAnEmail = await externalRowKey(
+      { full_name: "someone else", organization: "elsewhere" },
+      "ada@example.test"
+    );
+    const derivedFromEmail = await externalRowKey(row, undefined);
+    expect(sourceIdIsAnEmail).not.toBe(derivedFromEmail);
+    expect(sourceIdIsAnEmail).toBe("k:ada@example.test");
+    expect(derivedFromEmail).toBe("e:ada@example.test");
+  });
+
+  it("reports which tier produced a key", async () => {
+    expect(keyTier(await externalRowKey(row, "row-7"))).toBe("source");
+    expect(keyTier(await externalRowKey(row, undefined))).toBe("email");
+    expect(keyTier(await externalRowKey({ ...row, email: undefined }, undefined))).toBe("hash");
+  });
+
+  it("shows the tier CHANGING when a roster gains an email between exports", async () => {
+    // The case the prefixes exist for. A conference adds emails to its export;
+    // every row re-keys, the roster duplicates, and unprefixed nothing can tell
+    // that this is what happened. This does not prevent it - Task 12b reports
+    // it, and an operator decides.
+    const august = { full_name: "ada lovelace", organization: "kinsta" };
+    const september = { ...august, email: "ada@example.test" };
+
+    const before = await externalRowKey(august, undefined);
+    const after = await externalRowKey(september, undefined);
+
+    expect(before).not.toBe(after);
+    expect(keyTier(before)).toBe("hash");
+    expect(keyTier(after)).toBe("email");
   });
 
   it("is STABLE when a field outside the identity subset changes", async () => {
@@ -1213,23 +1251,60 @@ export interface NormalizedRow {
 }
 
 /**
- * The identity key, in three tiers. It is never the name alone: the reference
+ * The identity key, in three tiers, EACH ONE NAMESPACED BY A PREFIX.
+ *
+ * `k:` the source's own row id, `e:` the normalized email, `h:` a digest of
+ * normalized name plus organization. It is never the name alone: the reference
  * roster carries 11 duplicated names across 23 rows.
  *
  * Tier 3 uses a STABLE IDENTITY SUBSET - normalized name and organization and
  * nothing else - rather than the whole row. A whole-row hash makes an edited
  * row a new row, so the edit is undetectable by construction, a duplicate lands
  * beside the stale original, and promotion finds no prior provenance.
+ *
+ * THE PREFIXES ARE NOT DECORATION, and they cannot be added later - every key
+ * in every deployed instance would be orphaned. They buy two things:
+ *
+ * 1. A TIER TRANSITION BECOMES DETECTABLE. A roster that gains email addresses
+ *    between two exports moves every row from tier 3 to tier 2, which re-keys
+ *    the whole roster and silently duplicates it. Adding emails to an export is
+ *    an ordinary thing for a conference to do. Unprefixed, the second import
+ *    just produces a parallel set of rows and the originals go stale beside
+ *    them, with nothing said. Prefixed, Task 12b can compare tiers and report
+ *    "42 rows changed identity tier" instead. It does not PREVENT the
+ *    duplication - only aliasing would, and that was considered and rejected as
+ *    too much machinery for the hardest part of the schema - but a visible
+ *    duplication an operator can act on beats an invisible one.
+ * 2. A COLLISION BETWEEN TIERS BECOMES IMPOSSIBLE. Unprefixed, a source that
+ *    emits `ada@example.test` as its own row id collides with a different row
+ *    whose email-derived key is the same string. Rare, silent, and a merge of
+ *    two different people.
+ *
+ * The costs are worth stating: keys are two characters longer, and
+ * `person_sources.external_row_key` still carries a live email address in tier
+ * 2, which the CLI export in plan 3 will emit. That is PII in a key column and
+ * the export documentation has to say so.
  */
 export async function externalRowKey(
   row: NormalizedRow,
   sourceRowId: string | undefined
 ): Promise<string> {
-  if (sourceRowId && sourceRowId.trim() !== "") return sourceRowId.trim();
-  if (row.email && row.email !== "") return row.email;
-  return sha256Hex(
+  if (sourceRowId && sourceRowId.trim() !== "") return `k:${sourceRowId.trim()}`;
+  if (row.email && row.email !== "") return `e:${row.email}`;
+  return `h:${await sha256Hex(
     canonicalJson({ full_name: row.full_name, organization: row.organization ?? null })
-  );
+  )}`;
+}
+
+/**
+ * Which tier produced a key. Import uses it to detect a TIER TRANSITION, which
+ * is otherwise invisible and duplicates rows.
+ */
+export function keyTier(key: string): "source" | "email" | "hash" | "unknown" {
+  if (key.startsWith("k:")) return "source";
+  if (key.startsWith("e:")) return "email";
+  if (key.startsWith("h:")) return "hash";
+  return "unknown";
 }
 
 /**
@@ -1522,14 +1597,33 @@ describe("staged schema", () => {
     await insertEntry("re_current", sourceId, "row-1", september);
     await insertEntry("re_stale", sourceId, "row-2", august);
 
+    // THE SAME FORMULATION TASKS 9 AND 14 USE, verbatim. Two things about it
+    // are load-bearing and neither is obvious.
+    //
+    // ROW_NUMBER, not `finished_at = (SELECT MAX(...))`. The MAX form returns
+    // EVERY run tied on finished_at, and the LEFT JOIN then duplicates every
+    // roster row. That is not hypothetical here: every test in this plan uses a
+    // frozen clock, so two runs finalized in one test have byte-identical
+    // timestamps. `id DESC` breaks the tie deterministically.
+    //
+    // CASE WHEN, not `<>`. A bare `<>` against an empty subquery yields SQL
+    // NULL, so "no completed run" silently becomes three-valued logic instead
+    // of the intended third state.
     const { results } = await env.DB.prepare(
-      `SELECT e.id,
-              (e.last_seen_run_id <> (
-                 SELECT r.id FROM import_runs r
-                 WHERE r.roster_source_id = e.roster_source_id AND r.status = 'committed'
-                 ORDER BY r.finished_at DESC LIMIT 1
-               )) AS stale
+      `WITH latest AS (
+         SELECT roster_source_id, run_id FROM (
+           SELECT roster_source_id, id AS run_id,
+                  ROW_NUMBER() OVER (PARTITION BY roster_source_id
+                                     ORDER BY finished_at DESC, id DESC) AS rn
+             FROM import_runs WHERE status = 'committed'
+         ) WHERE rn = 1
+       )
+       SELECT e.id,
+              CASE WHEN l.run_id IS NULL THEN NULL
+                   WHEN e.last_seen_run_id = l.run_id THEN 0
+                   ELSE 1 END AS stale
          FROM roster_entries e
+         LEFT JOIN latest l ON l.roster_source_id = e.roster_source_id
         WHERE e.roster_source_id = ?
         ORDER BY e.id`
     )
@@ -1540,6 +1634,36 @@ describe("staged schema", () => {
       { id: "re_current", stale: 0 },
       { id: "re_stale", stale: 1 },
     ]);
+  });
+
+  it("returns ONE row per entry when two runs share a finished_at", async () => {
+    // The defect this formulation exists to avoid. Every test in this plan uses
+    // a frozen clock, so identical timestamps are the normal case here, not an
+    // exotic one. Under `finished_at = (SELECT MAX(...))` both runs qualify and
+    // the LEFT JOIN emits each roster entry twice - with different `stale`
+    // values, since last_seen_run_id matches one run and not the other.
+    const sourceId = await seedSource();
+    const a = await seedRun(sourceId, "ir_a", "committed", "2026-09-01T00:00:00Z");
+    await seedRun(sourceId, "ir_b", "committed", "2026-09-01T00:00:00Z");
+    await insertEntry("re_1", sourceId, "row-1", a);
+
+    const { results } = await env.DB.prepare(
+      `WITH latest AS (
+         SELECT roster_source_id, run_id FROM (
+           SELECT roster_source_id, id AS run_id,
+                  ROW_NUMBER() OVER (PARTITION BY roster_source_id
+                                     ORDER BY finished_at DESC, id DESC) AS rn
+             FROM import_runs WHERE status = 'committed'
+         ) WHERE rn = 1
+       )
+       SELECT e.id FROM roster_entries e
+         LEFT JOIN latest l ON l.roster_source_id = e.roster_source_id
+        WHERE e.roster_source_id = ?`
+    )
+      .bind(sourceId)
+      .all<{ id: string }>();
+
+    expect(results).toHaveLength(1);
   });
 
   it("keeps a stale row selectable, because nothing deletes or hides it", async () => {
@@ -2554,7 +2678,7 @@ git commit -m "feat: add FTS5 people index with trigger-maintained sync"
     - `interface DuplicateCandidate { record_kind: "person" | "roster_entry"; id: string; full_name: string; organization: string | null; evidence: string[]; score: number }`
     - `const STRONG_MATCH = 2` - a name plus an organization reaches it; either alone does not
     - `function findDuplicateCandidates(ctx, probe: { full_name: string; organization?: string; email?: string }, opts?: { excludeRosterEntryId?: string }): Promise<DuplicateCandidate[]>`
-  - `function createPerson(ctx, input): Promise<Person>` - throws `ToolError("conflict", ...)` carrying the candidates in `details` when it refuses
+  - `function createPerson(ctx, input): Promise<Person & { possible_duplicates?: DuplicateCandidate[] }>` - throws `ToolError("conflict", ...)` carrying the candidates in `details` when it refuses, and returns weak candidates alongside the person when it does not
   - `function updatePerson(ctx, input): Promise<Person>`
   - `function getPerson(ctx, input): Promise<PersonDetail>`
 
@@ -2572,7 +2696,9 @@ Task 7 fills `contacts`, `links`, `tags`; Task 10 fills `recent_encounters`, `en
 
 **The refusal is a `conflict` error carrying the candidates, not a union return type.** Two shapes were available. A discriminated union - `{status: "created"} | {status: "duplicate_candidates"}` - reads well in isolation and was rejected, because `createPerson` is the fixture every later task builds its test data with, and a union makes 40-odd call sites narrow a result they do not care about. The spec's own error contract already carries exactly what is needed: a machine-readable code, a reason, and the corrective next call. `ToolError` grows one optional `details` field to hold the candidates, and `promote_roster_entry` stays the only tool that returns candidates as a success, which is right, because surfacing them is that tool's entire first phase rather than its refusal.
 
-**The gap this leaves is real and is named rather than hidden.** "Add Jane, I just met her," against a roster row carrying a name and nothing else, still creates a duplicate. Closing it would mean refusing on a bare name match, which breaks the duplicate-name case the whole id discipline exists for. The candidates are returned either way, so an agent that reads its own tool result can still see the roster row and promote it instead; what is not guaranteed is that it will.
+**The residual gap is narrowed by returning weak candidates on SUCCESS.** "Add Jane, I just met her," against a roster row carrying a name and nothing else, scores 1 and does not refuse - so she is created. But the result now carries `possible_duplicates`, so the agent is told what it nearly duplicated and can call `delete_person` and `promote_roster_entry` instead of leaving her provenance behind.
+
+Two reviewers argued this should refuse on a bare name outright, pointing out that `force: true` already exists so the "add Chris Smith becomes impossible" objection is overstated - it becomes a second call, not impossible. That is a fair correction to the argument. It was still decided against, because a two-call create on every common name is a real cost paid constantly against a gap that this field now mostly closes. What is genuinely not guaranteed is that the agent reads the field and acts on it; that is a smaller and more honest claim than the previous draft's.
 
 **Why the types are declared here, in one file, for tables that do not exist yet.** The first draft declared `PersonDetail` with `unknown[]` collections and expected later tasks to narrow them. They never do: `Contact[]` is assignable to `unknown[]`, so every later task compiles without touching the interface, and every caller of `getPerson` receives untyped arrays it has to cast. A cast in a test is the visible symptom; the real cost is that plan 2 cannot generate an output schema from a type that says `unknown`. Declaring all seven record types up front costs nothing at runtime, since types are erased, and it means each later task adds a query rather than renegotiating a shape.
 
@@ -3223,12 +3349,15 @@ export async function createPerson(ctx: ToolContext, input: CreatePersonInput): 
     // The duplicate check runs BEFORE the insert and before the id is minted.
     // "Add Jane, I just met her" against a roster row waiting to be promoted
     // creates a durable duplicate and loses her provenance permanently.
+    // Run the check even under `force`, because the WEAK candidates are worth
+    // returning either way - see below.
+    const candidates = await findDuplicateCandidates(ctx, {
+      full_name,
+      organization: input.organization ?? undefined,
+      email: input.email,
+    });
+
     if (input.force !== true) {
-      const candidates = await findDuplicateCandidates(ctx, {
-        full_name,
-        organization: input.organization ?? undefined,
-        email: input.email,
-      });
       const strong = candidates.filter((c) => c.score >= STRONG_MATCH);
       if (strong.length > 0) {
         // A roster hit and a person hit call for different next moves, and the
@@ -3266,7 +3395,22 @@ export async function createPerson(ctx: ToolContext, input: CreatePersonInput): 
       )
       .run();
 
-    return loadPerson(ctx, id);
+    const person = await loadPerson(ctx, id);
+
+    // SUB-THRESHOLD CANDIDATES ARE RETURNED ON SUCCESS, and this is what closes
+    // most of the bare-name gap without ever blocking a legitimate create.
+    //
+    // A bare name scores 1 and does not refuse, because the reference roster
+    // carries 11 duplicated names across 23 rows and refusing would make "add
+    // Chris Smith" a two-call operation on any roster holding two of them. But
+    // the case this whole check exists for - "add Jane, I just met her" against
+    // an unpromoted roster row - often produces exactly that weak match, and
+    // saying nothing meant the agent never learned the roster row was there.
+    //
+    // Now it is created AND the agent is told what it nearly duplicated, so it
+    // can call delete_person and promote_roster_entry instead. That is strictly
+    // more information than it had, and it costs one optional field.
+    return candidates.length > 0 ? { ...person, possible_duplicates: candidates } : person;
   });
 }
 
@@ -4176,19 +4320,30 @@ export async function deletePerson(
     await redeemConfirmation(ctx, "delete_person", id, input.confirmation_token);
     const preview = await deletePreview(ctx, id);
 
-    // EVERY CHILD IS DELETED EXPLICITLY, and this is not belt-and-braces over
-    // the ON DELETE CASCADE declarations in the migrations.
+    // EVERY CHILD IS DELETED EXPLICITLY. This IS belt-and-braces over the
+    // ON DELETE CASCADE declarations in the migrations, and an earlier version
+    // of this comment claimed otherwise on a false premise.
     //
-    // SQLite documents that foreign key actions are unaffected by the
-    // recursive_triggers setting, which means rows removed BY A CASCADE may not
-    // fire the AFTER DELETE triggers that maintain the FTS indexes. Left to
-    // cascades, a hard-deleted person's encounter text stays in
-    // `encounters_fts` forever - which is the worst possible place for it,
-    // given that this tool exists to satisfy erasure requests.
+    // What that version said: SQLite documents that foreign key actions are
+    // unaffected by the recursive_triggers setting, therefore cascaded deletes
+    // may not fire the AFTER DELETE triggers maintaining the FTS indexes.
+    // The first half is a real sentence in the documentation. The inference is
+    // backwards - it means FK actions happen regardless of that setting, not
+    // that they skip triggers. Tested 2026-08-24 on SQLite 3.51 with
+    // foreign_keys=ON and recursive_triggers=OFF: a cascaded child delete DID
+    // remove its FTS row.
     //
-    // Deleting the rows directly makes the triggers fire. The order is
-    // children first, parent last, and it is one batch so a partial delete
-    // cannot leave a person gone with her encounters still indexed.
+    // The explicit deletes stay anyway, for three weaker but honest reasons.
+    // D1 runs its own SQLite build inside workerd and the test above was not
+    // run there. An explicit delete states the intent where someone reading
+    // this function can see it, rather than in a schema three files away. And
+    // this tool exists to satisfy erasure requests, where the cost of being
+    // wrong is a deleted person's text sitting in a search index indefinitely.
+    //
+    // The order is children first, parent last, and it is one batch so a
+    // partial delete cannot leave a person gone with her encounters indexed.
+    // THE TEST IN STEP 5b IS WHAT ACTUALLY GUARANTEES THE OUTCOME - not this
+    // comment, and not the cascades either.
     await ctx.db.batch([
       ctx.db.prepare("DELETE FROM encounters WHERE person_id = ?").bind(id),
       ctx.db.prepare("DELETE FROM followups WHERE person_id = ?").bind(id),
@@ -4263,9 +4418,13 @@ it("leaves NO fts row behind after a hard delete", async () => {
 });
 ```
 
-- [ ] **Step 5c: Run it and confirm it fails for the right reason first**
+- [ ] **Step 5c: Run it against cascades alone and record what D1 actually does**
 
-Before adding the explicit child deletes, comment them out and run this test against a plain `DELETE FROM people`. It must fail on `encounters_fts`. If it passes with cascades alone, then D1's build fires triggers on cascaded deletes after all, and that is worth recording in `docs/MEASUREMENTS.md` - but the explicit deletes stay regardless, because the behavior is documented as unspecified and a future runtime is free to change it back.
+Before adding the explicit child deletes, comment them out and run this test against a plain `DELETE FROM people`.
+
+**Expect it to PASS**, and do not treat that as a reason to skip the explicit deletes. On stock SQLite 3.51 the cascade fires the trigger and the FTS row goes; that was measured on 2026-08-24 and the earlier claim to the contrary was a misreading. What this step is actually for is finding out whether **D1's build inside workerd** agrees, which nobody has checked.
+
+Record the answer in `docs/MEASUREMENTS.md` either way. If it passes, the explicit deletes are defense in depth and the plan says so honestly. If it fails, they are load-bearing and that is a genuinely surprising platform fact worth writing down - the kind Task 0 already turned up twice.
 
 - [ ] **Step 6: Commit**
 
@@ -4898,13 +5057,14 @@ export async function searchPeople(
     const { results: rows } = await ctx.db
       .prepare(
         `WITH latest AS (
-           SELECT roster_source_id, id AS run_id, finished_at
-             FROM import_runs r
-            WHERE r.status = 'committed'
-              AND r.finished_at = (
-                    SELECT MAX(finished_at) FROM import_runs x
-                     WHERE x.roster_source_id = r.roster_source_id AND x.status = 'committed'
-                  )
+           -- EXACTLY ONE ROW PER SOURCE. See the note below on why the obvious
+           -- formulation is wrong.
+           SELECT roster_source_id, run_id, finished_at FROM (
+             SELECT roster_source_id, id AS run_id, finished_at,
+                    ROW_NUMBER() OVER (PARTITION BY roster_source_id
+                                       ORDER BY finished_at DESC, id DESC) AS rn
+               FROM import_runs WHERE status = 'committed'
+           ) WHERE rn = 1
          )
          SELECT re.id AS id, re.full_name AS full_name, re.organization AS organization,
                 re.job_title AS job_title, rs.source_key AS source_key,
@@ -6085,19 +6245,19 @@ describe("parseCsv", () => {
 describe("prepareRow", () => {
   it("uses the source's key when it has one", async () => {
     const out = await prepareRow({ external_row_key: "row-7", full_name: "Ada" });
-    expect(out.key).toBe("row-7");
+    expect(out.key).toBe("k:row-7");
   });
 
   it("falls back to the normalized email when the source has no key", async () => {
     const out = await prepareRow({ full_name: "Ada Lovelace", email: "Ada@Example.TEST" });
-    expect(out.key).toBe("ada@example.test");
+    expect(out.key).toBe("e:ada@example.test");
   });
 
   it("falls back to a name-plus-organization digest when there is no email either", async () => {
     const a = await prepareRow({ full_name: "Ada Lovelace", organization: "Kinsta" });
     const b = await prepareRow({ organization: "Kinsta", full_name: "Ada Lovelace" });
     expect(a.key).toBe(b.key);
-    expect(a.key).toHaveLength(64); // a bare hex SHA-256, no prefix
+    expect(a.key).toMatch(/^h:[0-9a-f]{64}$/); // tier prefix plus hex SHA-256
   });
 
   it("gives two same-named people at different organizations different keys", async () => {
@@ -6470,10 +6630,33 @@ export async function ensureSource(
   input: Pick<ImportRosterInput, "source_key" | "label" | "event" | "source_url">
 ): Promise<string> {
   const existing = await ctx.db
-    .prepare("SELECT id FROM roster_sources WHERE source_key = ?")
+    .prepare("SELECT id, purged_at FROM roster_sources WHERE source_key = ?")
     .bind(input.source_key)
-    .first<{ id: string }>();
-  if (existing) return existing.id;
+    .first<{ id: string; purged_at: string | null }>();
+
+  if (existing) {
+    // A PURGE IS TERMINAL. Without this check the tombstone does nothing that
+    // matters, and the migration comment in 0002 asserts a protection the
+    // system does not have.
+    //
+    // The `roster_sources` row surviving a purge stops a SECOND row being
+    // created under the same key. It does not, on its own, stop the thing that
+    // row exists to prevent: importing the 2027 roster under `wcus-2026` after
+    // purging it. Any row whose external_row_key is a tier-2 email or a tier-3
+    // name+organization digest matching a 2026 `person_sources` row then makes
+    // `promoteRosterEntry` return a person from the wrong year, with
+    // `linked_existing: true`, ignoring `create_new: true`, silently. That is
+    // precisely the "write against the wrong person" this design names as its
+    // most likely real failure.
+    if (existing.purged_at !== null) {
+      throw new ToolError(
+        "conflict",
+        `roster source ${input.source_key} was purged on ${existing.purged_at} and cannot be imported into again`,
+        "call import_roster with a new source_key, for example by adding the year or the capture date"
+      );
+    }
+    return existing.id;
+  }
 
   const id = newId("rs");
   await ctx.db
@@ -7352,6 +7535,51 @@ describe("finalizeImport", () => {
       .bind("2")
       .first<{ full_name: string }>();
     expect(grace?.full_name).toBe("Grace");
+  });
+
+  it("an UNFINALIZED import does not invert staleness", async () => {
+    // VERIFY BEFORE FIXING. One reviewer of four claimed this is broken and the
+    // other three did not look; this test decides it rather than reasoning
+    // about it, which is how the STRONG_MATCH arithmetic bug survived.
+    //
+    // The claim: importRoster stamps last_seen_run_id with the OPEN run
+    // immediately, so once September has imported Ada but never finalized -
+    //   - Ada points at September, which is not the latest COMMITTED run, so
+    //     she reads as stale;
+    //   - Grace, whom September never sent, still points at August, which IS
+    //     the latest committed run, so she reads as current.
+    // Exactly backwards, and permanent if September is abandoned.
+    //
+    // If this test FAILS, the claim is right and the fix is a design decision:
+    // either stamp last_seen_run_id only at finalization (needs chunk
+    // membership recorded during import) or carry pending and committed
+    // observation columns separately. Do not paper over it in the query.
+    //
+    // If it PASSES, the reviewer was wrong and this test stays as the record.
+    const august = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 2,
+      rows: [
+        { external_row_key: "1", full_name: "Ada Lovelace" },
+        { external_row_key: "2", full_name: "Grace Hopper" },
+      ],
+    });
+    await finalizeImport(ctx, { run_id: august.run_id });
+
+    // September imports Ada only, and is never finalized.
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada Lovelace" }],
+    });
+
+    const ada = await searchPeople(ctx, { query: "Lovelace", scope: "roster" });
+    const grace = await searchPeople(ctx, { query: "Hopper", scope: "roster" });
+
+    // Neither is stale. August is still the latest committed run and it saw
+    // both rows; an open run is inert and must not change what either reads as.
+    expect(ada.roster_entries[0]?.stale).toBe(false);
+    expect(grace.roster_entries[0]?.stale).toBe(false);
   });
 
   it("does not become the staleness baseline until it is finalized", async () => {
@@ -8676,15 +8904,52 @@ describe("purgeRosterSource", () => {
     expect(tombstone?.id).toBe(source!.id);
     expect(tombstone?.purged_at).toBe("2026-08-20T12:00:00.000Z");
 
-    // And a later import under the same key reuses the tombstone rather than
-    // creating a second source row.
+    // And a later import under the same key is REFUSED. The tombstone alone
+    // only stops a second source row; refusing the import is what actually
+    // stops 2027 data inheriting 2026 provenance.
+    try {
+      await importRoster(ctx, {
+        ...SOURCE,
+        expected_total: 1,
+        rows: [{ external_row_key: "9", full_name: "Someone Else" }],
+      });
+      throw new Error("expected the import to be refused");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("conflict");
+      expect((e as ToolError).next).toContain("new source_key");
+    }
+
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM roster_sources").first<{ n: number }>();
+    expect(count?.n).toBe(1);
+    const entries = await env.DB.prepare("SELECT COUNT(*) AS n FROM roster_entries").first<{ n: number }>();
+    expect(entries?.n).toBe(0);
+  });
+
+  it("accepts a DIFFERENT source key after a purge", async () => {
+    // The corrective path the refusal names. Purging is not a dead end; it just
+    // means the next roster gets its own key and its own provenance namespace.
     await importRoster(ctx, {
       ...SOURCE,
       expected_total: 1,
-      rows: [{ external_row_key: "9", full_name: "Someone Else" }],
+      rows: [{ external_row_key: "1", full_name: "Ada" }],
     });
+    const source = await env.DB.prepare("SELECT id FROM roster_sources LIMIT 1").first<{ id: string }>();
+    const first = await purgeRosterSource(ctx, { roster_source_id: source!.id });
+    if (first.status !== "confirmation_required") throw new Error("unreachable");
+    await purgeRosterSource(ctx, {
+      roster_source_id: source!.id,
+      confirmation_token: first.confirmation_token,
+    });
+
+    await importRoster(ctx, {
+      ...SOURCE,
+      source_key: "wcus-2027",
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Someone Else" }],
+    });
+
     const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM roster_sources").first<{ n: number }>();
-    expect(count?.n).toBe(1);
+    expect(count?.n).toBe(2);
   });
 
   it("reports it in list_roster_sources afterwards", async () => {
@@ -8764,13 +9029,14 @@ export async function listRosterSources(ctx: ToolContext): Promise<RosterSourceS
   const { results } = await ctx.db
     .prepare(
       `WITH latest AS (
-         SELECT roster_source_id, id AS run_id, finished_at
-           FROM import_runs r
-          WHERE r.status = 'committed'
-            AND r.finished_at = (
-                  SELECT MAX(finished_at) FROM import_runs x
-                   WHERE x.roster_source_id = r.roster_source_id AND x.status = 'committed'
-                )
+         -- EXACTLY ONE ROW PER SOURCE. See the note below on why the obvious
+         -- formulation is wrong.
+         SELECT roster_source_id, run_id, finished_at FROM (
+           SELECT roster_source_id, id AS run_id, finished_at,
+                  ROW_NUMBER() OVER (PARTITION BY roster_source_id
+                                     ORDER BY finished_at DESC, id DESC) AS rn
+             FROM import_runs WHERE status = 'committed'
+         ) WHERE rn = 1
        )
        SELECT rs.id AS id, rs.source_key AS source_key, rs.label AS label,
               rs.event AS event, rs.url AS url, rs.purged_at AS purged_at,
@@ -8842,13 +9108,14 @@ export async function getRosterEntry(
   const row = await ctx.db
     .prepare(
       `WITH latest AS (
-         SELECT roster_source_id, id AS run_id, finished_at
-           FROM import_runs r
-          WHERE r.status = 'committed'
-            AND r.finished_at = (
-                  SELECT MAX(finished_at) FROM import_runs x
-                   WHERE x.roster_source_id = r.roster_source_id AND x.status = 'committed'
-                )
+         -- EXACTLY ONE ROW PER SOURCE. See the note below on why the obvious
+         -- formulation is wrong.
+         SELECT roster_source_id, run_id, finished_at FROM (
+           SELECT roster_source_id, id AS run_id, finished_at,
+                  ROW_NUMBER() OVER (PARTITION BY roster_source_id
+                                     ORDER BY finished_at DESC, id DESC) AS rn
+             FROM import_runs WHERE status = 'committed'
+         ) WHERE rn = 1
        )
        SELECT re.id AS id, rs.source_key AS source_key, rs.label AS source_label,
               rs.event AS source_event, re.external_row_key AS external_row_key,

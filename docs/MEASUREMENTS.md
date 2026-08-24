@@ -106,6 +106,33 @@ this question.
 
 ---
 
+## Run of 2026-08-24, second: cascaded deletes and FTS triggers
+
+Not a Cloudflare measurement. Run locally against **SQLite 3.51.0** with
+`foreign_keys = ON` and `recursive_triggers = OFF`, to settle a claim the spec
+and plan 1 both asserted.
+
+**The claim, now withdrawn:** that rows removed by an `ON DELETE CASCADE` may not
+fire the `AFTER DELETE` triggers maintaining the FTS indexes, so `delete_person`
+must delete children explicitly or a deleted person's text stays searchable.
+
+**The observation: cascaded deletes DO fire the triggers.** A parent row was
+deleted, the child row went with it by cascade, and the child's FTS row was
+removed by the trigger. The reasoning behind the original claim misread a real
+sentence in SQLite's documentation - foreign key actions are unaffected by the
+recursive-triggers setting - which means those actions happen regardless of the
+setting, not that they bypass triggers.
+
+**What did not change:** `delete_person` still deletes children explicitly. The
+reasons are now weaker and stated as such - D1 runs its own SQLite build inside
+workerd and this was not tested there, and an explicit delete states intent at
+the call site. Plan 1 Task 8 Step 5c records what to check against D1 itself.
+
+**Still not established:** whether D1's build behaves the same way. Nobody has
+run this inside workerd, and Task 8 Step 5c now asks the implementer to.
+
+---
+
 ## Constants this run set
 
 | Constant | Value | Bounded by |
