@@ -1901,6 +1901,18 @@ CREATE INDEX idx_roster_entries_last_seen ON roster_entries(last_seen_run_id);
 -- scope: roster runs a bounded LIKE scan instead. An FTS index over staged data
 -- would fire triggers on every imported row, spending exactly the CPU budget
 -- the import protocol is fighting for. These two indexes make that scan bounded.
+-- NOTE, added after two reviewers independently found the same thing: neither of
+-- these indexes is currently usable by either of its intended consumers.
+-- `duplicates.ts` filters on `LOWER(full_name) = ?`, and `search_people`'s
+-- roster scan uses a leading-wildcard `LIKE '%x%'`. SQLite's planner can use a
+-- plain index for neither - the first needs an expression index on LOWER(...),
+-- and no index serves a leading wildcard at all.
+--
+-- They are kept rather than dropped because a full scan of a few thousand
+-- staged rows is sub-millisecond and the write cost is trivial at import
+-- volumes, and because dropping them is an optimisation decision rather than a
+-- correctness fix. If someone later needs these lookups to be indexed, the
+-- answer is expression indexes on LOWER(...), not these.
 CREATE INDEX idx_roster_entries_name ON roster_entries(full_name);
 CREATE INDEX idx_roster_entries_email ON roster_entries(email);
 
@@ -3285,12 +3297,24 @@ if (SCORE.name + SCORE.organization < STRONG_MATCH || SCORE.email < STRONG_MATCH
  * Scans people and staged roster entries. Both, always: the whole point is that
  * "add Jane" must see the roster row nobody has promoted yet.
  *
- * Staged rows are not FTS-indexed, by design in the spec, so this is a bounded
- * LIKE scan over `roster_entries`. At the scale this system is built for - a few
- * hundred to a few thousand staged rows, with indexes on `full_name` and `email`
- * from Task 3 - that is fast enough, and an FTS index over staged data would
- * fire triggers on every imported row, spending exactly the CPU budget the
- * import protocol is fighting for.
+ * Staged rows are not FTS-indexed, by design in the spec, so this scans
+ * `roster_entries`. IT IS A FULL SCAN, and saying so plainly is the point of
+ * this paragraph.
+ *
+ * An earlier version credited "indexes on full_name and email from Task 3" with
+ * making it fast. That was false. These predicates are `LOWER(col) = ?`, and
+ * SQLite's planner cannot use a plain index on `col` to satisfy one - it needs
+ * an expression index on `LOWER(col)`, and there is none. Two independent
+ * reviewers found this from different directions: the same indexes also cannot
+ * serve `search_people`'s leading-wildcard `LIKE '%x%'`. They are currently
+ * unusable by both of their intended consumers.
+ *
+ * The scan is still the right call. At the scale this system is built for, a few
+ * hundred to a few thousand staged rows, a full scan is sub-millisecond, and an
+ * FTS index over staged data would fire triggers on every imported row -
+ * spending exactly the CPU budget the import protocol is fighting for. What was
+ * wrong was the explanation, not the decision, and the first person to trust the
+ * old comment would have been debugging the wrong thing.
  *
  * `raw_record` is never selected. It is untrusted text and this result goes
  * straight into a model's context immediately before a write decision.
