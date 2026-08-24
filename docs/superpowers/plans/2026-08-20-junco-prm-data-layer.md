@@ -2032,7 +2032,12 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idx_idempotency_subject ON idempotency_keys(subject_id);
 
 CREATE TABLE confirmations (
-  token      TEXT PRIMARY KEY,
+  -- NOT NULL is load-bearing, not decoration. SQLite permits NULL in a PRIMARY
+  -- KEY unless it is INTEGER PRIMARY KEY or the table is WITHOUT ROWID, so
+  -- `token TEXT PRIMARY KEY` alone accepts a null-keyed row that is
+  -- unredeemable and invisible. This table slipped past the global constraint
+  -- for a while because its key column is called `token` rather than `id`.
+  token      TEXT PRIMARY KEY NOT NULL,
   action     TEXT NOT NULL,
   target_id  TEXT NOT NULL,
   preview    TEXT NOT NULL,
