@@ -405,22 +405,38 @@ export default {
 - [ ] **Step 5: Write `vitest.config.ts`**
 
 ```ts
-import { defineWorkersConfig, readD1Migrations } from "@cloudflare/vitest-pool-workers/config";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
 
+// VERIFIED AGAINST THE INSTALLED PACKAGE, 0.22.0, on 2026-08-24.
+//
+// An earlier version of this file used `defineWorkersConfig` from
+// `@cloudflare/vitest-pool-workers/config`. That subpath export DOES NOT EXIST
+// in 0.22.0 - the package exports only ".", "./types", and a codemod named
+// "vitest-v3-to-v4" - and `defineWorkersConfig` appears nowhere in it. It is
+// Vitest-3-era API, and the codemod's name is the package telling you so.
+//
+// Worse, this plan's own "Decisions taken on review" section asserted the
+// opposite and instructed an executing agent NOT to substitute a newer shape.
+// That instruction was wrong and has been withdrawn. The current shape is a
+// PLUGIN passed to vitest's own defineConfig, not a config wrapper.
 const migrations = await readD1Migrations("./migrations");
 
-export default defineWorkersConfig({
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        bindings: { TEST_MIGRATIONS: migrations },
+      },
+    }),
+  ],
   test: {
     setupFiles: ["./tests/apply-migrations.ts"],
-    poolOptions: {
-      workers: {
-        singleWorker: true,
-        wrangler: { configPath: "./wrangler.jsonc" },
-        miniflare: {
-          bindings: { TEST_MIGRATIONS: migrations },
-        },
-      },
-    },
+    // One worker, no isolation: every test file shares one D1 instance, and the
+    // migrations are applied once per file by the setup file above.
+    isolate: false,
+    maxWorkers: 1,
   },
 });
 ```
@@ -441,7 +457,9 @@ Migrations are applied once per worker before any test runs. Every test file's `
 
 ```ts
 declare module "cloudflare:test" {
-  interface ProvidedEnv {
+  // `Cloudflare.Env`, not `ProvidedEnv` - the latter is Vitest-3-era and is
+  // absent from 0.22.0. Verified against the installed package 2026-08-24.
+  interface Env {
     DB: D1Database;
     TEST_MIGRATIONS: D1Migration[];
   }
@@ -11215,7 +11233,11 @@ Named so a reviewer does not read the absence as an oversight.
 Four questions came out of the 2026-08-21 review that the plan could not settle on its own. Recorded with their reasoning, because each one is a place where a later reader will otherwise wonder what was considered.
 
 - **FTS5 indexes are standalone tables carrying the record id as an `UNINDEXED` column,** not external-content tables. One reviewer called `content_rowid='rowid'` against a `TEXT PRIMARY KEY` fatal, on the grounds that `VACUUM` can renumber the implicit rowids; two called it fine. SQLite does document that rowid renumbering, so the mechanism is real even though D1's maintenance behavior is not documented either way. The alternative, adding an integer surrogate key to `people` and `encounters` to stabilize the rowid, was considered and rejected: it buys back a few megabytes of duplicated text at the cost of a second key on every durable row. The failure being designed against is silent, which is what settled it.
-- **The test harness stays `@cloudflare/vitest-pool-workers` 0.22.** Cloudflare's current documentation shows `@cloudflare/vitest-plugin` and `cloudflareTest()`, and one reviewer flagged the pool package as obsolete on that basis. The plugin was first published on 2026-08-20 and is one release old; the pool package is not deprecated, was updated on 2026-08-18, and targets the same Vitest 4.1. An executing agent that searches the docs will find the newer shape, which is why Task 1 says explicitly not to substitute it.
+- **The test harness stays `@cloudflare/vitest-pool-workers` 0.22**, and **the rest of what this bullet used to say was wrong.** It read: an executing agent that searches the docs will find a newer `cloudflareTest()` shape, "which is why Task 1 says explicitly not to substitute it."
+
+  That instruction was backwards, and the first implementer to execute Task 1 caught it. **0.22.0 has no `./config` subpath export at all** - the package exports `.`, `./types`, and a codemod named `vitest-v3-to-v4` - and `defineWorkersConfig` appears nowhere in it. `cloudflareTest()` is not a newer thing to be resisted; it is what this package actually exports, and the codemod's name is the package saying so out loud. `ProvidedEnv` is gone the same way, replaced by `Cloudflare.Env`.
+
+  The decision to stay on the pool package rather than move to `@cloudflare/vitest-plugin` still stands. The API shape asserted alongside it did not, and Task 1 now carries the verified one. Recorded here rather than quietly fixed because this bullet actively told an executing agent to write code that could not run.
 - **`export_data` is built here, in Task 15.** The spec kept it in the tool surface and the first draft of this plan listed it under what it does not build. The spec wins: it is a read over tables this plan already owns, and plan 3's CLI export is a different interface for a different job.
 - **`delete_encounter` stays a single call.** It is the one destructive operation outside the two-call rule, and Global Constraints now states the exception rather than leaving the plan contradicting itself. An encounter is one row the user just dictated, `update_encounter` handles most corrections, and Time Travel covers a delete they regret.
 
