@@ -6,6 +6,7 @@
 - Revised a fifth time 2026-08-21, after a four-agent review of the fourth revision. It reversed two of that revision's changes: purge-then-import is not how a roster is refreshed (stale rows are annotated, never acted on), and `external_row_key` no longer doubles as the change-detection hash. See "Second review" at the end.
 - Revised a fourth time 2026-08-21, after a three-agent review of this spec (a fourth timed out). Three structural changes came out of it: **roster retirement was removed entirely** because no caller-supplied completeness claim can safely gate a destructive operation, **`person_roster_entries` was dropped** because a durable table pointing at disposable rows was the defect this spec claims to have fixed, and **nine tools were added to the surface**, which previously had no way to record an email address. Details in "Questions resolved on 2026-08-21" at the end.
 - Revised again 2026-08-21, after a four-agent review of the phase 1 implementation plan sent four questions back up to the spec. The import protocol now sends each row once instead of re-transmitting the roster on every call, `people.notes` has a stated job, the backup is a local export rather than an undecided one, and the mobile-connector question was checked rather than deferred. See "Questions resolved on 2026-08-21" at the end. There are now no open questions.
+- Revised 2026-08-24, twice and both times small. First a duplicated `### Search` heading was repaired. Then two gaps surfaced by writing the phase 1 Worker plan were filled: the spec described the deployment's variables in prose but never named them, and the removal of the "identity echo" endpoint had left no statement of how an operator recovers from setting the owner id wrong. See "Configuration surface" under Deployment and "Losing access" under Operations. The `/health` contract under Verification was also pinned field by field, and its `owner_configured` renamed to `configured` and widened to cover every variable rather than the owner id alone. No design decision changed.
 - Author: Matt (Red Madrone Solutions), drafted with Claude
 
 ## Summary
@@ -348,6 +349,31 @@ Everything around and between those is agent work: cloning, installing dependenc
 
 Setting the owner identity is not a human block. The agent resolves the numeric GitHub user id from a username it was given, so nothing is copied out of a browser.
 
+### Configuration surface
+
+Every variable and binding a deployment carries, named literally, because the runbook, the Worker, and the upgrade document all have to agree about them and prose descriptions do not survive that.
+
+**Secrets**, set with `wrangler secret put` and never written into the Wrangler configuration file:
+
+- `GITHUB_CLIENT_SECRET` - from the GitHub OAuth application.
+- `COOKIE_ENCRYPTION_KEY` - random 32 bytes, hex. `workers-oauth-provider` encrypts its consent cookie with it.
+
+**Plain variables**, set in the Wrangler configuration file, visible in the dashboard:
+
+- `GITHUB_CLIENT_ID` - from the GitHub OAuth application. Public by design; it appears in the authorization URL.
+- `OWNER_GITHUB_USER_ID` - the owner's **numeric** GitHub user id, as a string.
+- `OWNER_TIMEZONE` - an IANA zone.
+
+**Bindings:**
+
+- `DB` - the D1 database.
+- `OAUTH_KV` - the Workers KV namespace `workers-oauth-provider` requires.
+- `RATE_LIMITER` - the Workers rate-limiting binding, only if it proves available on the free plan. See Security and data handling.
+
+**`OWNER_GITHUB_USER_ID` is a plain variable rather than a secret, deliberately.** It is not a credential: it is a public number anyone can resolve from a username, and the OAuth flow rather than its secrecy is what protects the instance. Making it a secret would hide it from deploy output and from the dashboard, which is exactly where an operator needs to see it when working out why their own requests are being refused.
+
+**The Worker fails closed if any of the five is missing or invalid**, and validates rather than merely checking presence. `OWNER_GITHUB_USER_ID` must be digits, because the likeliest operator error is pasting a username, and `OWNER_TIMEZONE` must be a zone `Intl` recognizes, because a typo'd zone otherwise surfaces much later as a crash inside `list_due` rather than as a refused deploy.
+
 ### Why the remaining steps cannot be automated away
 
 Recorded so that nobody spends a day trying.
@@ -393,7 +419,16 @@ A single file, `docs/DEPLOY.md`, is the deliverable, and it is written to a fixe
 
 Verification runs in two parts, because unauthenticated checks cannot prove the thing that actually matters.
 
-The agent asserts that the Worker responds, that it refuses tools when unauthenticated, and that migrations are applied. This needs an endpoint that the spec has to define rather than assume: `/health`, unauthenticated, returning `{ok, schema_version, owner_configured}` and nothing else. It deliberately does not report whether the instance is unclaimed in a way that invites claiming, since with the owner id set as configuration before first deploy there is no unclaimed window to advertise.
+The agent asserts that the Worker responds, that it refuses tools when unauthenticated, and that migrations are applied. This needs an endpoint that the spec has to define rather than assume: `/health`, unauthenticated, returning exactly four fields and nothing else.
+
+- `status` - `"ok"` if the Worker is running. It has no other value; a Worker that cannot answer does not answer.
+- `schema_version` - the name of the last applied migration, read from D1's own `d1_migrations` table rather than from a constant in the code. That is the point of it: it reports what the **database** believes, so it can disagree with the deployed code, which is exactly the drift the field exists to surface. It is `null` on a database that has never been migrated, which is a real state during a first deploy and one this route has to survive rather than crash on.
+- `configured` - whether every variable and binding under "Configuration surface" is present and valid. An earlier draft called this `owner_configured` and scoped it to the owner id alone; it covers all of them, because an instance missing its cookie key is just as unusable as one missing its owner, and an operator debugging a deploy should not have to guess which of five things this field is talking about.
+- `request_id` - so a report can be matched to a log line. `/health` is the one route an operator can reach before anything else works, and it is where a support conversation starts.
+
+**`/health` answers even when configuration is incomplete, and it is the only route that does.** Everything else fails closed. An operator debugging an unconfigured instance needs something to respond, and this route holds no data - it reports `configured: false` and carries on.
+
+Three things it deliberately does **not** report: the owner id, the client id, and any row count. The first two are the configuration an attacker would want; the third is a small leak with no upside, since "42 people" tells a stranger the instance is in use and worth a second look. It also does not report whether the instance is unclaimed in a way that invites claiming, since with the owner id set as configuration before first deploy there is no unclaimed window to advertise.
 
 That is not sufficient on its own. Reachability and a refused anonymous request say nothing about whether the owner can actually sign in, whether the GitHub application is configured correctly, or whether Claude can complete a connection. The runbook therefore ends with an **authenticated** end-to-end check: connect the connector, call one harmless read tool, and confirm a real result comes back. Fail-closed is confirmed rather than assumed, and so is fail-open.
 
@@ -468,9 +503,14 @@ The first question a stranger asks is whether this will cost them money, and an 
 
 ### Losing access
 
-Three different losses with three different answers, stated plainly because the honest answer to one of them is bad:
+Four ways to lose access, with four different answers, stated plainly because the honest answer to one of them is bad:
 
 - **Losing the GitHub account** is recoverable. Resolve the new numeric user id, update the allowlist variable, redeploy. Existing grants are invalidated by the allowlist change.
+- **Setting `OWNER_GITHUB_USER_ID` to the wrong number** is recoverable, and the instance tells the operator what the right one is. This is the case an earlier draft's "identity echo" endpoint existed to solve, and removing that endpoint left no statement of what replaced it, so it is written down here.
+
+  A wrong-but-numeric id passes validation, so the deploy succeeds and `/health` reports the instance as configured. The symptom is that the owner completes the GitHub consent screen and every subsequent tool call is refused. The diagnosis is one command: `wrangler tail` shows an `auth_failure` line carrying the numeric id that **was** presented, which is the owner's real id and therefore exactly the value the variable should have been set to. Copy it, set it, redeploy. The connector does not need to be removed and re-added.
+
+  This works because authentication failures are logged with the presented identity, which is the one deliberate exception to the rule that logs never carry identity. It was written for detecting someone probing the instance; that it also hands the operator their own id when they have mistyped it is a second use for the same line, and worth keeping in mind before anyone narrows what that log records.
 - **A leaked client secret** is recoverable. Rotate it at GitHub, set it again with `wrangler secret put`, and revoke outstanding grants by clearing the KV namespace.
 - **Losing the Cloudflare account** is not recoverable from inside the system. Everything lives there, including Time Travel. The exported JSON on the operator's own machine is the only answer, and nothing automates it: the coverage is exactly as good as the operator's habit of running it. The deploy documentation says that in those words rather than implying a safety net that does not exist. An operator who never runs the export has no answer to this case, and should know that before they have data worth losing.
 
