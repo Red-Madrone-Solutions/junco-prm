@@ -4,6 +4,7 @@ import { assertId, newId } from "../ids";
 import { withIdempotency } from "../idempotency";
 import { nowIso } from "../time";
 import type { Person, PersonDetail } from "../types";
+import { loadContacts, loadLinks, loadTags } from "./attributes_read";
 
 export type { Person, PersonDetail } from "../types";
 
@@ -208,11 +209,16 @@ export interface GetPersonInput {
 export async function getPerson(ctx: ToolContext, input: GetPersonInput): Promise<PersonDetail> {
   const id = assertId("p", input.person_id);
   const person = await loadPerson(ctx, id);
+  const [contacts, links, tags] = await Promise.all([
+    loadContacts(ctx, id),
+    loadLinks(ctx, id),
+    loadTags(ctx, id),
+  ]);
   return {
     ...person,
-    contacts: [],
-    links: [],
-    tags: [],
+    contacts,
+    links,
+    tags,
     sources: [],
     open_followups: [],
     recent_encounters: [],
