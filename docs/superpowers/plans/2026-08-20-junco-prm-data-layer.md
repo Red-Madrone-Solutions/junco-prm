@@ -3944,6 +3944,7 @@ import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { assertId, newId } from "../ids";
 import { withIdempotency } from "../idempotency";
+import { normalizeEmail, normalizePhone, normalizeText } from "../normalize";
 import { nowIso } from "../time";
 import type { PersonDetail } from "../types";
 import { getPerson, loadPerson } from "./people";
