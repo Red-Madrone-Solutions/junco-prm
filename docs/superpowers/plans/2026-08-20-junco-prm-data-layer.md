@@ -337,11 +337,11 @@ Why this is one task rather than four: the scaffold is worthless until something
 npm init -y
 npm pkg set name="junco-prm" private=true type="module"
 npm pkg set scripts.test="vitest run" scripts.typecheck="tsc --noEmit"
-npm install --save-dev --save-exact wrangler@4.125.0 typescript@5 vitest@4.1.11 @cloudflare/vitest-pool-workers@0.22.0 @cloudflare/workers-types@4
+npm install --save-dev --save-exact wrangler@4.125.0 typescript@5 vitest@4.1.11 @cloudflare/vitest-pool-workers@0.22.0 @cloudflare/workers-types@5.20260823.1
 mkdir -p migrations
 ```
 
-Versions are exact, not ranges. A plan written against floating versions is a plan that worked once, and the two packages that matter here move weekly. These were the current releases on 2026-08-21: Wrangler 4.125.0, Vitest 4.1.11, and `@cloudflare/vitest-pool-workers` 0.22.0, which declares a peer dependency on Vitest `^4.1.0`.
+Versions are exact, not ranges. A plan written against floating versions is a plan that worked once, and the two packages that matter here move weekly. These were the current releases on 2026-08-21: Wrangler 4.125.0, Vitest 4.1.11, and `@cloudflare/vitest-pool-workers` 0.22.0, which declares a peer dependency on Vitest `^4.1.0`. `@cloudflare/workers-types` is pinned at `5.20260823.1`, not `^4` - see the note above on the spike (line 214): the package is on 5.x, and an older tutorial's `@4` would install a stale major version.
 
 Cloudflare has since published `@cloudflare/vitest-plugin` 1.0.0, whose `cloudflareTest()` plus `defineConfig()` shape is what current documentation shows, and an executing agent that searches the docs will find it rather than what is written below. Use what is written below anyway. That package was first published on 2026-08-20 and is one release old; `@cloudflare/vitest-pool-workers` is not deprecated, was updated on 2026-08-18, and targets the same Vitest. Migrating later is a change to one config file. Do not substitute one for the other partway through this plan, because the two configure the same pool through different entry points and a half-migrated harness fails in a way that looks like a database error.
 
@@ -356,7 +356,7 @@ Cloudflare has since published `@cloudflare/vitest-plugin` 1.0.0, whose `cloudfl
     "module": "ES2022",
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
-    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
@@ -366,6 +366,8 @@ Cloudflare has since published `@cloudflare/vitest-plugin` 1.0.0, whose `cloudfl
   "include": ["src/**/*.ts", "tests/**/*.ts", "env.d.ts", "vitest.config.ts"]
 }
 ```
+
+The `types` entry is `@cloudflare/vitest-pool-workers/types`, not the bare package name. The bare name's `types` field points at `dist/pool/index.d.mts` - the pool-config API - while the ambient `cloudflare:test` module declaration (`env`, `applyD1Migrations`, `D1Migration`) lives only under the `/types` export subpath. Verified against the installed package, 0.22.0, on 2026-08-24.
 
 - [ ] **Step 3: Write `wrangler.jsonc`**
 
@@ -456,14 +458,24 @@ Migrations are applied once per worker before any test runs. Every test file's `
 - [ ] **Step 7: Write `env.d.ts`**
 
 ```ts
-declare module "cloudflare:test" {
-  // `Cloudflare.Env`, not `ProvidedEnv` - the latter is Vitest-3-era and is
-  // absent from 0.22.0. Verified against the installed package 2026-08-24.
-  interface Env {
-    DB: D1Database;
-    TEST_MIGRATIONS: D1Migration[];
+import type { D1Migration } from "cloudflare:test";
+
+// `declare global { namespace Cloudflare { interface Env } }`, not
+// `declare module "cloudflare:test" { interface ProvidedEnv }` - the latter is
+// Vitest-3-era and is absent from 0.22.0. Verified against the installed
+// package 2026-08-24. `cloudflare:test`'s own `env` export is typed as
+// `Cloudflare.Env`, the same global namespace `@cloudflare/workers-types`
+// declares and expects a project to extend by merging into it.
+declare global {
+  namespace Cloudflare {
+    interface Env {
+      DB: D1Database;
+      TEST_MIGRATIONS: D1Migration[];
+    }
   }
 }
+
+export {};
 ```
 
 - [ ] **Step 8: Write the failing test `tests/schema.test.ts`**
@@ -518,7 +530,7 @@ describe("durable core schema", () => {
 - [ ] **Step 9: Run the test to verify it fails**
 
 Run: `npm test`
-Expected: FAIL with `no such table: people`. The `migrations/` directory exists and is empty, so `readD1Migrations` returns an empty list, the harness applies nothing, and the assertion about table names is what fails. If the failure instead comes from Vitest failing to load its configuration, the directory was not created in Step 1 and the test never ran at all.
+Expected: FAIL on `it("creates the durable tables")`. The `migrations/` directory exists and is empty, so `readD1Migrations` returns an empty list, the harness applies nothing, and the assertion about table names is what fails. On the installed 0.22.0, `applyD1Migrations` creates its own bookkeeping tables (`_cf_METADATA`, `d1_migrations`, `sqlite_sequence`) even with zero migrations to apply, so the failure surfaces as an assertion mismatch (`toEqual(expect.arrayContaining([...]))` against that bookkeeping-only table list) rather than a raw `no such table: people` query error - the other two tests, which only assert that an `INSERT` throws, still pass either way. If the failure instead comes from Vitest failing to load its configuration, the directory was not created in Step 1 and the test never ran at all.
 
 - [ ] **Step 10: Write `migrations/0001_durable_core.sql`**
 
