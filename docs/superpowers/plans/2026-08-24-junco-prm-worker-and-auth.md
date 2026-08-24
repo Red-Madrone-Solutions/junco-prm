@@ -2334,12 +2334,18 @@ git commit -m "feat: serve the tool registry over stateless MCP"
   - `function checkRateLimit(env: Env, request: Request): Promise<boolean>` - the same signature either way
   - `function rateLimitedResponse(requestId: string): Response`
 
-**Read `docs/MEASUREMENTS.md` before writing a line of this task.** Plan 1's Task 0 deployed a stub Worker to a free Cloudflare account with a `[[ratelimits]]` binding declared, and recorded whether the deploy was accepted. There are two implementations below and you build exactly one:
+> **ANSWERED. Build Step 3a, the binding version. Skip Step 3b.**
+>
+> Plan 1's Task 0 ran on 2026-08-24 against a free Cloudflare account. The `[[ratelimits]]` binding was declared, `wrangler deploy` accepted it and listed it as `env.SPIKE_LIMIT (100 requests/60s)`, and it was live at runtime: `{"bound": true, "first_call_success": true}`. **`RATE_LIMIT_STRATEGY = "binding"`.** The reviewer who believed it was paid-only and would fail the deploy was mistaken.
+>
+> Step 3b, the KV token bucket, is kept below rather than deleted. It is the fallback if Cloudflare ever moves the binding behind a paid plan, and its write-up records why a KV counter is weaker and why that weakness does not matter much for this threat. Do not build it now.
 
-- `RATE_LIMIT_STRATEGY = "binding"` → the Workers rate-limiting binding.
-- `RATE_LIMIT_STRATEGY = "kv_token_bucket"` → a token bucket over `OAUTH_KV`, which the deployment already has.
+The two branches, for the record:
 
-If `docs/MEASUREMENTS.md` does not exist or does not record this, **stop and run Task 0.** Building the wrong one is a wasted task plus a failed deploy, and guessing is exactly what Task 0 exists to prevent.
+- `RATE_LIMIT_STRATEGY = "binding"` → the Workers rate-limiting binding. **This one.**
+- `RATE_LIMIT_STRATEGY = "kv_token_bucket"` → a token bucket over `OAUTH_KV`. Not needed.
+
+One caveat that survives the answer: a local `wrangler dev` reports the binding as present regardless, because Miniflare simulates it. Only a remote deploy answers this, which is why Task 0 exists rather than a local test.
 
 **Why this exists at all.** The OAuth authorization, token, dynamic-registration, and `/health` routes are reachable by anyone who finds the URL. Unlimited, they burn Worker requests, D1 reads, and the deployer's own GitHub application quota. Dynamic Client Registration is the sharpest edge: it is an unauthenticated write, so anyone who finds the URL can register clients in a loop, and each one costs a KV write.
 

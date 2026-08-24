@@ -44,7 +44,7 @@ Copied from the spec. Every task's requirements implicitly include this section.
 - **Import identity is `(roster_source_id, external_row_key)`** under a unique constraint, so a re-import updates rather than duplicates.
 - **Import is resumable across calls, and each row is sent exactly once.** The first call declares `expected_total` and carries the first chunk; every later call carries `run_id`, the `offset` it continues from, and only its own rows. A chunk larger than `IMPORT_BATCH_LIMIT` is **rejected, not truncated**, because the agent controls the chunking and a silently dropped tail is lost data. An `offset` that is not the run's `next_offset` is rejected outright, and the rejection carries the run's true `next_offset` and `remaining` so the next call is obviously correct rather than a guess.
 - **A chunk is idempotent on `(run_id, offset)`,** recorded in a chunk-receipts table, and **the receipt lookup runs before the offset check.** A retry after a dropped response replays its original result instead of being rejected for presenting an offset the run has already passed. Reversing that order makes the mechanism that exists to make retries safe unreachable behind the rule it exists to soften, and wedges a run at an offset the caller cannot discover.
-- **`IMPORT_BATCH_LIMIT` is an empirical constant, not a derived one.** Two earlier drafts derived it from D1's query budget on the reading that each statement inside a `db.batch()` spends one of the 50 queries a free-plan invocation allows. That derivation is withdrawn: Cloudflare's Workers limits page lists 50 **external** subrequests against 1,000 to internal services and D1 is an internal service, while D1's own limits page prints 50, and `batch()` is documented as sending its statements inside a single call to the database. The constraint that probably binds is 10 ms of CPU per invocation, against a chunk that parses, validates, canonicalizes, and computes two SHA-256 digests per row. Task 0 measures both and sets the constant. Until Task 0 has run, 150 is a placeholder chosen to be safe under either reading.
+- **`IMPORT_BATCH_LIMIT` is 150, and it is bounded by the model rather than by the platform.** Task 0 ran on 2026-08-24 against a free Cloudflare account and found that **neither platform limit this cap was built around actually binds**: a `db.batch()` of 500 statements completes in 3 ms, so the query budget is irrelevant, and a 5,000-row invocation spends 163 ms of CPU and completes, so the 10 ms figure the spec asserted is stale. A row costs about 0.033 ms. What bounds a chunk now is how many rows a language model can reasonably emit as JSON in one tool call - 150 rows is 7,500 to 15,000 tokens of tool input, and re-emitting that on a retry is acceptable where 500 rows would not be. See `docs/MEASUREMENTS.md`.
 - **Nothing is ever retired, and a re-import never removes anything.** A caller assertion cannot gate a destructive operation: an agent whose input was truncated declares the total it can see, satisfies every check, and destroys the rest with nothing said out loud. A row the latest completed run did not see is **annotated as stale and never acted on**. It stays searchable and promotable, because a person who left the attendee list is still someone you met.
 - **`raw_record` is never returned by any routine read.** Not by `searchPeople`, not by `getRosterEntry`, not by `getPerson`. Imported roster text is written by strangers, fetched from the public web, and read back to an agent that can call write tools; a job title that reads like an instruction is the obvious injection vector. `getPerson` returns provenance **metadata** only: source key, label, event, URL, captured-at, the hash, and whether the current staged row still matches it. The canonical snapshot on `person_sources` is reachable only through the CLI export in plan 3.
 - **Every tool declares MCP's static annotations** - `readOnlyHint`, `destructiveHint`, `idempotentHint` - because clients use them to decide what to approve and what to run without asking, and a surface this size should not make a client guess.
@@ -136,9 +136,19 @@ Files that change together live together: each tool file owns its own SQL, its o
   - `UPSERT_ROWS_PER_STATEMENT` - unchanged at 6 unless the batch finding overturns the 100-parameter arithmetic.
   - `RATE_LIMIT_STRATEGY` - `"binding"` or `"kv_token_bucket"`, consumed by plan 2 rather than by this plan.
 
+> **THIS TASK HAS RUN.** Executed 2026-08-24 against Matt's free Cloudflare account. Results are in `docs/MEASUREMENTS.md` and the constants below are the measured ones. The steps are kept intact so the measurement can be reproduced when someone doubts a number, which is the whole reason `spike/` stays in the repository. **Do not re-run it as part of a fresh execution of this plan** unless a Cloudflare limit is suspected of having changed.
+>
+> Headline: neither platform limit this task was written to measure actually binds. A `db.batch()` of 500 statements completes in 3 ms, and a 5,000-row invocation spends 163 ms of CPU and completes - against a documented free-plan ceiling of 10 ms. The `[[ratelimits]]` binding is available on the free plan, so plan 2 Task 8 builds the binding rather than the KV fallback.
+
 **This task requires a real Cloudflare account and Matt runs the deploy.** Everything else in this plan runs against local D1 under Wrangler and needs no account at all. That asymmetry is why the spike is Task 0 rather than a step inside Task 12: an agent executing this plan will hit a human block here, and it should hit it before it has written import code against a constant that turns out to be wrong.
 
 **Why this is not arithmetic.** Two earlier drafts of this plan derived the chunk cap from D1's query budget, on the reading that every statement inside a `db.batch()` spends one of the 50 queries a free-plan Worker invocation is allowed. Cloudflare's own documentation does not agree with itself on that point: the Workers limits page lists 50 **external** subrequests against 1,000 subrequests to internal services, and D1 is an internal service, while D1's limits page prints 50 for queries per invocation. `batch()` is separately documented as sending its statements "inside a single call to the database." Three readings, two of which make the derived cap wrong by a factor of 25.
+
+**Two defects in an earlier version of this task, both found by running it and both worth stating, because each would have cost a wasted deploy.**
+
+**Each request must measure exactly one size.** The first draft looped over several sizes inside one request - 49, 50, 60 and 200 statements, or 10 through 300 rows. Both limits under test are **per invocation**, so a loop spends them all against a single budget: the first size poisons every size after it, and if the budget is exceeded the invocation dies with no result at all. The size is now a required query parameter, and the operator calls each route once per size.
+
+**The Worker cannot time itself.** `Date.now()` is frozen in Workers between I/O operations - a Spectre mitigation - so a tight compute loop reports zero elapsed time however long it really took. The first draft computed `ms_per_row` from `Date.now()` deltas and would have reported `0` with total confidence. The real CPU figure comes from `wrangler tail`, which reports it per invocation. What the Worker contributes is whether the invocation **survives** at a given row count, which is the harder half of the answer anyway, because the CPU limit kills the invocation rather than returning an error.
 
 The constraint that probably actually binds is the one the free plan enforces hardest and both earlier drafts were quietest about: **10 ms of CPU per invocation.** A chunk parses rows, validates each one, builds canonical JSON, and computes two SHA-256 digests per row. Several hundred digests inside 10 ms is the thing that fails, and it fails as the runtime killing the invocation mid-chunk rather than as an error the protocol can report and the agent can retry.
 
@@ -193,124 +203,15 @@ The `[[ratelimits]]` block is here to find out whether a free account accepts it
 
 - [ ] **Step 3: Write `spike/src/index.ts`**
 
-Three routes, one per question. Each returns JSON and nothing else, because the answer has to be readable from `curl` without a browser.
+**This file now exists in the repository.** It was written and smoke-tested on 2026-08-24 against local D1 under `wrangler dev`, which is what turned up the two defects recorded above. Read `spike/src/index.ts` rather than reproducing it from this document; what follows is what it does and why, so a reader knows whether the file still matches its intent.
 
-```ts
-export interface Env {
-  DB: D1Database;
-  SPIKE_LIMIT?: { limit(opts: { key: string }): Promise<{ success: boolean }> };
-}
+Three routes, each taking a required `?n=` so no request ever measures more than one size:
 
-/** Question 1: does a batch of N statements survive, and what does it cost? */
-async function measureBatch(env: Env, n: number) {
-  const stmt = env.DB.prepare("INSERT OR REPLACE INTO probe (id, n) VALUES (?, ?)");
-  const statements = Array.from({ length: n }, (_, i) => stmt.bind(`k${i}`, i));
-  const startedAt = Date.now();
-  try {
-    const results = await env.DB.batch(statements);
-    return {
-      n,
-      ok: true,
-      rows_written: results.length,
-      wall_ms: Date.now() - startedAt,
-      // D1 reports served-by and duration per statement; the first is enough to see.
-      first_meta: results[0]?.meta ?? null,
-    };
-  } catch (e) {
-    return { n, ok: false, error: String(e), wall_ms: Date.now() - startedAt };
-  }
-}
+- **`/batch?n=N`** issues one `db.batch()` of N trivial inserts and reports whether it succeeded, plus D1's own per-statement `meta`. That `meta` is worth having: it carries `duration` and `served_by` **from the database**, which is a timing source the runtime does not freeze.
+- **`/cpu?n=N`** does N rows of exactly the work Task 12a will do - normalize every field, canonicalize twice, and take two SHA-256 digests. It reports only that it survived. The row it builds carries a 400-character bio on purpose: a real roster row has a bio or a talk abstract, it lands in `raw_record` and therefore in the whole-row digest, and leaving it out would measure a row narrower than any that exists.
+- **`/ratelimit`** reports whether the binding is present at runtime.
 
-/** Question 2: CPU per row for parse, canonicalize, and two digests. */
-const enc = new TextEncoder();
-
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
-    a < b ? -1 : a > b ? 1 : 0
-  );
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
-}
-
-async function sha256(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", enc.encode(text));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function normalize(text: string): string {
-  return text.normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
-}
-
-/**
- * One row costs exactly what Task 12a will make it cost: normalize every field,
- * canonicalize the whole row, and take two digests - one over the identity
- * subset for `external_row_key`, one over the whole row for `content_hash`.
- */
-async function costOneRow(i: number) {
-  const row = {
-    full_name: `  Ada  Lovelace ${i} `,
-    preferred_name: "Ada",
-    job_title: "Analytical Engine Programmer",
-    organization: "  Analytical Society  ",
-    email: `Ada+Row${i}@Example.TEST`,
-    role: "attendee",
-    bio: "x".repeat(400),
-  };
-  const normalized = Object.fromEntries(
-    Object.entries(row).map(([k, v]) => [k, normalize(String(v))])
-  );
-  const identity = canonical({
-    full_name: normalized.full_name,
-    organization: normalized.organization,
-  });
-  await sha256(identity);
-  await sha256(canonical(normalized));
-}
-
-async function measureCpu(rows: number) {
-  const startedAt = Date.now();
-  for (let i = 0; i < rows; i++) await costOneRow(i);
-  const wall = Date.now() - startedAt;
-  return { rows, wall_ms: wall, ms_per_row: wall / rows, rows_per_10ms: wall === 0 ? null : (rows / wall) * 10 };
-}
-
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const json = (body: unknown) =>
-      new Response(JSON.stringify(body, null, 2), {
-        headers: { "content-type": "application/json" },
-      });
-
-    if (url.pathname === "/batch") {
-      // 49 and 50 straddle the printed D1 cap; 60 and 200 test whether it binds at all.
-      const sizes = [49, 50, 60, 200];
-      const out = [];
-      for (const n of sizes) out.push(await measureBatch(env, n));
-      return json({ question: "queries per invocation", results: out });
-    }
-
-    if (url.pathname === "/cpu") {
-      // Escalating sizes, because the 10 ms cap kills the invocation rather than
-      // returning an error: the largest size that responds at all is the finding.
-      const out = [];
-      for (const rows of [10, 50, 100, 150, 300]) out.push(await measureCpu(rows));
-      return json({ question: "cpu per row", results: out });
-    }
-
-    if (url.pathname === "/ratelimit") {
-      if (!env.SPIKE_LIMIT) {
-        return json({ question: "ratelimit binding", bound: false, note: "binding absent at runtime" });
-      }
-      const { success } = await env.SPIKE_LIMIT.limit({ key: "spike" });
-      return json({ question: "ratelimit binding", bound: true, first_call_success: success });
-    }
-
-    return json({ routes: ["/batch", "/cpu", "/ratelimit"] });
-  },
-};
-```
+The spike also carries its own `package.json`, `tsconfig.json`, and `.gitignore`, because it is a standalone Worker with its own dependency on `wrangler` and `@cloudflare/workers-types`. Two things learned installing it, which will bite the same way in the main project: `@cloudflare/workers-types` is on **5.x**, not the 4.x an older tutorial will suggest, and npm 11 does not run install scripts by default, so `esbuild` and `workerd` need `npm install-scripts approve esbuild workerd` followed by `npm rebuild` or wrangler will not run at all.
 
 - [ ] **Step 4: Matt deploys the spike to a free Cloudflare account**
 
@@ -330,20 +231,40 @@ Expected at the deploy step, and both outcomes are findings rather than failures
 
 A deploy that is refused for any other reason is not a finding, it is a broken spike. Fix it and deploy again.
 
-- [ ] **Step 5: Matt runs the three probes and captures the output**
+- [ ] **Step 5: Matt runs the probes and captures the output**
+
+**Run `wrangler tail` in a second terminal first, and leave it running.** It is not optional and it is not a nicety: it reports CPU time per invocation, and that number is the entire answer to question two. The Worker cannot measure it - `Date.now()` is frozen between I/O in Workers, so anything the Worker computed would be zero.
 
 ```bash
+# Terminal 1, left running:
+cd spike && npx wrangler tail --format=pretty
+
+# Terminal 2:
 BASE=https://junco-prm-spike.<subdomain>.workers.dev
-curl -s $BASE/batch     | tee /tmp/spike-batch.json
-curl -s $BASE/cpu       | tee /tmp/spike-cpu.json
-curl -s $BASE/ratelimit | tee /tmp/spike-ratelimit.json
+
+# Question 1 - one size per request, and run each twice.
+for n in 49 50 60 200 500; do
+  echo "--- batch n=$n ---"
+  curl -s "$BASE/batch?n=$n" | tee "/tmp/spike-batch-$n.json" | head -6
+done
+
+# Question 2 - escalating until one stops answering. THAT is the finding.
+for n in 10 25 50 100 150 300 600; do
+  echo "--- cpu n=$n ---"
+  curl -s --max-time 30 "$BASE/cpu?n=$n" | tee "/tmp/spike-cpu-$n.json" | head -4
+done
+
+# Question 3
+curl -s "$BASE/ratelimit" | tee /tmp/spike-ratelimit.json
 ```
+
+**Run each `/batch` size twice and use the second result.** The first invocation after a deploy pays cold-start cost, and that is not part of the answer.
 
 How to read each one:
 
-- **`/batch`** - if all four sizes return `ok: true`, including 200, then `batch()` does not spend one query per statement and the 50-query cap is not what bounds a chunk. If 49 succeeds and 50 or 60 fails, the printed D1 cap binds exactly as the withdrawn derivation assumed, and `IMPORT_BATCH_LIMIT` is bounded by query arithmetic after all. Run `/batch` more than once: the first invocation after a deploy pays cold-start cost that is not part of the answer.
-- **`/cpu`** - read `ms_per_row` at the largest size that returned at all. A size that produces no response is the CPU limit killing the invocation, and that is the finding: the cap is below that size. Note that local `wrangler dev` does **not** enforce the 10 ms limit, which is the whole reason this runs against a deployed Worker.
-- **`/ratelimit`** - `bound: false` at runtime after a deploy that accepted the binding is its own finding and means the same thing as a refused deploy for plan 2's purposes.
+- **`/batch`** - if every size returns `ok: true`, including 200 and 500, then `batch()` does not spend one query per statement, the 50-query cap is not what bounds a chunk, and the withdrawn derivation was wrong in the direction that matters. If 49 succeeds and 50 or 60 fails, the printed D1 cap binds exactly as that derivation assumed, and `IMPORT_BATCH_LIMIT` is bounded by query arithmetic after all. Either answer is useful; the point is to stop guessing.
+- **`/cpu`** - watch `wrangler tail` for the CPU time on each invocation, and divide by `n`. **The size that produces no response at all is the more important reading**: that is the CPU limit killing the invocation, and it puts a hard ceiling on the chunk cap. Note that `wrangler dev` does **not** enforce the 10 ms limit, which is the whole reason this runs against a deployed Worker rather than locally.
+- **`/ratelimit`** - `bound: true` here means the binding is live on a free plan. `bound: false` after a deploy that accepted the block means the same thing as a refused deploy, for plan 2's purposes. **A local `wrangler dev` run reports `bound: true` regardless**, because Miniflare simulates the binding, so a local result answers nothing.
 
 - [ ] **Step 6: Write `docs/MEASUREMENTS.md`**
 
@@ -361,11 +282,14 @@ Cloudflare limit can change and a number with no provenance cannot be rechecked.
 - Measured: <date>
 - Account plan: Cloudflare Workers free
 - Wrangler version: <version>
-- `db.batch()` of 49 / 50 / 60 / 200 statements: <result per size>
-- CPU per roster row (normalize, canonicalize, two SHA-256): <ms_per_row>
-- Rows per 10 ms: <rows_per_10ms>
-- **`IMPORT_BATCH_LIMIT` = <value>**, the smaller of the two row counts, halved
-  for margin.
+- `db.batch()` sizes attempted, and the result of each: <49 / 50 / 60 / 200 / 500>
+- Largest batch that succeeded: <n>
+- CPU ms per invocation at each row count, read from `wrangler tail`:
+  <10 / 25 / 50 / 100 / 150 / 300 / 600>
+- Largest row count that returned at all: <n>
+- Derived CPU per row: <ms>
+- **`IMPORT_BATCH_LIMIT` = <value>**, the smaller of the query-bounded and
+  CPU-bounded row counts, halved for margin.
 
 ## Rate limiting
 
@@ -6246,27 +6170,29 @@ import { hashJson } from "../idempotency";
 import { nowIso } from "../time";
 
 /**
- * Rows accepted per call. MEASURED, NOT DERIVED - see Task 0 and
- * docs/MEASUREMENTS.md.
+ * Rows accepted per call.
  *
- * Two earlier drafts derived this from the free plan's 50 D1 queries per Worker
- * invocation, on the reading that every statement inside a db.batch() spends one
- * of them. That derivation is withdrawn. Cloudflare's own pages disagree: the
- * Workers limits page lists 50 EXTERNAL subrequests against 1,000 to internal
- * services and D1 is an internal service, while D1's limits page prints 50, and
- * batch() is documented as sending its statements inside a single call to the
- * database. Three readings, two of which make the derived number wrong by a
- * factor of 25.
+ * MEASURED 2026-08-24 on a free Cloudflare account - see docs/MEASUREMENTS.md.
+ * The value is unchanged from the placeholder that preceded it, and the reason
+ * for it is completely different. That is worth reading before changing it.
  *
- * The constraint that probably binds is 10 ms of CPU per invocation, against a
- * chunk that normalizes every field, canonicalizes, and takes two SHA-256
- * digests per row. Several hundred digests inside 10 ms is what fails, and it
- * fails as the runtime killing the invocation mid-chunk rather than as an error
- * this protocol can report.
+ * NEITHER PLATFORM LIMIT THIS CONSTANT WAS BUILT AROUND ACTUALLY BINDS.
  *
- * 150 is a PLACEHOLDER chosen to be safe under either reading. Task 0 replaces
- * it with the smaller of the measured row counts, halved for margin. Do not
- * write import code against this constant before Task 0 has run.
+ *   - A db.batch() does NOT spend one query per statement. 500 statements
+ *     completed in 3 ms of CPU on a free plan. Two earlier drafts derived this
+ *     cap from a 50-query-per-invocation budget; that arithmetic was wrong.
+ *   - The free-plan CPU ceiling is NOT 10 ms. A 5,000-row invocation doing
+ *     exactly this work spent 163 ms and completed, with no ceiling found. A
+ *     row costs about 0.033 ms, so a 150-row chunk costs roughly 5 ms.
+ *
+ * WHAT BOUNDS IT NOW IS THE MODEL, NOT THE RUNTIME. A chunk is roster rows a
+ * language model has to emit as JSON in a single tool call, at roughly 50 to
+ * 100 tokens per row. 150 rows is 7,500 to 15,000 tokens of tool input: a
+ * reasonable amount to ask for in one call, and to re-emit if that call has to
+ * be retried. 500 rows would be 25,000 to 50,000, which is not.
+ *
+ * So anyone raising this number should be arguing about tool call size and
+ * retry cost. Cloudflare is no longer the reason for it.
  */
 export const IMPORT_BATCH_LIMIT = 150;
 
