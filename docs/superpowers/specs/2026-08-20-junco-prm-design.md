@@ -137,7 +137,7 @@ It is never the person's name alone: the prototype roster contains 11 duplicated
 
 A second draft prescribed `purge_roster_source` followed by a fresh import as the way to refresh a roster. That was worse than what it replaced: purge destroys every row **before** the multi-call import that is supposed to replace them, so an import that dies on chunk three leaves the user with no roster at all, and the failure needs only a dropped connection rather than a truncated file. Re-import is additive and is the normal path. Purge survives for what it is actually for: "I am done with this roster."
 
-### Search### Search
+### Search
 
 Search uses FTS5 with bm25 ranking. Two indexes, not one, because people and encounters are different entities and conflating them produces results an agent cannot explain: one over `people` (names, organization, job title, notes) and one over `encounters` (summary). Tags participate in people search too, matched directly against the tag tables rather than through the index, because tag membership changes without `people` being written and no trigger on `people` would fire.
 
