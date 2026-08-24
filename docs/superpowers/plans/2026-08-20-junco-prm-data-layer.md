@@ -996,7 +996,7 @@ git commit -m "feat: add prefixed ids, tool errors, and timezone-aware dates"
   - `function sha256Hex(text: string): Promise<string>`
   - `function externalRowKey(row: NormalizedRow, sourceKey: string | undefined): Promise<string>` - the three-tier identity rule, each tier **namespaced** by a prefix: `k:` source id, `e:` email, `h:` name+org digest
   - `function keyTier(key: string): "source" | "email" | "hash" | "unknown"`
-  - `function contentHash(row: NormalizedRow): Promise<string>` - SHA-256 of the whole normalized row
+  - `function contentHash(row: Record<string, string | undefined>): Promise<string>` - SHA-256 of the whole normalized row. Looser than `externalRowKey`'s parameter on purpose: it reads no particular field.
   - `const HONORIFIC_SUFFIXES: ReadonlySet<string>`
   - `function encodeCursor(value: Record<string, string | number>): string`
   - `function decodeCursor(cursor: string | undefined): Record<string, string | number> | null` - throws `ToolError("invalid_input", ...)` on a malformed token
@@ -1342,7 +1342,7 @@ export function keyTier(key: string): "source" | "email" | "hash" | "unknown" {
  * import, and compared at promotion time so a commit cannot promote a person
  * from data the caller never inspected.
  */
-export async function contentHash(row: NormalizedRow): Promise<string> {
+export async function contentHash(row: Record<string, string | undefined>): Promise<string> {
   return sha256Hex(canonicalJson(row));
 }
 ```
