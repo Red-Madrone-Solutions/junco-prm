@@ -280,7 +280,7 @@ describe("updatePerson", () => {
 });
 
 describe("getPerson", () => {
-  it("returns the record with empty collections until later tasks fill them", async () => {
+  it("returns empty collections for a freshly created person; sources stays stubbed until Task 13", async () => {
     const created = await createPerson(ctx, { full_name: "Ada Lovelace" });
     const detail = await getPerson(ctx, { person_id: created.id });
     expect(detail.id).toBe(created.id);

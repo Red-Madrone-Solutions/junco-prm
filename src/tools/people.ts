@@ -7,6 +7,7 @@ import { nowIso } from "../time";
 import type { Person, PersonDetail } from "../types";
 import { loadContacts, loadLinks, loadTags } from "./attributes_read";
 import { loadRecentEncounters } from "./encounters_read";
+import { loadOpenFollowups } from "./followups_read";
 
 export type { Person, PersonDetail } from "../types";
 
@@ -232,13 +233,14 @@ export async function getPerson(ctx: ToolContext, input: GetPersonInput): Promis
     input.encounter_limit ?? 10,
     input.encounter_cursor
   );
+  const openFollowups = await loadOpenFollowups(ctx, id);
   return {
     ...person,
     contacts,
     links,
     tags,
     sources: [],
-    open_followups: [],
+    open_followups: openFollowups,
     recent_encounters: encounters.results,
     encounter_count: encounters.total,
     encounter_next_cursor: encounters.next_cursor,
