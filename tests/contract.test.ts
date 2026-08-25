@@ -254,6 +254,20 @@ describe("tool registry", () => {
     expect(row?.subject_id).toBeNull();
   });
 
+  it("does not resolve a tool name up the prototype chain", async () => {
+    // Plan 2's transport will index this map by a name that arrives over the
+    // wire. As a plain object literal, TOOLS["toString"] is a function and any
+    // `=== undefined` guard on the lookup passes. The same shape was a live
+    // defect in export.ts: `export_data({scope: "toString"})` concatenated
+    // Function.prototype.toString's source into the SQL.
+    for (const inherited of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      expect(TOOLS[inherited], `TOOLS resolved ${inherited}`).toBeUndefined();
+    }
+    // The map still has to behave as a map.
+    expect(Object.keys(TOOLS).sort()).toEqual(EXPECTED);
+    expect(TOOLS["get_person"]?.name).toBe("get_person");
+  });
+
   it("rejects a wrong-kind id from every tool that takes one", async () => {
     const wrongKind: [string, Record<string, unknown>][] = [
       ["get_person", { person_id: newId("re") }],

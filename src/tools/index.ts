@@ -123,7 +123,18 @@ const personFields = {
   ),
 };
 
-export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
+/**
+ * NULL PROTOTYPE, and it is load-bearing rather than tidy. Plan 2's transport
+ * will index this map by a tool name that arrives over the wire. As a plain
+ * object, `TOOLS["toString"]` resolves up the prototype chain to a function,
+ * and any `=== undefined` guard on the lookup passes. The same shape was a live
+ * defect in `export.ts`'s QUERIES: `export_data({scope: "toString"})` fed
+ * `Function.prototype.toString`'s source text into the SQL and returned a raw
+ * D1 error carrying no `code`. `Object.keys` and `for...in` are unaffected.
+ */
+export const TOOLS: Record<string, ToolDefinition> = Object.assign(
+  Object.create(null),
+  Object.fromEntries(
   [
     // ---------------------------------------------------------------- reads
     define(
@@ -503,6 +514,7 @@ export const TOOLS: Record<string, ToolDefinition> = Object.fromEntries(
       purgeRosterSource
     ),
   ].map((tool) => [tool.name, tool])
+  )
 );
 
 /** Every tool name, so a caller can assert coverage without reaching into the map. */

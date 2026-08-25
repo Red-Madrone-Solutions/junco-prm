@@ -71,6 +71,29 @@ describe("exportData", () => {
 
   it("never exports staged roster data", async () => {
     await expect(exportData(ctx, { scope: "roster_entries" as never })).rejects.toThrow(ToolError);
+    try {
+      await exportData(ctx, { scope: "roster_entries" as never });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("invalid_input");
+    }
+  });
+
+  it("refuses a scope inherited from Object.prototype rather than running it as SQL", async () => {
+    // QUERIES was a plain object literal, so QUERIES["toString"] resolved to
+    // Function.prototype.toString, the `base === undefined` guard passed, and
+    // the function's source text went into the SQL. The call came back as
+    // `D1_ERROR: near "function": syntax error` - a raw error with no `code`,
+    // outside the closed set of seven that clients and tests bind to.
+    for (const inherited of ["toString", "constructor", "valueOf", "hasOwnProperty"]) {
+      try {
+        await exportData(ctx, { scope: inherited as never });
+        throw new Error(`expected a refusal for scope ${inherited}`);
+      } catch (e) {
+        expect(e).toBeInstanceOf(ToolError);
+        expect((e as ToolError).code).toBe("invalid_input");
+      }
+    }
   });
 
   // The brief this test file was drafted from described `limit: 0` and
