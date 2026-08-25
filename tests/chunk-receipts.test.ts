@@ -14,6 +14,11 @@ const T = "2026-08-20T00:00:00Z";
 
 beforeEach(async () => {
   await env.DB.prepare("DELETE FROM import_chunk_receipts").run();
+  // roster_entries.last_seen_run_id / committed_run_id reference import_runs,
+  // so a row left behind by an earlier file (isolate: false shares one D1
+  // instance across every test file) makes the import_runs delete below fail
+  // with FOREIGN KEY constraint failed. Must run before that delete.
+  await env.DB.prepare("DELETE FROM roster_entries").run();
   await env.DB.prepare("DELETE FROM import_runs").run();
   await env.DB.prepare("DELETE FROM roster_sources").run();
   await env.DB.prepare(
