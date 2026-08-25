@@ -10060,6 +10060,7 @@ Expected: FAIL, cannot resolve `../src/tools/export`.
 ```ts
 import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
+import { assertId } from "../ids";
 import { clampLimit, decodeCursor, encodeCursor } from "../paginate";
 
 export type ExportScope = "people" | "encounters" | "followups";
@@ -10076,6 +10077,48 @@ const QUERIES: Record<ExportScope, string> = {
   followups: `SELECT id, person_id, due_on, note, completed_at, cancelled_at, created_at
               FROM followups`,
 };
+
+const ID_PREFIX: Record<ExportScope, "p" | "enc" | "fu"> = {
+  people: "p",
+  encounters: "enc",
+  followups: "fu",
+};
+
+/**
+ * THE CURSOR IS VALIDATED AGAINST ITS SCOPE, and an earlier draft of this code
+ * decoded it as `as { id?: string } | null` and bound `after.id` straight into
+ * the query. `decodeCursor` only guarantees the token is some JSON object this
+ * server issued. It cannot know this tool's keyset is a bare `id`, and it cannot
+ * know which table that id belongs to.
+ *
+ * Both failures are SILENT, which is why this is a check rather than a comment.
+ * Ids sort lexically by their kind prefix, `enc_` < `fu_` < `p_`. A people
+ * cursor replayed against `scope: "encounters"` becomes `WHERE id > 'p_...'`
+ * over rows that all start `enc_`, which is never true: the page comes back
+ * EMPTY with `next_cursor: null`, indistinguishable from a finished export. An
+ * encounters cursor replayed against `scope: "people"` is always true, so the
+ * page silently RESTARTS from the first row and re-delivers everything the
+ * caller already has. Neither throws. Both break the no-drops, no-duplicates
+ * guarantee a cursor convention exists to provide, on the very first
+ * out-of-scope call.
+ *
+ * This is the same validate-then-assertId shape `decodeEncounterCursor` and
+ * `decodeFollowupCursor` already use, not a second pagination dialect.
+ * Corrected 2026-08-25 after the Task 15 review traced both failure modes.
+ */
+function decodeExportCursor(scope: ExportScope, cursor: string | undefined): { id: string } | null {
+  const decoded = decodeCursor(cursor);
+  if (decoded === null) return null;
+  const { id } = decoded as { id?: string };
+  if (typeof id !== "string") {
+    throw new ToolError(
+      "invalid_input",
+      "cursor is not a token this tool issued",
+      "call export_data again without a cursor to start from the first page"
+    );
+  }
+  return { id: assertId(ID_PREFIX[scope], id) };
+}
 
 export interface ExportDataInput {
   scope?: ExportScope;
