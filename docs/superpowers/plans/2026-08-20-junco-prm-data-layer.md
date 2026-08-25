@@ -9019,7 +9019,46 @@ export async function promoteRosterEntry(
         .first<{ id: string }>();
       if (!exists) throw new ToolError("not_found", `no person with id ${personId}`);
 
+      // A LOST RACE IN THE LINK PATH NEEDS THE SAME RECOVERY THE CREATE PATH HAS.
+    // Two concurrent commits on the same (source_key, external_row_key), one
+    // naming a person and one creating, both read no prior provenance at the
+    // `already` check above. Without this, the link path surfaces a raw D1
+    // unique-constraint error: no code from the closed set of seven, no reason
+    // in this tool's vocabulary, and no corrective next call for a caller that
+    // is a model and will otherwise guess.
+    //
+    // An earlier draft put this recovery in the create path's catch instead,
+    // where `wantsLink` is necessarily false because this branch returns first,
+    // so it could never fire. Corrected 2026-08-25 after the Task 13 review.
+    try {
       await ctx.db.batch(provenance(personId));
+    } catch (e) {
+      const winner = await ctx.db
+        .prepare(
+          "SELECT person_id FROM person_sources WHERE source_key = ? AND external_row_key = ?"
+        )
+        .bind(entry.source_key, entry.external_row_key)
+        .first<{ person_id: string }>();
+
+      // Only a lost race explains a winner being there now.
+      if (!winner) throw e;
+
+      // Someone other than the person this call named got the roster row. Same
+      // refusal the `already` branch makes, reached a few milliseconds later,
+      // carrying the same code and the same next call so the caller cannot tell
+      // the two timings apart.
+      if (winner.person_id !== personId) {
+        throw new ToolError(
+          "conflict",
+          `roster entry ${entryId} was promoted to a different person while this call was in flight`,
+          `call get_person with person_id ${winner.person_id} to see who this roster row belongs to`,
+          { promoted_person_id: winner.person_id }
+        );
+      }
+
+      // The winner IS the person this call named, so the caller's intent was
+      // satisfied by whoever got there first. Fall through and return them.
+    }
 
       return {
         status: "promoted" as const,
@@ -9087,15 +9126,11 @@ export async function promoteRosterEntry(
       // real failure and must not be dressed up as a successful promotion.
       if (!winner) throw e;
 
-      if (wantsLink && input.link_to_person_id !== winner.person_id) {
-        throw new ToolError(
-          "conflict",
-          `roster entry ${entryId} was promoted to a different person while this call was in flight`,
-          `call get_person with person_id ${winner.person_id} to see who this roster row belongs to`,
-          { promoted_person_id: winner.person_id }
-        );
-      }
-
+      // NOTHING CHECKS wantsLink HERE, and an earlier draft did. The link
+      // branch above returns before this point, so `wantsLink` is necessarily
+      // false by the time this catch runs and the check could never fire. The
+      // caller that needs that refusal is served by the copy in the link path's
+      // own catch. Corrected 2026-08-25 after the Task 13 review.
       return {
         status: "promoted" as const,
         person: await getPerson(ctx, { person_id: winner.person_id }),
@@ -9126,6 +9161,8 @@ Name matching appears in this tool and in `createPerson`, in both cases as *evid
 **The two-phase shape is advisory, and that asymmetry is deliberate.** Nothing forces an agent to look at candidates first, unlike `delete_person` and `purge_roster_source`, which require a token minted by their preview call. Promotion's worst outcome is a duplicate person, which is recoverable, and which the provenance override above already prevents in the one case the system can actually see. A confirmation token on the highest-frequency conference action would cost a round trip every single time.
 
 **`promote_roster_entry` records its idempotency subject through `subjectFromResult`, not as a trailing `subjectId`.** The global constraints say every write's stored response must be reachable by `delete_person`'s scrub, and this tool's stored response is a full `PersonDetail`. It cannot pass the id up front: phase one is about nobody and phase two only knows the person after it creates or resolves one. The callback narrows the union and returns `undefined` for the candidates branch, which is exactly what `update_encounter` does at `src/tools/encounters.ts` and what `subjectFromResult`'s own doc comment describes. Added 2026-08-25; an earlier draft of this sample passed neither argument, which would have left every promoted person's stored response under `subject_id` NULL.
+
+**A lost race is recovered in BOTH commit branches, and an earlier draft recovered it in only one.** The create path's `catch` originally carried the refusal for a caller who named a person, but the link branch returns before that `catch` is reachable, so `wantsLink` is always false there and the refusal could never fire. Meanwhile the link path's own provenance batch had no `try` at all, so a lost race there surfaced a raw D1 unique-constraint error carrying none of the seven codes. Each branch now recovers its own batch. Found by the Task 13 review on 2026-08-25 and ruled against the plan text, because the spec's closed error set is the binding authority and this plan is only its argument.
 
 **Committing a promotion is one transaction.** The first draft called `createPerson`, then `addContact`, then batched the two provenance rows, which is three separate writes. A failure after the first leaves a person with no provenance and no link to the roster row that produced them, and the retry creates a second person, because nothing yet records that the entry was promoted. Minting the person id inline and batching every insert makes the whole promotion land or none of it. It is also why this path does not call the public `createPerson` and `addContact` tools: those wrap themselves in their own idempotency handling and cannot be enlisted in someone else's transaction.
 
