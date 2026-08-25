@@ -320,10 +320,23 @@ export async function searchPeople(
         `WITH latest AS (
            -- EXACTLY ONE ROW PER SOURCE. See the note below on why the obvious
            -- formulation is wrong.
+           --
+           -- The tiebreak is rowid DESC, not id DESC. import_runs.id is
+           -- "ir_" followed by crypto.randomUUID() (src/ids.ts), so ordering by
+           -- it breaks a tie between two runs finished in the same instant by
+           -- comparing two random UUIDs - effectively a coin flip over which run
+           -- is the staleness baseline. import_runs has a TEXT PRIMARY KEY and
+           -- no WITHOUT ROWID clause, so it carries an implicit rowid that
+           -- increases with insertion order, which is the chronological
+           -- ordering this tiebreak means. This is a single-query ORDER BY, not
+           -- a stored or FTS-indexed value, so it is not the rowid hazard the
+           -- design doc's Global Constraints warn about (VACUUM renumbering
+           -- rowids stored in an external-content FTS index) - nothing here
+           -- persists a rowid anywhere.
            SELECT roster_source_id, run_id, finished_at FROM (
              SELECT roster_source_id, id AS run_id, finished_at,
                     ROW_NUMBER() OVER (PARTITION BY roster_source_id
-                                       ORDER BY finished_at DESC, id DESC) AS rn
+                                       ORDER BY finished_at DESC, rowid DESC) AS rn
                FROM import_runs WHERE status = 'committed'
            ) WHERE rn = 1
          )

@@ -72,6 +72,82 @@ describe("finalizeImport", () => {
     expect(rows?.n).toBe(2);
   });
 
+  it("breaks a finished_at tie by insertion order, not by comparing run ids", async () => {
+    // The flaky test below ties `finished_at` too, but which run wins the tie
+    // under `id DESC` depends on two random UUIDs neither this test nor the
+    // code controls - so reverting the fix only fails it about half the time.
+    // This test controls both ids directly: run1's id is chosen to sort AFTER
+    // run2's id even though run1 is inserted first. Under `id DESC` that makes
+    // the buggy query pick run1 (the older run) as the baseline on every single
+    // run, not by chance. Under `rowid DESC` it picks run2 (the later-inserted,
+    // correct run) on every single run, because SQLite's implicit rowid tracks
+    // insertion order and neither id string does.
+    const FIXED = "2026-08-20T12:00:00.000Z";
+    const run1Id = "ir_zzzzzzzz-0000-0000-0000-000000000001";
+    const run2Id = "ir_00000000-0000-0000-0000-000000000002";
+
+    await env.DB.prepare(
+      "INSERT INTO roster_sources (id, source_key, label, event, url, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+      .bind("rs_ordertest", "ordertest", "Ordering Test", "Ordering Test", "https://example.test", FIXED)
+      .run();
+
+    // run1 inserted first (lower rowid) but with an id that sorts higher.
+    await env.DB.prepare(
+      `INSERT INTO import_runs
+         (id, roster_source_id, format, status, expected_total, started_at, finished_at)
+       VALUES (?, ?, 'json', 'committed', 2, ?, ?)`
+    )
+      .bind(run1Id, "rs_ordertest", FIXED, FIXED)
+      .run();
+
+    // Two roster rows, both first seen and committed by run1.
+    await env.DB.prepare(
+      `INSERT INTO roster_entries
+         (id, roster_source_id, external_row_key, content_hash, full_name, source_url,
+          source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind("re_order_1", "rs_ordertest", "k:1", "sha256:test1", "Ordering Kept",
+            "https://example.test", FIXED, "{}", run1Id, run1Id, FIXED, FIXED)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO roster_entries
+         (id, roster_source_id, external_row_key, content_hash, full_name, source_url,
+          source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind("re_order_2", "rs_ordertest", "k:2", "sha256:test2", "Ordering Dropped",
+            "https://example.test", FIXED, "{}", run1Id, run1Id, FIXED, FIXED)
+      .run();
+
+    // run2 inserted second (higher rowid), id sorts lower than run1's, same
+    // finished_at. It re-saw "k:1" but omitted "k:2".
+    await env.DB.prepare(
+      `INSERT INTO import_runs
+         (id, roster_source_id, format, status, expected_total, started_at, finished_at)
+       VALUES (?, ?, 'json', 'committed', 1, ?, ?)`
+    )
+      .bind(run2Id, "rs_ordertest", FIXED, FIXED)
+      .run();
+    await env.DB.prepare(
+      "UPDATE roster_entries SET last_seen_run_id = ?, committed_run_id = ? WHERE id = 're_order_1'"
+    )
+      .bind(run2Id, run2Id)
+      .run();
+
+    const found = await searchPeople(ctx, { query: "Ordering", scope: "roster" });
+    const kept = found.roster_entries.find((e) => e.full_name === "Ordering Kept");
+    const dropped = found.roster_entries.find((e) => e.full_name === "Ordering Dropped");
+
+    // run2 is the later-inserted committed run, so it is the baseline: the row
+    // it re-saw reads current, and the row it omitted reads stale. Reverting
+    // the ordering fix flips both of these on every run of this test, because
+    // run1Id was chosen to always win `id DESC`.
+    expect(kept?.stale).toBe(false);
+    expect(dropped?.stale).toBe(true);
+  });
+
   it("leaves the omitted row searchable and promotable", async () => {
     const first = await importRoster(ctx, {
       ...SOURCE,

@@ -16,6 +16,11 @@ import type { Source } from "../types";
  * null if there is no staged row at all - purged, or never re-imported. "It
  * changed" and "it is no longer there" call for different next moves, so
  * collapsing null into false would tell the agent the wrong thing.
+ *
+ * `promoted_at` is not unique - two promotions under the fixed test clock, or
+ * two in production inside the same millisecond, land on the same instant -
+ * so `ps.id` is a tiebreak. This orders the list deterministically; unlike
+ * the staleness baseline in search.ts, no selection decision depends on it.
  */
 export async function loadPersonSources(ctx: ToolContext, personId: string): Promise<Source[]> {
   const { results } = await ctx.db
@@ -37,7 +42,7 @@ export async function loadPersonSources(ctx: ToolContext, personId: string): Pro
                 LIMIT 1) AS matches_current
          FROM person_sources ps
         WHERE ps.person_id = ?
-        ORDER BY ps.promoted_at`
+        ORDER BY ps.promoted_at, ps.id`
     )
     .bind(personId)
     .all<Omit<Source, "matches_current"> & { matches_current: number | null }>();

@@ -56,20 +56,59 @@ async function insertProvenanceFor(personId: string): Promise<void> {
  * intercepted by the `already` fast path and the batch never runs at all, so a
  * test that pre-inserts one proves nothing about the batch or its catch.
  *
- * This proxies `env.DB` and hooks the FIRST `batch()` call: it runs `before`,
- * then delegates to the real `env.DB.batch`. Nothing in the code under test is
- * mocked or replaced - the real D1 constraint fires inside the real batch,
- * which is also the only way to observe whether an aborted batch rolls the
- * `people` insert back.
+ * This proxies `env.DB`. Nothing in the code under test is mocked or replaced
+ * - the real D1 constraint fires inside the real batch, which is also the
+ * only way to observe whether an aborted batch rolls the `people` insert back.
+ *
+ * It does NOT hook the first `batch()` call, on purpose. An earlier version
+ * did, which only landed on the provenance batch because that happens to be
+ * `promoteRosterEntry`'s only `db.batch()` call today, given these tests pass
+ * no `idempotency_key` and `loadEntry`, the `already` read, and `getPerson`
+ * all use `prepare`. If the commit path ever gains an earlier `batch()` call,
+ * that assumption breaks silently: the hook fires on the wrong statement, the
+ * race is never wedged into the window it needs, and all three tests using
+ * this pass anyway with no useful assertion left to fail. Instead, `prepare`
+ * is wrapped so every statement remembers its own SQL, and the hook fires
+ * only for a `batch()` call that actually contains the `person_sources`
+ * insert - the one write both race scenarios below are about. `assertFired`
+ * lets each test confirm that happened at all, so a `batch()` call that never
+ * matches (rather than matching the wrong one) also fails loudly instead of
+ * the test just passing on an unexercised race.
  */
-function racingDb(before: () => Promise<unknown>): D1Database {
-  let fired = false;
-  return new Proxy(env.DB, {
+function racingDb(before: () => Promise<unknown>): { db: D1Database; assertFired: () => void } {
+  const sqlOf = new WeakMap<object, string>();
+  let matched = false;
+
+  function wrapStatement(stmt: D1PreparedStatement, sql: string): D1PreparedStatement {
+    const proxy = new Proxy(stmt, {
+      get(target, prop, receiver) {
+        if (prop === "bind") {
+          return (...args: unknown[]) => wrapStatement(target.bind(...args), sql);
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    // Tag the PROXY, not the raw statement `bind()` returns - `batch()` below
+    // receives whatever `promote.ts` passes it, which is this proxy. Tagging
+    // the raw object here would leave `sqlOf.get` unable to find it.
+    sqlOf.set(proxy, sql);
+    return proxy;
+  }
+
+  const db = new Proxy(env.DB, {
     get(target, prop, receiver) {
+      if (prop === "prepare") {
+        return (sql: string) => wrapStatement(target.prepare(sql), sql);
+      }
       if (prop === "batch") {
         return async (statements: D1PreparedStatement[]) => {
-          if (!fired) {
-            fired = true;
+          const isProvenanceBatch = statements.some((s) =>
+            sqlOf.get(s)?.includes("INSERT INTO person_sources")
+          );
+          if (isProvenanceBatch) {
+            if (matched) throw new Error("racingDb: intercepted a person_sources batch twice");
+            matched = true;
             await before();
           }
           return target.batch(statements);
@@ -79,6 +118,15 @@ function racingDb(before: () => Promise<unknown>): D1Database {
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+
+  return {
+    db,
+    assertFired: () => {
+      if (!matched) {
+        throw new Error("racingDb: never intercepted a person_sources batch - the race was not exercised");
+      }
+    },
+  };
 }
 
 describe("promoteRosterEntry, first phase", () => {
@@ -247,10 +295,12 @@ describe("promoteRosterEntry, second phase", () => {
     const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
     const winner = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
 
+    const race = racingDb(() => insertProvenanceFor(winner.id));
     const out = await promoteRosterEntry(
-      { ...ctx, db: racingDb(() => insertProvenanceFor(winner.id)) },
+      { ...ctx, db: race.db },
       { roster_entry_id: entryId, create_new: true }
     );
+    race.assertFired();
     if (out.status !== "promoted") throw new Error("unreachable");
     expect(out.person.id).toBe(winner.id);
     expect(out.linked_existing).toBe(true);
@@ -392,9 +442,10 @@ describe("promoteRosterEntry, second phase", () => {
     const named = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
     const winner = await createPerson(ctx, { full_name: "Someone Else" });
 
+    const race = racingDb(() => insertProvenanceFor(winner.id));
     try {
       await promoteRosterEntry(
-        { ...ctx, db: racingDb(() => insertProvenanceFor(winner.id)) },
+        { ...ctx, db: race.db },
         { roster_entry_id: entryId, link_to_person_id: named.id }
       );
       throw new Error("expected a refusal");
@@ -404,6 +455,7 @@ describe("promoteRosterEntry, second phase", () => {
       expect((e as ToolError).next).toContain(winner.id);
       expect((e as ToolError).details).toEqual({ promoted_person_id: winner.id });
     }
+    race.assertFired();
 
     // The winner's row is the only one. The refused call wrote nothing.
     const sources = await env.DB.prepare(
@@ -421,10 +473,12 @@ describe("promoteRosterEntry, second phase", () => {
     const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
     const named = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
 
+    const race = racingDb(() => insertProvenanceFor(named.id));
     const out = await promoteRosterEntry(
-      { ...ctx, db: racingDb(() => insertProvenanceFor(named.id)) },
+      { ...ctx, db: race.db },
       { roster_entry_id: entryId, link_to_person_id: named.id }
     );
+    race.assertFired();
     if (out.status !== "promoted") throw new Error("unreachable");
     expect(out.person.id).toBe(named.id);
     expect(out.linked_existing).toBe(true);
