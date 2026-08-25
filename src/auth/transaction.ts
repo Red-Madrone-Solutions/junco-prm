@@ -14,9 +14,27 @@ import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
  *
  *   1. Only an opaque random handle travels through GitHub. The auth request is
  *      in KV, so nothing an attacker can craft describes a different one.
- *   2. A cookie set when the flow starts binds the transaction to the browser
- *      that started it. The attacker's cookie is in the attacker's browser, so
- *      the owner arrives without it and is refused.
+ *   2. A cookie binds each server-side record to one browser, so a browser that
+ *      did not receive the cookie cannot use the record.
+ *
+ * THERE ARE TWO RECORDS AND TWO COOKIES, and the reason is a variant of the
+ * same attack. A first version of this module bound only the transaction, which
+ * opens at the approval POST. That left the pending consent record - created by
+ * an unauthenticated GET that any party can issue, browser or not - bound to
+ * nobody. An attacker could issue that GET from their own server, scrape the
+ * handle out of the returned HTML, and get the owner's browser to submit the
+ * approval from a page of their own. The owner never saw the consent screen,
+ * and the cookie that then arrived was one this Worker had just placed in the
+ * owner's browser itself, so every check downstream reported success.
+ *
+ *   - `beginConsent` / `consumeConsent` bind the pending record to the browser
+ *     the consent screen was rendered to. Its cookie is SameSite=Strict: the
+ *     only request that reads it is a form submission from our own page.
+ *   - `beginTransaction` / `consumeTransaction` bind the approved request to
+ *     the browser that approved it, and carry that binding across the round
+ *     trip to GitHub. Its cookie is SameSite=Lax, because the request that
+ *     reads it is a top-level navigation arriving from github.com and Strict
+ *     would drop it on exactly the request that needs it.
  *
  * Signing the state instead would NOT be sufficient. A signature proves this
  * Worker minted that state; it says nothing about which browser started the
@@ -24,7 +42,8 @@ import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
  */
 
 const TTL_SECONDS = 600;
-const COOKIE_NAME = "junco_txn";
+const TXN_COOKIE_NAME = "junco_txn";
+const CONSENT_COOKIE_NAME = "junco_consent";
 
 function randomHandle(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -39,6 +58,90 @@ export class TransactionError extends Error {
     super("this sign-in link is not valid for this browser");
     this.name = "TransactionError";
   }
+}
+
+export class ConsentError extends Error {
+  constructor(public readonly reason: "no_cookie" | "mismatch" | "unknown") {
+    // Two messages, and the split is deliberate. "unknown" covers an expired
+    // record and a forged handle alike, and it is named for the expiry because
+    // that is the only one of the two a legitimate person hits - by leaving the
+    // page open past the TTL - and they need to be told to start again. A
+    // missing cookie and a wrong one share the other message, so neither is
+    // distinguishable from outside.
+    super(
+      reason === "unknown"
+        ? "this approval has expired"
+        : "this approval is not valid for the browser that started it"
+    );
+    this.name = "ConsentError";
+  }
+}
+
+/**
+ * Opens a PENDING CONSENT: the parsed auth request, held between rendering the
+ * consent screen and the approval POST, bound to the browser it is rendered to.
+ *
+ * The binding starts HERE and not at the approval, which is the whole point.
+ * `GET /authorize` is unauthenticated and anyone can issue it, including from a
+ * server with no browser at all. Whoever issues it receives this cookie; a
+ * browser that was never shown the page does not have it and cannot approve.
+ */
+export async function beginConsent(
+  env: Env,
+  authRequest: AuthRequest
+): Promise<{ handle: string; cookie: string }> {
+  const handle = randomHandle();
+  const secret = randomHandle();
+
+  await env.OAUTH_KV.put(`pending:${handle}`, JSON.stringify({ authRequest, secret }), {
+    expirationTtl: TTL_SECONDS,
+  });
+
+  const cookie =
+    `${CONSENT_COOKIE_NAME}=${secret}; Path=/; Max-Age=${TTL_SECONDS}; ` +
+    // SameSite=Strict, unlike the transaction cookie below. The only request
+    // that reads this one is a form submission from our own consent page, which
+    // is same-site; a cross-site form post carries no Strict cookie at all.
+    "HttpOnly; Secure; SameSite=Strict";
+
+  return { handle, cookie };
+}
+
+/**
+ * Sent with the redirect to GitHub. The pending record is consumed by then, so
+ * the secret that bound it has no further use and should not sit in the browser
+ * for the rest of its ten minutes.
+ */
+export const CONSENT_COOKIE_CLEARED =
+  `${CONSENT_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;
+
+/**
+ * Consumes a pending consent. SINGLE USE, and the cookie is checked before KV
+ * is touched: a caller with no cookie learns nothing about whether the handle
+ * it presented names a real record.
+ */
+export async function consumeConsent(
+  env: Env,
+  request: Request,
+  handle: string
+): Promise<AuthRequest> {
+  const presented = readCookie(request, CONSENT_COOKIE_NAME);
+  if (!presented) throw new ConsentError("no_cookie");
+  if (!handle) throw new ConsentError("unknown");
+
+  const raw = await env.OAUTH_KV.get(`pending:${handle}`);
+  if (!raw) throw new ConsentError("unknown");
+
+  const stored = JSON.parse(raw) as { authRequest: AuthRequest; secret: string };
+
+  // Delete BEFORE validating the secret, for the same reason consumeTransaction
+  // does: a wrong-cookie attempt burns the record rather than leaving it to be
+  // probed again.
+  await env.OAUTH_KV.delete(`pending:${handle}`);
+
+  if (!timingSafeEqual(stored.secret, presented)) throw new ConsentError("mismatch");
+
+  return stored.authRequest;
 }
 
 /**
@@ -62,7 +165,7 @@ export async function beginTransaction(
   });
 
   const cookie =
-    `${COOKIE_NAME}=${secret}; Path=/; Max-Age=${TTL_SECONDS}; ` +
+    `${TXN_COOKIE_NAME}=${secret}; Path=/; Max-Age=${TTL_SECONDS}; ` +
     // HttpOnly: script cannot read it. Secure: never sent over http.
     // SameSite=Lax rather than Strict, because the callback arrives as a
     // top-level navigation FROM github.com and Strict would drop the cookie on
@@ -81,7 +184,7 @@ export async function consumeTransaction(
   request: Request,
   handle: string
 ): Promise<AuthRequest> {
-  const presented = readCookie(request, COOKIE_NAME);
+  const presented = readCookie(request, TXN_COOKIE_NAME);
   if (!presented) throw new TransactionError("no_cookie");
 
   const raw = await env.OAUTH_KV.get(`txn:${handle}`);

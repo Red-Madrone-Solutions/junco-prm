@@ -3,7 +3,15 @@ import type { Config } from "../config";
 import { logAuthFailure } from "../log";
 import { consentPage } from "./consent";
 import { authorizeUrl, completeCallback, GitHubAuthError } from "./github";
-import { beginTransaction, consumeTransaction, TransactionError } from "./transaction";
+import {
+  beginConsent,
+  beginTransaction,
+  ConsentError,
+  CONSENT_COOKIE_CLEARED,
+  consumeConsent,
+  consumeTransaction,
+  TransactionError,
+} from "./transaction";
 
 /**
  * THE ONLY THING EVER WRITTEN INTO A GRANT.
@@ -107,13 +115,22 @@ export function buildProvider(config: Config, apiHandler: FetchHandler) {
     clientRegistrationCallback: ({ clientMetadata }) => {
       const uris = clientMetadata.redirect_uris;
       if (!Array.isArray(uris) || uris.length === 0) {
-        throw new Error("redirect_uris is required");
+        return { code: "invalid_client_metadata", description: "redirect_uris is required" };
       }
       for (const uri of uris) {
         if (typeof uri !== "string" || !isAllowedRedirect(uri)) {
-          throw new Error(`redirect_uri not permitted on this instance: ${String(uri)}`);
+          // RETURNED, NOT THROWN, and the rejected URI is not echoed back.
+          // ClientRegistrationCallbackResult in the installed .d.ts documents a
+          // returned object as the way to reject, which the library turns into
+          // a 400 invalid_client_metadata. A throw takes its catch instead and
+          // yields a 500 whose description repeats whatever the caller sent.
+          return {
+            code: "invalid_client_metadata",
+            description: "redirect_uri not permitted on this instance",
+          };
         }
       }
+      return undefined;
     },
   });
 }
@@ -125,8 +142,10 @@ type OAuthEnv = Env & { OAUTH_PROVIDER: OAuthHelpers };
  *
  * Four routes, and the ordering of the checks in each is the security:
  *
- *   GET  /authorize          parse, then SHOW CONSENT. No redirect yet.
- *   POST /authorize/approve  open a bound transaction, then redirect to GitHub.
+ *   GET  /authorize          parse, then SHOW CONSENT, bound to this browser.
+ *                            No redirect yet.
+ *   POST /authorize/approve  prove the same browser, then open a transaction
+ *                            and redirect to GitHub.
  *   GET  /callback           consume the transaction, resolve identity, finish.
  *   *                        404. Never fall through to parseAuthRequest.
  */
@@ -152,35 +171,73 @@ function githubHandler(config: Config): FetchHandler {
         }
 
         const client = await oauth.lookupClient(authRequest.clientId);
+        // The cookie goes out WITH THE PAGE, so the pending record belongs to
+        // the browser that was shown the consent screen from the moment it
+        // exists. Anyone can issue this GET, including from a server with no
+        // browser; whoever does gets the cookie, and nobody else can use their
+        // handle.
+        const { handle, cookie } = await beginConsent(env, authRequest);
+
         // NOTHING IS REDIRECTED YET. The user sees who is asking first.
         return consentPage({
           clientName: String(client?.clientName ?? authRequest.clientId),
+          clientId: authRequest.clientId,
+          registeredAt: client?.registrationDate ?? null,
           redirectUri: authRequest.redirectUri,
-          handle: await stashPending(env, authRequest),
-          githubLoginUrl: "",
+          handle,
+          setCookie: cookie,
         });
       }
 
       // -------------------------------------------------- /authorize/approve
       if (url.pathname === "/authorize/approve" && request.method === "POST") {
+        // FIRST, AND BEFORE THE BODY IS READ: this POST must be our own form.
+        //
+        // `form-action 'self'` on the consent page constrains forms ON that
+        // page. It says nothing about a form on somebody else's page aimed at
+        // us, and a simple form post triggers no preflight, so without this an
+        // attacker who scraped a handle out of an /authorize response they
+        // issued themselves could have the owner's browser submit it.
+        if (!isSameOriginForm(request, url.origin)) {
+          logAuthFailure({ requestId, presentedUserId: null, reason: "invalid_token" });
+          return new Response("this approval did not come from this site", { status: 400 });
+        }
+
         const form = await request.formData();
         const pending = String(form.get("handle") ?? "");
-        const authRequest = await readPending(env, pending);
-        if (!authRequest) return new Response("this approval has expired", { status: 400 });
 
-        // The transaction opens HERE, at the moment a human approved it, and
-        // the cookie goes to the browser that clicked. That is what binds the
-        // rest of the flow to this person.
+        let authRequest: AuthRequest;
+        try {
+          // AND THE CHECK THAT DOES NOT DEPEND ON A HEADER BEING SENT. The
+          // cookie this compares against was set on the consent response, in
+          // the browser that page was rendered to. A browser that never loaded
+          // it has nothing to present, so it cannot approve on someone's behalf
+          // even if both headers above are absent.
+          authRequest = await consumeConsent(env, request, pending);
+        } catch (e) {
+          logAuthFailure({
+            requestId,
+            presentedUserId: null,
+            reason: e instanceof ConsentError ? "invalid_token" : "no_props",
+          });
+          return new Response(
+            e instanceof ConsentError ? e.message : "this approval could not be processed",
+            { status: 400 }
+          );
+        }
+
+        // The transaction opens HERE, at the moment a human approved it, and it
+        // carries the binding across the round trip to GitHub - which the
+        // consent cookie cannot, being SameSite=Strict.
         const { handle, cookie } = await beginTransaction(env, authRequest);
         const callbackUrl = new URL("/callback", url.origin).toString();
 
-        return new Response(null, {
-          status: 302,
-          headers: {
-            location: authorizeUrl(config, callbackUrl, handle),
-            "set-cookie": cookie,
-          },
+        const headers = new Headers({
+          location: authorizeUrl(config, callbackUrl, handle),
         });
+        headers.append("set-cookie", cookie);
+        headers.append("set-cookie", CONSENT_COOKIE_CLEARED);
+        return new Response(null, { status: 302, headers });
       }
 
       if (url.pathname === "/authorize/deny") {
@@ -251,23 +308,24 @@ function githubHandler(config: Config): FetchHandler {
 }
 
 /**
- * The consent page needs somewhere to keep the parsed request between rendering
- * and the approval POST. Short-lived, and NOT the bound transaction - that only
- * opens once a human has actually approved, so an unapproved page leaves no
- * cookie anywhere.
+ * Two headers a browser sets and a page cannot forge.
+ *
+ * `Sec-Fetch-Site` is `same-origin` when our own consent page submits the form
+ * and `cross-site` when somebody else's does. `Origin` is sent on every form
+ * POST and names the page the form was on.
+ *
+ * NEITHER IS TREATED AS REQUIRED, and that is deliberate. Both are absent from
+ * a request made by something that is not a browser, so demanding them would
+ * refuse legitimate non-browser callers while proving nothing about the ones
+ * that matter. A header that is present and wrong is evidence; a header that is
+ * missing is not, and the consent cookie is what carries the property there.
  */
-async function stashPending(env: Env, authRequest: AuthRequest): Promise<string> {
-  const handle = crypto.randomUUID();
-  await env.OAUTH_KV.put(`pending:${handle}`, JSON.stringify(authRequest), {
-    expirationTtl: 600,
-  });
-  return handle;
-}
+function isSameOriginForm(request: Request, origin: string): boolean {
+  const site = request.headers.get("sec-fetch-site");
+  if (site !== null && site !== "same-origin") return false;
 
-async function readPending(env: Env, handle: string): Promise<AuthRequest | null> {
-  if (!handle) return null;
-  const raw = await env.OAUTH_KV.get(`pending:${handle}`);
-  if (!raw) return null;
-  await env.OAUTH_KV.delete(`pending:${handle}`);
-  return JSON.parse(raw) as AuthRequest;
+  const declaredOrigin = request.headers.get("origin");
+  if (declaredOrigin !== null && declaredOrigin !== origin) return false;
+
+  return true;
 }

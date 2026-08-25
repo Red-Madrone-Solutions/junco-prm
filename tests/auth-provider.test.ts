@@ -72,28 +72,24 @@ describe("the provider's own routes", () => {
   });
 });
 
+/**
+ * These render `consentPage` directly, which is the right level for escaping
+ * and for response headers. What the page IS RENDERED AT ALL is not something
+ * they can establish - delete the /authorize GET branch and every one of them
+ * stays green - so that assertion lives in tests/auth-flow.test.ts, which walks
+ * the real dispatch chain.
+ */
 describe("the consent screen", () => {
-  it("names the client and the redirect URI it will deliver to", async () => {
-    const { consentPage } = await import("../src/auth/consent");
-    const html = await consentPage({
-      clientName: "Claude",
-      redirectUri: "https://claude.ai/api/mcp/auth_callback",
-      handle: "h",
-      githubLoginUrl: "https://github.com/login/oauth/authorize",
-    }).text();
-
-    expect(html).toContain("Claude");
-    expect(html).toContain("https://claude.ai/api/mcp/auth_callback");
-  });
-
   it("ESCAPES a client name and redirect chosen by whoever registered", async () => {
     // Both are attacker-controlled - anyone can register a client through DCR.
     const { consentPage } = await import("../src/auth/consent");
     const html = await consentPage({
       clientName: '<img src=x onerror="alert(1)">',
+      clientId: "abc123",
+      registeredAt: 1_756_000_000,
       redirectUri: 'https://evil.test/"><script>alert(1)</script>',
       handle: "h",
-      githubLoginUrl: "https://github.com/login/oauth/authorize",
+      setCookie: "junco_consent=s; Path=/",
     }).text();
 
     expect(html).not.toContain("<img");
@@ -101,13 +97,34 @@ describe("the consent screen", () => {
     expect(html).toContain("&lt;img");
   });
 
+  it("SHOWS HOW OLD THE REGISTRATION IS, the one field an attacker cannot make look normal", async () => {
+    // With the allowlist as written, the only non-loopback redirect a remote
+    // attacker can register is Anthropic's own callback, and the client name is
+    // whatever they typed. Neither distinguishes them. A client registered
+    // seconds ago does.
+    const { consentPage } = await import("../src/auth/consent");
+    const html = await consentPage({
+      clientName: "Claude",
+      clientId: "abc123",
+      registeredAt: Math.floor(Date.now() / 1000) - 5,
+      redirectUri: "https://claude.ai/api/mcp/auth_callback",
+      handle: "h",
+      setCookie: "junco_consent=s; Path=/",
+    }).text();
+
+    expect(html).toContain("abc123");
+    expect(html).toContain("5 seconds ago");
+  });
+
   it("cannot be framed", async () => {
     const { consentPage } = await import("../src/auth/consent");
     const response = consentPage({
       clientName: "Claude",
+      clientId: "abc123",
+      registeredAt: 1_756_000_000,
       redirectUri: "https://claude.ai/api/mcp/auth_callback",
       handle: "h",
-      githubLoginUrl: "https://github.com/login/oauth/authorize",
+      setCookie: "junco_consent=s; Path=/",
     });
     expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
     expect(response.headers.get("x-frame-options")).toBe("DENY");
