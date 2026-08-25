@@ -254,6 +254,54 @@ describe("tool registry", () => {
     expect(row?.subject_id).toBeNull();
   });
 
+  it("declares every field the encounter tools validate and store", () => {
+    // The one dimension the earlier break-then-revert proofs never covered was
+    // schema STRUCTURE, and it was the dimension that had a defect in it.
+    // logEncounter and updateEncounter both validate `occurred_at` as an ISO
+    // instant and write it to a column migration 0005 declares, while neither
+    // schema declared it and both declare additionalProperties: false. It
+    // worked only because nothing enforces the schema yet; a conforming client
+    // could never have written that column.
+    const fields: [string, string[]][] = [
+      [
+        "log_encounter",
+        ["person_id", "occurred_on", "occurred_at", "summary", "location", "event", "idempotency_key"],
+      ],
+      [
+        "update_encounter",
+        ["encounter_id", "occurred_on", "occurred_at", "summary", "location", "event", "idempotency_key"],
+      ],
+    ];
+    for (const [name, expected] of fields) {
+      const tool = TOOLS[name];
+      if (!tool) throw new Error(`no tool ${name}`);
+      expect(Object.keys(tool.inputSchema.properties).sort(), name).toEqual([...expected].sort());
+      expect(tool.inputSchema.additionalProperties, name).toBe(false);
+    }
+  });
+
+  it("stores an occurred_at sent through the registry, the field the schemas now declare", async () => {
+    // The other half of the pair above: the schema permits it AND the code
+    // honours it. Either half alone can be true while the contract is broken.
+    const person = (await TOOLS["create_person"]!.run(ctx, {
+      full_name: "Ada Lovelace",
+    } as never)) as { id: string };
+
+    const logged = (await TOOLS["log_encounter"]!.run(ctx, {
+      person_id: person.id,
+      occurred_on: "2026-08-20",
+      occurred_at: "2026-08-20T18:00:00Z",
+      summary: "met at the hallway track",
+    } as never)) as { encounter: { id: string; occurred_at: string | null } };
+    expect(logged.encounter.occurred_at).toBe("2026-08-20T18:00:00Z");
+
+    const fixed = (await TOOLS["update_encounter"]!.run(ctx, {
+      encounter_id: logged.encounter.id,
+      occurred_at: "2026-08-20T19:30:00Z",
+    } as never)) as { occurred_at: string | null };
+    expect(fixed.occurred_at).toBe("2026-08-20T19:30:00Z");
+  });
+
   it("does not resolve a tool name up the prototype chain", async () => {
     // Plan 2's transport will index this map by a name that arrives over the
     // wire. As a plain object literal, TOOLS["toString"] is a function and any

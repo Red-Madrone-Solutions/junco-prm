@@ -377,6 +377,15 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         {
           person_id: personId,
           occurred_on: str("The date it happened, as YYYY-MM-DD in the owner's time zone."),
+          // DECLARED BECAUSE THE CODE HONOURS IT. logEncounter validates
+          // occurred_at as an ISO instant and writes it to a column migration
+          // 0005 declares, but this schema omitted it while declaring
+          // additionalProperties: false. Nothing enforces the schema today, so
+          // it worked; the moment plan 2's transport validates against these
+          // schemas, the column would have become permanently unwritable.
+          occurred_at: nullableStr(
+            "Optional exact instant, ISO-8601 UTC, when the time of day matters. The date above is what reads sort by."
+          ),
           summary: str("What happened."),
           location: str("Where, if worth recording."),
           event: str('Event name, e.g. "WordCamp US 2026".'),
@@ -394,6 +403,10 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         {
           encounter_id: id("enc", "Encounter"),
           occurred_on: str("Corrected date, as YYYY-MM-DD."),
+          // Same reason as log_encounter's; see the comment there.
+          occurred_at: nullableStr(
+            "Corrected exact instant, ISO-8601 UTC, or null to clear it."
+          ),
           summary: str("Corrected summary."),
           location: nullableStr("Corrected location, or null to clear it."),
           event: nullableStr("Corrected event, or null to clear it."),
