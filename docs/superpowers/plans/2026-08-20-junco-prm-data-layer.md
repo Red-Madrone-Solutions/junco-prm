@@ -6494,7 +6494,7 @@ git commit -m "feat: add follow-ups and timezone-correct list_due"
 **Interfaces:**
 - Consumes: `roster_sources`, `import_runs` from Task 3; `hashJson` for content-derived row keys; `newId`; `assertId`.
 - Produces:
-  - `const IMPORT_BATCH_LIMIT` - **the value Task 0 measured.** Until Task 0 has run, 150 is a placeholder, not a derived number.
+  - `const IMPORT_BATCH_LIMIT` - **150, bounded by model tool-call size, not by any platform limit.** Task 0 measured that BOTH platform limits originally cited for it do not bind: a `db.batch()` of 500 statements completes in 3 ms, and a 5,000-row invocation spent 163 ms of CPU on the free plan with no ceiling found. The number is unchanged and its justification is entirely different. See `docs/MEASUREMENTS.md`.
   - `const UPSERT_ROWS_PER_STATEMENT = 6`
   - `interface RosterRow { external_row_key?: string; full_name: string; preferred_name?: string; job_title?: string; organization?: string; email?: string; role?: string; raw?: unknown }`
   - `interface NormalizedRosterRow { key: string; content_hash: string; fields: RosterRow }`
@@ -6918,9 +6918,8 @@ export interface NormalizedRosterRow {
  * as identity, a whole-row hash makes an edited row a new row, so the edit is
  * undetectable and a duplicate lands beside the stale original.
  *
- * This is the hottest function in the import path - two SHA-256 digests per row
- * against a 10 ms CPU budget - and it is what Task 0 measured to set
- * IMPORT_BATCH_LIMIT.
+ * This is the hottest function in the import path - two SHA-256 digests per row, about
+ * 0.033 ms of CPU each measured end to end, which is why `IMPORT_BATCH_LIMIT` is bounded by tool-call size rather than by CPU.
  */
 export async function prepareRow(row: RosterRow): Promise<NormalizedRosterRow> {
   const { external_row_key, raw, ...content } = row;
@@ -7089,7 +7088,7 @@ Every check here is a way a resumed import goes wrong, and the offset checks are
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/import-state.test.ts`
-Expected: PASS, all eighteen cases. The eleven under `openOrResumeRun` are the ones that matter: they are the whole integrity story of a resumed import now that the input hash is gone.
+Expected: PASS, all 23 cases. The eleven under `openOrResumeRun` are the ones that matter: they are the whole integrity story of a resumed import now that the input hash is gone.
 
 - [ ] **Step 5: Commit**
 
