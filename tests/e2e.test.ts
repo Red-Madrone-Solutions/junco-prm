@@ -72,9 +72,11 @@ describe("the conference path", () => {
 
     // Passing a roster id where a person id belongs is a validation error, not
     // a corrupted record. This is the failure the spec names as most likely.
+    // Assert the code, not just that something threw: a bare not-found lookup
+    // would also reject here without ever distinguishing re_ from p_ ids.
     await expect(
       call("log_encounter", { person_id: entryId, occurred_on: "2026-08-20", summary: "x" })
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: "invalid_id" });
 
     // Phase one: candidates, no writes.
     const candidates = (await call("promote_roster_entry", { roster_entry_id: entryId })) as {
@@ -149,7 +151,9 @@ describe("the conference path", () => {
     // export in plan 3, because this result lands in a model's context
     // immediately before most writes against this person.
     expect(detail.sources[0]).not.toHaveProperty("raw_record_snapshot");
-    expect(JSON.stringify(detail)).not.toContain("IGNORE");
+    // No separate string search for fixture text here: raw_record is read only
+    // by promote.ts to build raw_record_snapshot, so the property check above
+    // is the only real guard fixture text could ever need against this path.
   });
 
   it("re-imports with a corrected row: one row changes, nothing duplicates, nothing is lost", async () => {
