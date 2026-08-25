@@ -4569,7 +4569,7 @@ Expected: PASS. The cascade case proves the foreign keys from Task 1 are doing r
 
 - [ ] **Step 5b: Add the hard-delete FTS test to `tests/people-lifecycle.test.ts`**
 
-The spec calls this test non-negotiable, and it cannot be written until Task 10 has created `encounters` and `encounters_fts`. Add it then, and until then leave the `it.todo` below in place so the gap is visible in the test output rather than only in this document.
+The spec calls this test non-negotiable. It is written HERE and asserts the `people_fts` half, which is real: that table exists from Task 5. The encounter half cannot be written yet - `encounters_fts` arrives with Task 10's migration `0006` - so Task 10 extends this same test rather than Task 8 leaving a skipped one behind. Do not write a todo: this plan's verification forbids skipped tests, and a todo here would assert nothing while looking like coverage.
 
 ```ts
 it("leaves NO fts row behind after a hard delete", async () => {
@@ -4579,11 +4579,6 @@ it("leaves NO fts row behind after a hard delete", async () => {
   const person = await createPerson(ctx, {
     full_name: "Ada Lovelace",
     notes: "distinctive-note-token",
-  });
-  await logEncounter(ctx, {
-    person_id: person.id,
-    occurred_on: "2026-08-20",
-    summary: "distinctive-encounter-token",
   });
 
   const token = await deletePerson(ctx, { person_id: person.id });
@@ -4599,19 +4594,6 @@ it("leaves NO fts row behind after a hard delete", async () => {
     .bind("distinctive-note-token")
     .first<{ n: number }>();
   expect(inPeople?.n).toBe(0);
-
-  const inEncounters = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM encounters_fts WHERE encounters_fts MATCH ?"
-  )
-    .bind("distinctive-encounter-token")
-    .first<{ n: number }>();
-  expect(inEncounters?.n).toBe(0);
-
-  // And the index is not merely empty of matches - the rows are gone.
-  const orphans = await env.DB.prepare(
-    "SELECT COUNT(*) AS n FROM encounters_fts WHERE encounter_id NOT IN (SELECT id FROM encounters)"
-  ).first<{ n: number }>();
-  expect(orphans?.n).toBe(0);
 });
 
 it("leaves NOTHING in the operational tables either", async () => {
@@ -4670,14 +4652,6 @@ it("leaves NOTHING in the operational tables either", async () => {
   expect(remaining?.n).toBe(0);
 });
 ```
-
-- [ ] **Step 5c: Run it against cascades alone and record what D1 actually does**
-
-Before adding the explicit child deletes, comment them out and run this test against a plain `DELETE FROM people`.
-
-**Expect it to PASS**, and do not treat that as a reason to skip the explicit deletes. On stock SQLite 3.51 the cascade fires the trigger and the FTS row goes; that was measured on 2026-08-24 and the earlier claim to the contrary was a misreading. What this step is actually for is finding out whether **D1's build inside workerd** agrees, which nobody has checked.
-
-Record the answer in `docs/MEASUREMENTS.md` either way. If it passes, the explicit deletes are defense in depth and the plan says so honestly. If it fails, they are load-bearing and that is a genuinely surprising platform fact worth writing down - the kind Task 0 already turned up twice.
 
 - [ ] **Step 6: Commit**
 
@@ -6037,10 +6011,51 @@ with:
 Run: `npx vitest run tests/encounters.test.ts tests/people.test.ts tests/people-lifecycle.test.ts`
 Expected: PASS. `tests/people.test.ts` still passes because a person with no encounters has an empty list, a count of zero, and a null cursor.
 
+- [ ] **Step 7b: Extend the hard-delete FTS test to encounters, and settle what D1 does**
+
+Task 8 wrote `tests/people-lifecycle.test.ts` with a hard-delete test that asserts only the
+`people_fts` half, because `encounters` and `encounters_fts` did not exist yet. Both exist now.
+Extend that same test - do not write a second one.
+
+Add the encounter to its setup, immediately after `createPerson`:
+
+```ts
+  await logEncounter(ctx, {
+    person_id: person.id,
+    occurred_on: "2026-08-20",
+    summary: "distinctive-encounter-token",
+  });
+```
+
+and add these assertions after the existing `people_fts` assertion:
+
+```ts
+  const inEncounters = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM encounters_fts WHERE encounters_fts MATCH ?"
+  )
+    .bind("distinctive-encounter-token")
+    .first<{ n: number }>();
+  expect(inEncounters?.n).toBe(0);
+
+  // And the index is not merely empty of matches - the rows are gone.
+  const orphans = await env.DB.prepare(
+    "SELECT COUNT(*) AS n FROM encounters_fts WHERE encounter_id NOT IN (SELECT id FROM encounters)"
+  ).first<{ n: number }>();
+  expect(orphans?.n).toBe(0);
+```
+
+- [ ] **Step 7c: Run that test against cascades alone and record what D1 actually does**
+
+Task 8 wrote explicit child deletes into `delete_person`. Temporarily comment them out, leaving a plain `DELETE FROM people`, and run the test you just extended. Restore them immediately afterwards - this is a measurement, not a change.
+
+**Expect it to PASS.** On stock SQLite 3.51 a cascade fires the child `AFTER DELETE` triggers and the FTS row goes with it; that was measured on 2026-08-24 and the earlier claim to the contrary is withdrawn. Do not treat a pass as a reason to remove the explicit deletes. What this step is actually for is finding out whether **D1's build inside workerd** agrees, which nobody has checked, and this is the first task where the encounter half of the test exists to check it with.
+
+Record the answer in `docs/MEASUREMENTS.md` either way. If it passes, the explicit deletes are defense in depth and the plan says so honestly. If it fails, they are load-bearing, and that is a genuinely surprising platform fact worth writing down - the kind Task 0 already turned up twice.
+
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/tools/encounters_read.ts src/tools/encounters.ts migrations/0006_encounters_search.sql src/tools/people.ts tests/encounters.test.ts
+git add src/tools/encounters_read.ts src/tools/encounters.ts migrations/0006_encounters_search.sql src/tools/people.ts tests/encounters.test.ts tests/people-lifecycle.test.ts
 git commit -m "feat: add encounter logging, correction, deletion, and listing"
 ```
 
