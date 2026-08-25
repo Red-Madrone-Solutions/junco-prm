@@ -39,7 +39,23 @@ export async function withIdempotency<T>(
    * already has its subject before the call and passes it as `subjectId`
    * instead.
    */
-  subjectFromResult?: (result: T) => string | undefined
+  subjectFromResult?: (result: T) => string | undefined,
+  /**
+   * What to persist in `response_json` INSTEAD of the value returned to the
+   * caller, for the one write whose result must not be stored as it stands.
+   *
+   * `delete_person` answers an erasure request and its result carries the
+   * erased person's name. Storing it verbatim leaves that name in an
+   * operational table under a NULL subject_id, where the delete's own scrub -
+   * which matches on subject_id - cannot reach it. It cannot pass its own id as
+   * the subject either; see the comment in `deletePerson` for why that makes
+   * the row delete itself before the response is recorded. So it redacts what
+   * it stores instead, and a replay returns the redacted form, which is the
+   * only form that can honestly survive the erasure.
+   *
+   * Every other write stores what it returned.
+   */
+  redactForStorage?: (result: T) => unknown
 ): Promise<T> {
   if (!key) return run();
 
@@ -96,7 +112,12 @@ export async function withIdempotency<T>(
     .prepare(
       "UPDATE idempotency_keys SET response_json = ?, completed_at = ?, subject_id = ? WHERE key = ?"
     )
-    .bind(JSON.stringify(result), nowIso(ctx.clock), finalSubject, scoped)
+    .bind(
+      JSON.stringify(redactForStorage ? redactForStorage(result) : result),
+      nowIso(ctx.clock),
+      finalSubject,
+      scoped
+    )
     .run();
 
   return result;

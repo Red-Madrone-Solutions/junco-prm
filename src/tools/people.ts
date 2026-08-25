@@ -295,9 +295,16 @@ export interface DeletePreview {
   contact_count: number;
 }
 
+/**
+ * The preview minus the name. This is what `delete_person` PERSISTS, and
+ * therefore what a replay returns; the first call returns the full preview.
+ * See `redactForStorage` at the bottom of `deletePerson`.
+ */
+export type RedactedDeletePreview = Omit<DeletePreview, "full_name">;
+
 export type DeletePersonResult =
   | { status: "confirmation_required"; confirmation_token: string; preview: DeletePreview }
-  | { status: "deleted"; deleted: DeletePreview };
+  | { status: "deleted"; deleted: DeletePreview | RedactedDeletePreview };
 
 export interface DeletePersonInput {
   person_id: string;
@@ -405,5 +412,28 @@ export async function deletePerson(
       ]);
 
       return { status: "deleted", deleted: preview };
-  });
+    },
+    // No subjectId - see the comment at the top of this closure.
+    undefined,
+    undefined,
+    // WHAT IS STORED IS NOT WHAT IS RETURNED, and this is the only tool where
+    // that is true. `preview.full_name` is the erased person's name, and the
+    // batch above cannot scrub this row because it is keyed on a subject_id
+    // this call must not set. So the name never reaches the table at all: the
+    // caller gets the full preview, `idempotency_keys` gets the counts. A
+    // retry still replays rather than re-executing, which is the whole point
+    // of the key, and nothing about the person survives it.
+    (result) =>
+      result.status === "deleted"
+        ? {
+            status: "deleted",
+            deleted: {
+              person_id: result.deleted.person_id,
+              encounter_count: result.deleted.encounter_count,
+              followup_count: result.deleted.followup_count,
+              contact_count: result.deleted.contact_count,
+            },
+          }
+        : result
+  );
 }

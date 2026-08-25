@@ -85,8 +85,55 @@ describe("deletePerson", () => {
     // The client never saw the response and sent the same call again.
     const retried = await deletePerson(ctx, args);
 
-    expect(retried).toEqual(committed);
+    expect(committed.status).toBe("deleted");
     expect(retried.status).toBe("deleted");
+    if (committed.status !== "deleted" || retried.status !== "deleted") {
+      throw new Error("unreachable");
+    }
+    // The replay carries the counts, so a client that lost the first response
+    // still learns what happened. It does NOT carry the name: see the next
+    // test for why the stored copy is redacted.
+    expect(retried.deleted).toEqual({
+      person_id: committed.deleted.person_id,
+      encounter_count: committed.deleted.encounter_count,
+      followup_count: committed.deleted.followup_count,
+      contact_count: committed.deleted.contact_count,
+    });
+  });
+
+  it("leaves no trace of the erased person's name in idempotency_keys", async () => {
+    // This is the one tool that exists to answer an erasure request, and its
+    // own stored response used to hold the name it had just erased - under a
+    // NULL subject_id, which is the one thing the delete's own scrub cannot
+    // reach. The first caller still gets the full preview.
+    const person = await createPerson(ctx, { full_name: "Henrietta Lacks" });
+    const first = await deletePerson(ctx, { person_id: person.id });
+    if (first.status !== "confirmation_required") throw new Error("unreachable");
+
+    const committed = await deletePerson(ctx, {
+      person_id: person.id,
+      confirmation_token: first.confirmation_token,
+      idempotency_key: "k1",
+    });
+    if (committed.status !== "deleted") throw new Error("unreachable");
+    expect((committed.deleted as { full_name?: string }).full_name).toBe("Henrietta Lacks");
+
+    const row = await env.DB
+      .prepare("SELECT response_json FROM idempotency_keys WHERE key = ?")
+      .bind("delete_person:k1")
+      .first<{ response_json: string | null }>();
+    // The row must still exist, or the retry above stops replaying.
+    expect(row?.response_json).not.toBeNull();
+    expect(row?.response_json).not.toContain("Henrietta");
+    expect(JSON.parse(row!.response_json!)).toEqual({
+      status: "deleted",
+      deleted: {
+        person_id: person.id,
+        encounter_count: 0,
+        followup_count: 0,
+        contact_count: 0,
+      },
+    });
   });
 
   it("cascades to contacts, links, and tags", async () => {
