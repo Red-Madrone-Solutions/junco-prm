@@ -39,11 +39,27 @@ import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
  * Signing the state instead would NOT be sufficient. A signature proves this
  * Worker minted that state; it says nothing about which browser started the
  * flow, and an attacker gets a validly signed state just by starting a real one.
+ *
+ * THE CONSENT COOKIE HOLDS MORE THAN ONE SECRET, bounded and rotating, because
+ * one browser can have more than one `GET /authorize` pending at once - Claude
+ * on the web and Claude on the desktop, started minutes apart, are the same
+ * browser and each opens its own consent page. A cookie that held only the
+ * newest secret would make the older page's approval fail with no way to
+ * recover but reloading it. See `beginConsent` and `consumeConsent` below.
  */
 
 const TTL_SECONDS = 600;
 const TXN_COOKIE_NAME = "junco_txn";
 const CONSENT_COOKIE_NAME = "junco_consent";
+
+// The consent cookie holds up to this many secrets at once, newest first,
+// joined by a delimiter that cannot collide with a secret's own characters -
+// every secret is base64url of 32 random bytes, so it never contains ".".
+// More than this many authorization flows open at once in one browser, on a
+// single-owner PRM, is not a real case; the cap is what keeps the cookie
+// bounded without needing a cleanup path of its own.
+const MAX_CONSENT_SECRETS = 3;
+const CONSENT_SECRET_DELIMITER = ".";
 
 function randomHandle(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -85,9 +101,16 @@ export class ConsentError extends Error {
  * `GET /authorize` is unauthenticated and anyone can issue it, including from a
  * server with no browser at all. Whoever issues it receives this cookie; a
  * browser that was never shown the page does not have it and cannot approve.
+ *
+ * The cookie MINTED HERE MAY ALREADY HOLD SECRETS from other pending consents
+ * in the same browser - a second `GET /authorize` before the first is approved
+ * or expires, for instance two authorization attempts started minutes apart.
+ * The new secret is added to the front rather than replacing what is there, so
+ * an older, still-open consent page does not stop working.
  */
 export async function beginConsent(
   env: Env,
+  request: Request,
   authRequest: AuthRequest
 ): Promise<{ handle: string; cookie: string }> {
   const handle = randomHandle();
@@ -97,14 +120,11 @@ export async function beginConsent(
     expirationTtl: TTL_SECONDS,
   });
 
-  const cookie =
-    `${CONSENT_COOKIE_NAME}=${secret}; Path=/; Max-Age=${TTL_SECONDS}; ` +
-    // SameSite=Strict, unlike the transaction cookie below. The only request
-    // that reads this one is a form submission from our own consent page, which
-    // is same-site; a cross-site form post carries no Strict cookie at all.
-    "HttpOnly; Secure; SameSite=Strict";
+  const existing = readCookie(request, CONSENT_COOKIE_NAME);
+  const priorSecrets = existing ? existing.split(CONSENT_SECRET_DELIMITER) : [];
+  const secrets = [secret, ...priorSecrets].slice(0, MAX_CONSENT_SECRETS);
 
-  return { handle, cookie };
+  return { handle, cookie: consentCookieHeader(secrets) };
 }
 
 /**
@@ -115,16 +135,39 @@ export async function beginConsent(
 export const CONSENT_COOKIE_CLEARED =
   `${CONSENT_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;
 
+/** Builds the Set-Cookie header for a given list of consent secrets, newest
+ * first. An empty list clears the cookie rather than sending an empty value,
+ * so a browser with no pending consents left does not keep carrying it. */
+function consentCookieHeader(secrets: string[]): string {
+  if (secrets.length === 0) return CONSENT_COOKIE_CLEARED;
+
+  return (
+    `${CONSENT_COOKIE_NAME}=${secrets.join(CONSENT_SECRET_DELIMITER)}; Path=/; ` +
+    `Max-Age=${TTL_SECONDS}; ` +
+    // SameSite=Strict, unlike the transaction cookie below. The only request
+    // that reads this one is a form submission from our own consent page, which
+    // is same-site; a cross-site form post carries no Strict cookie at all.
+    "HttpOnly; Secure; SameSite=Strict"
+  );
+}
+
 /**
  * Consumes a pending consent. SINGLE USE, and the cookie is checked before KV
  * is touched: a caller with no cookie learns nothing about whether the handle
  * it presented names a real record.
+ *
+ * The presented cookie may carry more than one secret - other pending consents
+ * in the same browser. Every entry is compared, constant-time, and the loop
+ * never stops early: stopping at the first match would leak which position in
+ * the cookie matched through timing. The returned cookie carries every entry
+ * that did NOT match, so the other pending consent(s) in this browser stay
+ * approvable; only the caller of this function decides whether to send it.
  */
 export async function consumeConsent(
   env: Env,
   request: Request,
   handle: string
-): Promise<AuthRequest> {
+): Promise<{ authRequest: AuthRequest; cookie: string }> {
   const presented = readCookie(request, CONSENT_COOKIE_NAME);
   if (!presented) throw new ConsentError("no_cookie");
   if (!handle) throw new ConsentError("unknown");
@@ -139,9 +182,18 @@ export async function consumeConsent(
   // probed again.
   await env.OAUTH_KV.delete(`pending:${handle}`);
 
-  if (!timingSafeEqual(stored.secret, presented)) throw new ConsentError("mismatch");
+  const presentedSecrets = presented.split(CONSENT_SECRET_DELIMITER);
+  let matched = false;
+  const remaining: string[] = [];
+  for (const candidate of presentedSecrets) {
+    const isMatch = timingSafeEqual(stored.secret, candidate);
+    matched = matched || isMatch;
+    if (!isMatch) remaining.push(candidate);
+  }
 
-  return stored.authRequest;
+  if (!matched) throw new ConsentError("mismatch");
+
+  return { authRequest: stored.authRequest, cookie: consentCookieHeader(remaining) };
 }
 
 /**

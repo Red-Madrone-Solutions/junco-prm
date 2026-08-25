@@ -7,7 +7,6 @@ import {
   beginConsent,
   beginTransaction,
   ConsentError,
-  CONSENT_COOKIE_CLEARED,
   consumeConsent,
   consumeTransaction,
   TransactionError,
@@ -176,7 +175,7 @@ function githubHandler(config: Config): FetchHandler {
         // exists. Anyone can issue this GET, including from a server with no
         // browser; whoever does gets the cookie, and nobody else can use their
         // handle.
-        const { handle, cookie } = await beginConsent(env, authRequest);
+        const { handle, cookie } = await beginConsent(env, request, authRequest);
 
         // NOTHING IS REDIRECTED YET. The user sees who is asking first.
         return consentPage({
@@ -207,13 +206,21 @@ function githubHandler(config: Config): FetchHandler {
         const pending = String(form.get("handle") ?? "");
 
         let authRequest: AuthRequest;
+        let consentCookie: string;
         try {
           // AND THE CHECK THAT DOES NOT DEPEND ON A HEADER BEING SENT. The
           // cookie this compares against was set on the consent response, in
           // the browser that page was rendered to. A browser that never loaded
           // it has nothing to present, so it cannot approve on someone's behalf
           // even if both headers above are absent.
-          authRequest = await consumeConsent(env, request, pending);
+          //
+          // The returned cookie carries whatever OTHER pending consents this
+          // browser still holds, minus the one just consumed - not a blanket
+          // clear, which would break a second, still-open consent page in the
+          // same browser.
+          const consumed = await consumeConsent(env, request, pending);
+          authRequest = consumed.authRequest;
+          consentCookie = consumed.cookie;
         } catch (e) {
           logAuthFailure({
             requestId,
@@ -236,7 +243,7 @@ function githubHandler(config: Config): FetchHandler {
           location: authorizeUrl(config, callbackUrl, handle),
         });
         headers.append("set-cookie", cookie);
-        headers.append("set-cookie", CONSENT_COOKIE_CLEARED);
+        headers.append("set-cookie", consentCookie);
         return new Response(null, { status: 302, headers });
       }
 

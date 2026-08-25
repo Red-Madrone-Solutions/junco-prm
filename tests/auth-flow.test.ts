@@ -59,9 +59,18 @@ function handleFrom(html: string): string {
   return match![1]!;
 }
 
-/** Drives `GET /authorize` and returns what that browser now holds. */
-async function startConsent(clientId: string): Promise<{ handle: string; cookie: string }> {
-  const response = await SELF.fetch(authorizeUrl(clientId), { redirect: "manual" });
+/**
+ * Drives `GET /authorize` and returns what that browser now holds. Pass
+ * `existingCookie` to simulate a browser that already holds a cookie from an
+ * earlier `GET /authorize` - the real request header a browser would send,
+ * not a separate channel.
+ */
+async function startConsent(
+  clientId: string,
+  existingCookie?: string
+): Promise<{ handle: string; cookie: string }> {
+  const headers = existingCookie ? { cookie: existingCookie } : undefined;
+  const response = await SELF.fetch(authorizeUrl(clientId), { headers, redirect: "manual" });
   expect(response.status).toBe(200);
   return { handle: handleFrom(await response.text()), cookie: cookieHeader(response) };
 }
@@ -209,6 +218,49 @@ describe("POST /authorize/approve, through the dispatch chain", () => {
 
     expect(response.status).toBe(400);
     expect(response.headers.get("location")).toBeNull();
+  });
+});
+
+describe("two authorization flows open in one browser", () => {
+  // The regression: a second GET /authorize in the same browser used to
+  // overwrite the first flow's cookie outright, so approving the OLDER
+  // consent page failed with no_cookie even though nothing about that page
+  // itself had gone wrong. Approving only the newer one would not catch a
+  // fix that just reordered which flow wins - both must still work, and the
+  // older one is the one that used to break.
+  it("still lets the OLDER consent page be approved after a newer one opens, and leaves the newer one approvable too", async () => {
+    const clientId = await registerClient("Claude");
+
+    const older = await startConsent(clientId);
+    const newer = await startConsent(clientId, older.cookie);
+
+    // The browser's cookie after the second GET /authorize carries both
+    // secrets - it is what a real browser would now hold, having replaced
+    // its single junco_consent cookie with the value the second response set.
+    const olderApproval = await approve({
+      handle: older.handle,
+      cookie: newer.cookie,
+      origin: WORKER_ORIGIN,
+      secFetchSite: "same-origin",
+    });
+
+    expect(olderApproval.status).toBe(302);
+    expect(new URL(olderApproval.headers.get("location")!).host).toBe("github.com");
+
+    // What the browser holds now: the fresh junco_txn from approving the
+    // older flow, plus whatever consent secret(s) remain - just the newer
+    // flow's, since the older one's was consumed and removed.
+    const afterOlderApproval = cookieHeader(olderApproval);
+
+    const newerApproval = await approve({
+      handle: newer.handle,
+      cookie: afterOlderApproval,
+      origin: WORKER_ORIGIN,
+      secFetchSite: "same-origin",
+    });
+
+    expect(newerApproval.status).toBe(302);
+    expect(new URL(newerApproval.headers.get("location")!).host).toBe("github.com");
   });
 });
 
