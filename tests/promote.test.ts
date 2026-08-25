@@ -7,6 +7,7 @@ import { addContact } from "../src/tools/attributes";
 import { importRoster } from "../src/tools/import";
 import { createPerson, getPerson } from "../src/tools/people";
 import { promoteRosterEntry } from "../src/tools/promote";
+import { loadPersonSources } from "../src/tools/promote_read";
 
 const ctx: ToolContext = {
   db: env.DB,
@@ -543,5 +544,36 @@ describe("promoteRosterEntry, second phase", () => {
     expect(detail.sources[0]?.matches_current).toBeNull();
     // And the metadata never carries the snapshot itself.
     expect(detail.sources[0]).not.toHaveProperty("raw_record_snapshot");
+  });
+});
+
+describe("loadPersonSources ordering", () => {
+  it("breaks a promoted_at tie by id, not by insertion order", async () => {
+    const person = await createPerson(ctx, { full_name: "Grace Hopper" });
+
+    const FIXED = "2026-08-20T12:00:00.000Z";
+    // Chosen so id-ascending order is the OPPOSITE of insertion order: the
+    // row with the lexically larger id is inserted first. Without the
+    // `ps.id` tiebreak, two rows sharing `promoted_at` come back from
+    // SQLite in whatever order its table scan visits them - insertion
+    // order, in practice - so this setup fails under `ORDER BY
+    // ps.promoted_at` alone and passes only once `ps.id` breaks the tie.
+    const bigId = "ps_zzzzzzzz-0000-0000-0000-000000000001";
+    const smallId = "ps_00000000-0000-0000-0000-000000000002";
+
+    async function insert(id: string, externalRowKey: string): Promise<void> {
+      await env.DB.prepare(
+        "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(id, person.id, "wcus-2026", externalRowKey, "WCUS 2026", "WCUS 2026",
+              "https://example.test/attendees", FIXED, "{}", "sha256:x", FIXED)
+        .run();
+    }
+
+    await insert(bigId, "k:1");
+    await insert(smallId, "k:2");
+
+    const sources = await loadPersonSources(ctx, person.id);
+    expect(sources.map((s) => s.id)).toEqual([smallId, bigId]);
   });
 });
