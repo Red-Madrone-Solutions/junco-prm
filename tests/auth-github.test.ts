@@ -84,17 +84,26 @@ describe("exchangeCode", () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ error: "bad_verification_code", error_description: "expired" })
     );
-    await expect(exchangeCode(config, "stale")).rejects.toThrow(GitHubAuthError);
+    await expect(exchangeCode(config, "stale")).rejects.toMatchObject({
+      name: "GitHubAuthError",
+      reason: "exchange_refused",
+    });
   });
 
   it("fails rather than returning undefined when the body has no token", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({}));
-    await expect(exchangeCode(config, "the-code")).rejects.toThrow(GitHubAuthError);
+    await expect(exchangeCode(config, "the-code")).rejects.toMatchObject({
+      name: "GitHubAuthError",
+      reason: "exchange_empty",
+    });
   });
 
   it("fails on a non-200", async () => {
     fetchMock.mockResolvedValueOnce(new Response("nope", { status: 500 }));
-    await expect(exchangeCode(config, "the-code")).rejects.toThrow(GitHubAuthError);
+    await expect(exchangeCode(config, "the-code")).rejects.toMatchObject({
+      name: "GitHubAuthError",
+      reason: "exchange_http",
+    });
   });
 });
 
@@ -115,12 +124,18 @@ describe("resolveUserId", () => {
 
   it("fails when the response carries no numeric id", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ login: "octocat" }));
-    await expect(resolveUserId("gho_token")).rejects.toThrow(GitHubAuthError);
+    await expect(resolveUserId("gho_token")).rejects.toMatchObject({
+      name: "GitHubAuthError",
+      reason: "identity_empty",
+    });
   });
 
   it("fails on a revoked token", async () => {
     fetchMock.mockResolvedValueOnce(new Response("Bad credentials", { status: 401 }));
-    await expect(resolveUserId("gone")).rejects.toThrow(GitHubAuthError);
+    await expect(resolveUserId("gone")).rejects.toMatchObject({
+      name: "GitHubAuthError",
+      reason: "identity_http",
+    });
   });
 });
 
@@ -140,7 +155,10 @@ describe("completeCallback", () => {
 
   it("does not resolve an identity when the exchange failed", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: "bad_verification_code" }));
-    await expect(completeCallback(config, "stale")).rejects.toThrow(GitHubAuthError);
+    await expect(completeCallback(config, "stale")).rejects.toMatchObject({
+      name: "GitHubAuthError",
+      reason: "exchange_refused",
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

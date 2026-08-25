@@ -17,10 +17,17 @@ const USER = "https://api.github.com/user";
 /** GitHub's API rejects requests with no User-Agent with a 403 that does not say so. */
 const USER_AGENT = "junco-prm";
 
+export type GitHubAuthErrorReason =
+  | "exchange_http"
+  | "exchange_refused"
+  | "exchange_empty"
+  | "identity_http"
+  | "identity_empty";
+
 export class GitHubAuthError extends Error {
   constructor(
     message: string,
-    public readonly reason: string
+    public readonly reason: GitHubAuthErrorReason
   ) {
     super(message);
     this.name = "GitHubAuthError";
