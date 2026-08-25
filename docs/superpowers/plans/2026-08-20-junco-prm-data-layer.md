@@ -5411,7 +5411,7 @@ Ranking works because `bm25()` returns negative scores where a better match is m
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run tests/search.test.ts`
-Expected: PASS, all thirteen cases.
+Expected: PASS, all 27 cases.
 
 - [ ] **Step 5: Commit**
 
