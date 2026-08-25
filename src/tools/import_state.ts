@@ -156,9 +156,9 @@ export interface NormalizedRosterRow {
  * as identity, a whole-row hash makes an edited row a new row, so the edit is
  * undetectable and a duplicate lands beside the stale original.
  *
- * This is the hottest function in the import path - two SHA-256 digests per row
- * against a 10 ms CPU budget - and it is what Task 0 measured to set
- * IMPORT_BATCH_LIMIT.
+ * This is the hottest function in the import path - two SHA-256 digests per row,
+ * about 0.033 ms of CPU each measured end to end, which is why
+ * `IMPORT_BATCH_LIMIT` is bounded by tool-call size rather than by CPU.
  */
 export async function prepareRow(row: RosterRow): Promise<NormalizedRosterRow> {
   const { external_row_key, raw, ...content } = row;
