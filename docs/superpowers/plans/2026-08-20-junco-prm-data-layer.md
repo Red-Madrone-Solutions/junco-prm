@@ -8108,7 +8108,7 @@ describe("finalizeImport", () => {
 - [ ] **Step 2: Run it to make sure it fails**
 
 Run: `npx vitest run tests/import-finalize.test.ts`
-Expected: FAIL, `finalizeImport` is not exported from `../src/tools/import`.
+Expected: FAIL - but NOT for the reason an earlier draft of this step gave. `finalizeImport` IS already exported from `../src/tools/import`: Task 12b built it, because the `committed_run_id` promotion the staleness ruling requires has nowhere else to run and 12b's own abandoned-run test needed a real commit path. EXTEND what is there rather than re-authoring it. These tests fail on the promotion behaviour they assert, not on a missing export.
 
 - [ ] **Step 3: Add `finalizeImport` to `src/tools/import.ts`**
 
