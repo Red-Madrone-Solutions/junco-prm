@@ -10019,18 +10019,33 @@ describe("exportData", () => {
     await expect(exportData(ctx, { scope: "roster_entries" as never })).rejects.toThrow(ToolError);
   });
 
-  it("clamps a page size the caller asks for at either end", async () => {
-    for (let i = 0; i < 3; i++) await createPerson(ctx, { full_name: `Person ${i}` });
+  // clampLimit DOES NOT CLAMP, and an earlier draft of this test asserted that it
+  // does. src/paginate.ts throws below the floor and above the ceiling on purpose:
+  // silently returning 50 for a requested 500 tells the agent it received
+  // everything. search, followups and encounters all depend on the throw, and
+  // Step 3 below calls clampLimit unmodified, so the earlier draft contradicted
+  // its own implementation as well as the shipped module. Corrected 2026-08-25.
+  it("rejects a limit below the floor rather than silently raising it to one", async () => {
+    await expect(exportData(ctx, { scope: "people", limit: 0 })).rejects.toMatchObject({
+      code: "invalid_input",
+    });
+  });
 
-    // Below the floor: one row, not zero, and a cursor to continue from.
-    const small = await exportData(ctx, { scope: "people", limit: 0 });
-    expect(small.results).toHaveLength(1);
-    expect(small.next_cursor).not.toBeNull();
+  it("rejects a limit above the ceiling rather than silently truncating", async () => {
+    await expect(exportData(ctx, { scope: "people", limit: 10_000 })).rejects.toMatchObject({
+      code: "limit_exceeded",
+    });
+  });
 
-    // Above the ceiling: no error, and every row that exists.
-    const large = await exportData(ctx, { scope: "people", limit: 10_000 });
-    expect(large.results).toHaveLength(3);
-    expect(large.next_cursor).toBeNull();
+  it("rejects a cursor whose id belongs to a different scope", async () => {
+    await createPerson(ctx, { full_name: "Ada Lovelace" });
+    const page = await exportData(ctx, { scope: "people", limit: 1 });
+    // A people cursor replayed against encounters. Without the scope check this
+    // returns an EMPTY page with next_cursor null, which reads as "export
+    // complete" while encounters the caller never saw are still there.
+    await expect(
+      exportData(ctx, { scope: "encounters", cursor: page.next_cursor! })
+    ).rejects.toMatchObject({ code: "invalid_id" });
   });
 });
 ```
@@ -10083,7 +10098,7 @@ export async function exportData(
 
   const limit = clampLimit(input.limit, DEFAULT_LIMIT, MAX_LIMIT);
 
-  const after = decodeCursor(input.cursor) as { id?: string } | null;
+  const after = decodeExportCursor(scope, input.cursor);
   const clause = after === null ? "" : "WHERE id > ?";
   const values = after === null ? [] : [after.id];
 
