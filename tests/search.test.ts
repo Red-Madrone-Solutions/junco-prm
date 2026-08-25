@@ -126,6 +126,50 @@ describe("searchPeople", () => {
     expect(out.roster_entries[0]?.stale).toBeNull();
   });
 
+  it("breaks a finished_at tie deterministically via id DESC, through searchPeople itself", async () => {
+    // The frozen clock every test in this suite shares makes a finished_at tie
+    // the natural case, not a contrived one. This calls the real exported
+    // searchPeople rather than a hand-copied SQL string, so it actually guards
+    // the `WITH latest AS (...)` CTE in src/tools/search.ts instead of a
+    // string literal that happens to look like it.
+    await env.DB.prepare(
+      "INSERT INTO roster_sources (id, source_key, label, event, url, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+      .bind("rs_tie", "tie-2026", "Tie Source", "TIE", "https://example.test", T)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO import_runs (id, roster_source_id, format, status, expected_total, next_offset, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind("ir_1", "rs_tie", "csv", "committed", 1, 1, T, T)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO import_runs (id, roster_source_id, format, status, expected_total, next_offset, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind("ir_2", "rs_tie", "csv", "committed", 1, 1, T, T)
+      .run();
+    // ir_2 sorts higher than ir_1, so `ORDER BY finished_at DESC, id DESC`
+    // makes ir_2 the winner despite the identical finished_at.
+    await env.DB.prepare(
+      "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind("re_tie_current", "rs_tie", "row-tie-1", "sha256:x", "Hopper Tie Current", null, "https://example.test", T, "{}", "ir_2", T, T)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind("re_tie_stale", "rs_tie", "row-tie-2", "sha256:x", "Hopper Tie Stale", null, "https://example.test", T, "{}", "ir_1", T, T)
+      .run();
+
+    const out = await searchPeople(ctx, { query: "Hopper Tie", scope: "roster" });
+    // Exactly one row per entry - the defect this CTE exists to avoid is the
+    // MAX(finished_at) form duplicating every roster row on a tie.
+    expect(out.roster_entries).toHaveLength(2);
+    const current = out.roster_entries.find((r) => r.id === "re_tie_current");
+    const stale = out.roster_entries.find((r) => r.id === "re_tie_stale");
+    expect(current?.stale).toBe(false);
+    expect(stale?.stale).toBe(true);
+  });
+
   it("carries promoted_person_id from DURABLE provenance, not a staged link", async () => {
     await seedRoster();
     const person = await createPerson(ctx, { full_name: "Grace Hopper", force: true });
@@ -336,6 +380,52 @@ describe("searchPeople", () => {
   it("rejects a cursor this server did not issue", async () => {
     try {
       await searchPeople(ctx, { query: "Kinsta", people_cursor: "garbage" });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("invalid_input");
+    }
+  });
+
+  it("rejects a roster cursor fed into people_cursor rather than silently resetting", async () => {
+    await env.DB.prepare(
+      "INSERT INTO roster_sources (id, source_key, label, event, url, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+    )
+      .bind("rs_c", "cross-2026", "Cross Source", "CROSS", "https://example.test", T)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO import_runs (id, roster_source_id, format, status, expected_total, next_offset, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind("ir_c", "rs_c", "csv", "committed", 1, 1, T, T)
+      .run();
+    for (let i = 0; i < 15; i++) {
+      await env.DB.prepare(
+        "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(`re_c_${i}`, "rs_c", `row-c-${i}`, "sha256:x", `Hopper Cross ${i}`, null, "https://example.test", T, "{}", "ir_c", T, T)
+        .run();
+    }
+    const rosterPage = await searchPeople(ctx, { query: "Hopper Cross", scope: "roster", limit: 10 });
+    expect(rosterPage.roster_next_cursor).toBeTruthy();
+    try {
+      await searchPeople(ctx, { query: "Kinsta", people_cursor: rosterPage.roster_next_cursor! });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("invalid_input");
+    }
+  });
+
+  it("rejects a people cursor fed into roster_cursor rather than silently resetting", async () => {
+    for (let i = 0; i < 15; i++) {
+      await createPerson(ctx, { full_name: `Tester Kinsta ${i}`, force: true });
+    }
+    const peoplePage = await searchPeople(ctx, { query: "Kinsta", limit: 5 });
+    expect(peoplePage.people_next_cursor).toBeTruthy();
+    try {
+      await searchPeople(ctx, {
+        query: "Hopper",
+        scope: "roster",
+        roster_cursor: peoplePage.people_next_cursor!,
+      });
       throw new Error("expected a refusal");
     } catch (e) {
       expect((e as ToolError).code).toBe("invalid_input");

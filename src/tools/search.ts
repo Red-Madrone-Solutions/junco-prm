@@ -214,8 +214,19 @@ export async function searchPeople(
 
   if (scope === "people" || scope === "all") {
     const decoded = decodeCursor(input.people_cursor) as
-      | { rank?: number; id?: string; prefix?: number }
+      | { kind?: string; rank?: number; id?: string; prefix?: number }
       | null;
+    if (decoded !== null && decoded.kind !== "people") {
+      // A cursor decodes fine but carries the WRONG ARRAY's keyset - most
+      // likely a roster cursor pasted into this field. Silently restarting at
+      // page 1 would hand back duplicate rows with nothing to signal it, so
+      // this is refused the same way a garbage cursor already is.
+      throw new ToolError(
+        "invalid_input",
+        "people_cursor is not a token this server issued for the people array",
+        "call the same tool again without a cursor to start from the first page"
+      );
+    }
     const after = decoded === null ? null : { ...decoded, prefix: decoded.prefix === 1 };
 
     // THE QUERY MODE IS DECIDED ONCE AND CARRIED IN THE CURSOR.
@@ -254,13 +265,27 @@ export async function searchPeople(
       // `prefix` travels with the position, so page two searches the same way
       // page one did.
       people_next_cursor = encodeCursor(
-        usePrefix ? { rank: last.rank, id: last.id, prefix: 1 } : { rank: last.rank, id: last.id }
+        usePrefix
+          ? { kind: "people", rank: last.rank, id: last.id, prefix: 1 }
+          : { kind: "people", rank: last.rank, id: last.id }
       );
     }
   }
 
   if (scope === "roster" || scope === "all") {
-    const after = decodeCursor(input.roster_cursor);
+    const decodedRoster = decodeCursor(input.roster_cursor) as
+      | { kind?: string; full_name?: string; id?: string }
+      | null;
+    if (decodedRoster !== null && decodedRoster.kind !== "roster") {
+      // Mirrors the people_cursor check above: a decodable cursor from the
+      // wrong array must not be treated as page 1 with no signal.
+      throw new ToolError(
+        "invalid_input",
+        "roster_cursor is not a token this server issued for the roster_entries array",
+        "call the same tool again without a cursor to start from the first page"
+      );
+    }
+    const after = decodedRoster;
     const like = likePattern(input.query);
 
     // Three things happen in this one statement, and each replaces something
@@ -284,8 +309,7 @@ export async function searchPeople(
     // index, because the leading '%' rules out a prefix seek. That is accepted
     // here - staged rows are disposable and few enough that the scan is
     // sub-millisecond - and migrations/0002 already names expression indexes as
-    // the fix if that ever stops being true. Those two indexes exist for other
-    // access patterns, not this one.
+    // the fix if that ever stops being true.
     const { results: rows } = await ctx.db
       .prepare(
         `WITH latest AS (
@@ -346,7 +370,7 @@ export async function searchPeople(
     }
     if (rows.length > limit) {
       const last = page[page.length - 1]!;
-      roster_next_cursor = encodeCursor({ full_name: last.full_name, id: last.id });
+      roster_next_cursor = encodeCursor({ kind: "roster", full_name: last.full_name, id: last.id });
     }
   }
 
