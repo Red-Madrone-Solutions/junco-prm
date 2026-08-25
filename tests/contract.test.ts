@@ -135,7 +135,14 @@ describe("tool registry", () => {
     ]);
   });
 
-  it("marks exactly the removing operations destructive", () => {
+  it("marks exactly the removing AND overwriting operations destructive", () => {
+    // MCP defines destructiveHint: false as "performs only additive updates",
+    // and the doc comment on ToolAnnotations says the same thing in its own
+    // words: an UPDATE counts, an INSERT does not. update_person overwrites
+    // `notes` and update_encounter overwrites `summary` - the previous text is
+    // gone and nothing retains it - so neither is additive. Both were annotated
+    // false, which let a client auto-approve destroying a note the user wrote.
+    // add_contact, add_link and add_tags are genuinely additive and stay false.
     const destructive = Object.values(TOOLS)
       .filter((t) => t.annotations.destructiveHint)
       .map((t) => t.name)
@@ -147,6 +154,8 @@ describe("tool registry", () => {
       "remove_contact",
       "remove_link",
       "remove_tags",
+      "update_encounter",
+      "update_person",
     ]);
   });
 

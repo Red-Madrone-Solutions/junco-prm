@@ -54,7 +54,11 @@ const READ: ToolAnnotations = {
   idempotentHint: true,
 };
 
-/** A write that adds or changes without removing, and is safe to replay. */
+/**
+ * A write that ADDS without removing or overwriting, and is safe to replay.
+ * A write that replaces a value a user wrote is DESTRUCTIVE by the rule above,
+ * whether or not it also deletes a row.
+ */
 const WRITE_IDEMPOTENT: ToolAnnotations = {
   readOnlyHint: false,
   destructiveHint: false,
@@ -260,7 +264,12 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       "update_person",
       "Update a person's scalar fields. Does not touch contacts, links, or tags; those have " +
         "their own tools.",
-      WRITE_IDEMPOTENT,
+      // DESTRUCTIVE, not WRITE_IDEMPOTENT, and the difference is what a client
+      // decides to run without asking. MCP defines destructiveHint: false as
+      // "performs only additive updates". This overwrites `notes` - standing
+      // facts the user wrote, gone with nothing retaining them - so a client
+      // told the call is additive can auto-approve destroying them.
+      DESTRUCTIVE,
       obj({ person_id: personId, ...personFields }, ["person_id"], { idempotent: true }),
       updatePerson
     ),
@@ -398,7 +407,9 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
     define(
       "update_encounter",
       "Correct a mis-logged encounter.",
-      WRITE_IDEMPOTENT,
+      // DESTRUCTIVE for the same reason as update_person: it overwrites
+      // `summary`, which is the whole content of the record.
+      DESTRUCTIVE,
       obj(
         {
           encounter_id: id("enc", "Encounter"),
