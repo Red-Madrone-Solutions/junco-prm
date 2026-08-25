@@ -1,4 +1,5 @@
 import type { ToolContext } from "../context";
+import { mintConfirmation, redeemConfirmation } from "../confirm";
 import { ToolError } from "../errors";
 import { assertId, newId } from "../ids";
 import { withIdempotency } from "../idempotency";
@@ -225,4 +226,174 @@ export async function getPerson(ctx: ToolContext, input: GetPersonInput): Promis
     encounter_count: 0,
     encounter_next_cursor: null,
   };
+}
+
+export interface ArchivePersonInput {
+  person_id: string;
+  idempotency_key?: string;
+}
+
+async function setArchived(
+  ctx: ToolContext,
+  input: ArchivePersonInput,
+  tool: string,
+  value: string | null
+): Promise<Person> {
+  const { idempotency_key, ...rest } = input;
+  const id = assertId("p", input.person_id);
+  return withIdempotency(
+    ctx,
+    tool,
+    idempotency_key,
+    rest,
+    async () => {
+      const result = await ctx.db
+        .prepare("UPDATE people SET archived_at = ?, updated_at = ? WHERE id = ?")
+        .bind(value, nowIso(ctx.clock), id)
+        .run();
+      if (result.meta.changes === 0) throw new ToolError("not_found", `no person with id ${id}`);
+      return loadPerson(ctx, id);
+    },
+    id
+  );
+}
+
+export function archivePerson(ctx: ToolContext, input: ArchivePersonInput): Promise<Person> {
+  return setArchived(ctx, input, "archive_person", nowIso(ctx.clock));
+}
+
+export function unarchivePerson(ctx: ToolContext, input: ArchivePersonInput): Promise<Person> {
+  return setArchived(ctx, input, "unarchive_person", null);
+}
+
+export interface DeletePreview {
+  person_id: string;
+  full_name: string;
+  encounter_count: number;
+  followup_count: number;
+  contact_count: number;
+}
+
+export type DeletePersonResult =
+  | { status: "confirmation_required"; confirmation_token: string; preview: DeletePreview }
+  | { status: "deleted"; deleted: DeletePreview };
+
+export interface DeletePersonInput {
+  person_id: string;
+  confirmation_token?: string;
+  idempotency_key?: string;
+}
+
+async function deletePreview(ctx: ToolContext, id: string): Promise<DeletePreview> {
+  const person = await loadPerson(ctx, id);
+  const counts = await ctx.db
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM person_contacts WHERE person_id = ?1) AS contacts,
+         (SELECT COUNT(*) FROM encounters WHERE person_id = ?1) AS encounters,
+         (SELECT COUNT(*) FROM followups WHERE person_id = ?1) AS followups`
+    )
+    .bind(id)
+    .first<{ contacts: number; encounters: number; followups: number }>();
+
+  return {
+    person_id: id,
+    full_name: person.full_name,
+    contact_count: counts?.contacts ?? 0,
+    encounter_count: counts?.encounters ?? 0,
+    followup_count: counts?.followups ?? 0,
+  };
+}
+
+export async function deletePerson(
+  ctx: ToolContext,
+  input: DeletePersonInput
+): Promise<DeletePersonResult> {
+  const id = assertId("p", input.person_id);
+
+  if (input.confirmation_token === undefined) {
+    const preview = await deletePreview(ctx, id);
+    const confirmation_token = await mintConfirmation(ctx, "delete_person", id, preview);
+    return { status: "confirmation_required", confirmation_token, preview };
+  }
+
+  const { idempotency_key, ...rest } = input;
+  return withIdempotency(ctx, "delete_person", idempotency_key, rest, async () => {
+      // Deliberately NOT passing `id` as the subjectId here (unlike every other
+      // person-scoped write in this module): the batch below purges
+      // `idempotency_keys WHERE subject_id = ?` for this same id as part of the
+      // erasure, and this very call's own in-flight claim row would be caught by
+      // that filter if it carried the same subject_id - deleting itself before
+      // the post-run UPDATE can record the response, and turning every retry of
+      // a confirmed delete into a fresh (and now-impossible) re-execution against
+      // an already-deleted person. Verified empirically while implementing this
+      // task: passing `id` here makes the "replays a confirmed delete" test fail.
+      // The preview is taken FIRST and handed to redeem, which refuses if it no
+      // longer matches what the token was minted from. Encounters logged between
+      // the two calls would otherwise be destroyed by a confirmation the human
+      // gave against a smaller number.
+      const preview = await deletePreview(ctx, id);
+      await redeemConfirmation(ctx, "delete_person", id, input.confirmation_token, preview);
+
+      // EVERY CHILD IS DELETED EXPLICITLY. This IS belt-and-braces over the
+      // ON DELETE CASCADE declarations in the migrations, and an earlier version
+      // of this comment claimed otherwise on a false premise.
+      //
+      // What that version said: SQLite documents that foreign key actions are
+      // unaffected by the recursive_triggers setting, therefore cascaded deletes
+      // may not fire the AFTER DELETE triggers maintaining the FTS indexes.
+      // The first half is a real sentence in the documentation. The inference is
+      // backwards - it means FK actions happen regardless of that setting, not
+      // that they skip triggers. Tested 2026-08-24 on SQLite 3.51 with
+      // foreign_keys=ON and recursive_triggers=OFF: a cascaded child delete DID
+      // remove its FTS row.
+      //
+      // The explicit deletes stay anyway, for three weaker but honest reasons.
+      // D1 runs its own SQLite build inside workerd and the test above was not
+      // run there. An explicit delete states the intent where someone reading
+      // this function can see it, rather than in a schema three files away. And
+      // this tool exists to satisfy erasure requests, where the cost of being
+      // wrong is a deleted person's text sitting in a search index indefinitely.
+      //
+      // The order is children first, parent last, and it is one batch so a
+      // partial delete cannot leave a person gone with her encounters indexed.
+      // THE TEST IN STEP 5b IS WHAT ACTUALLY GUARANTEES THE OUTCOME - not this
+      // comment, and not the cascades either.
+      await ctx.db.batch([
+        ctx.db.prepare("DELETE FROM encounters WHERE person_id = ?").bind(id),
+        ctx.db.prepare("DELETE FROM followups WHERE person_id = ?").bind(id),
+        ctx.db.prepare("DELETE FROM person_contacts WHERE person_id = ?").bind(id),
+        ctx.db.prepare("DELETE FROM person_links WHERE person_id = ?").bind(id),
+        ctx.db.prepare("DELETE FROM person_tags WHERE person_id = ?").bind(id),
+        ctx.db.prepare("DELETE FROM person_sources WHERE person_id = ?").bind(id),
+        ctx.db.prepare("DELETE FROM people WHERE id = ?").bind(id),
+
+        // THE OPERATIONAL TABLES ARE PART OF THE ERASURE, not housekeeping.
+        //
+        // `idempotency_keys.response_json` holds a full copy of whatever each
+        // write returned, which for most writes is a complete person record -
+        // name, notes, contacts, encounters. `confirmations.preview` holds the
+        // name and the counts shown in this very delete's preview call. Leaving
+        // either behind means `delete_person` removed the person from the tables
+        // a reader would look in, and left them in two a reader would not.
+        //
+        // This tool exists to answer a request to be erased. "We removed most of
+        // it" is not an answer to that request.
+        //
+        // `subject_id` alone is not enough: `create_person` cannot record it,
+        // because the id does not exist yet when its idempotency key is claimed
+        // (see the dedicated test for that in tests/people.test.ts) - so its
+        // stored response, a full copy of the freshly created person, sits
+        // under subject_id NULL forever. The OR clause below is the "whatever
+        // it is keyed on" half of the test in Step 5b: it also removes any
+        // response that simply contains this person's id, regardless of what
+        // subject_id (if any) it was filed under.
+        ctx.db
+          .prepare("DELETE FROM idempotency_keys WHERE subject_id = ? OR response_json LIKE ?")
+          .bind(id, `%"id":"${id}"%`),
+        ctx.db.prepare("DELETE FROM confirmations WHERE target_id = ?").bind(id),
+      ]);
+
+      return { status: "deleted", deleted: preview };
+  });
 }
