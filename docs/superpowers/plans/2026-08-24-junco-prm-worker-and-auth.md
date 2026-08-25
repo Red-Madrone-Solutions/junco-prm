@@ -819,8 +819,16 @@ describe("GET /health", () => {
       configured: boolean;
     };
     expect(body.status).toBe("ok");
-    // The migrations from plan 1 have been applied by the test harness.
-    expect(body.schema_version).toBe("0004_search.sql");
+    // THE EXPECTED VALUE IS INJECTED BY THIS TEST, not read from real migration
+    // state, and both earlier drafts of this assertion were wrong in different
+    // ways. The first hardcoded "0004_search.sql", which went stale the moment
+    // plan 1 grew past four migrations. The obvious repair - have the test query
+    // d1_migrations itself and compare - is CIRCULAR: it reads the same source
+    // the handler reads, so replacing the handler's query with a hardcoded
+    // "0008_committed_run.sql" would still pass. A marker name no real migration
+    // could produce cannot be matched by a hardcode coincidentally.
+    // Corrected 2026-08-25, found by executing this task and its review.
+    expect(body.schema_version).toBe("9999_marker_for_this_test.sql");
     expect(body.configured).toBe(true);
   });
 
@@ -863,10 +871,35 @@ describe("GET /health", () => {
     expect(body.configured).toBe(false);
   });
 
+  // DO NOT DROP A REAL TABLE HERE, and an earlier draft did exactly that.
+  //
+  // vitest.config.ts sets `isolate: false` with `maxWorkers: 1`, so every test
+  // file in a run shares ONE D1 instance. `DROP TABLE IF EXISTS d1_migrations`
+  // against env.DB left the bookkeeping table gone for every file that ran
+  // afterwards: each one's apply-migrations setup could no longer see which
+  // migrations had run, reapplied them against tables that already existed, and
+  // failed with "table people already exists". Measured: ELEVEN other suites
+  // broke. It is deterministic, not a flake, and it appears the first time
+  // anyone runs the suite.
+  //
+  // A stand-in binding reaches the same catch branch and touches nothing shared.
+  // Corrected 2026-08-25. This is the second isolate:false shared-D1 hazard in
+  // this project; plan 1 had one in a test file's cleanup ordering.
   it("reports a null schema version rather than failing when migrations have not run", async () => {
-    await env.DB.prepare("DROP TABLE IF EXISTS d1_migrations").run();
+    const broken = {
+      ...env,
+      DB: {
+        prepare() {
+          return {
+            first() {
+              throw new Error("no such table: d1_migrations");
+            },
+          };
+        },
+      },
+    } as unknown as Env;
     const { health } = await import("../src/health");
-    const body = (await (await health(env, "r1")).json()) as { schema_version: string | null };
+    const body = (await (await health(broken, "r1")).json()) as { schema_version: string | null };
     expect(body.schema_version).toBeNull();
   });
 });
