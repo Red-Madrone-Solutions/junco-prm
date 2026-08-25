@@ -2007,7 +2007,11 @@ return withIdempotency(ctx, "add_contact", idempotency_key, rest, async () => {
 }, personId);
 ```
 
-The tools this covers: `update_person`, `archive_person`, `unarchive_person`, `delete_person`, `add_contact`, `remove_contact`, `add_link`, `remove_link`, `add_tags`, `remove_tags`, `log_encounter`, `create_followup`, and `promote_roster_entry` once it knows which person it produced. `create_person` mints its id inside the closure and cannot pass one up front; it is the one exception, and it is safe because a person who has just been created has no prior stored responses to scrub.
+The tools this covers: `update_person`, `archive_person`, `unarchive_person`, `add_contact`, `remove_contact`, `add_link`, `remove_link`, `add_tags`, `remove_tags`, `log_encounter`, `create_followup`, and `promote_roster_entry` once it knows which person it produced. `create_person` mints its id inside the closure and cannot pass one up front; it is the one exception, and it is safe because a person who has just been created has no prior stored responses to scrub.
+
+`delete_person` is the SECOND exception, alongside `create_person`, and for the opposite reason. Its own batch purges `idempotency_keys WHERE subject_id = ?` for the person being erased. If its claim row carried that same subject_id, the delete would destroy its own in-flight claim mid-transaction: the post-run `UPDATE ... SET response_json` would then match no row, no replay record would exist, and a retry of a confirmed delete would re-execute against an already-deleted person and fail with `not_found` instead of replaying the original success. This was found by executing Task 8, not by reading the plan - passing the id there makes the "replays a confirmed delete" test fail. Task 16's contract test lists the tools it asserts and correctly does not include `delete_person`.
+
+The residual is real and is recorded for the final review: `delete_person`'s own row survives the erasure carrying the deleted person's name in `response_json`, under a NULL subject. It is one row, it is what the spec's retention window exists to reclaim, and it cannot be removed without breaking retry-replay of a delete - the two requirements are in genuine conflict and the conflict is a design question, not a patch.
 
 Tools that are not about one person - `import_roster`, `finalize_import`, `purge_roster_source` - pass nothing.
 
