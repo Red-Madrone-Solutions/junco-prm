@@ -3,7 +3,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
 import { newId } from "../src/ids";
-import { addContact, addLink, addTags, removeContact, removeTags } from "../src/tools/attributes";
+import {
+  addContact,
+  addLink,
+  addTags,
+  removeContact,
+  removeLink,
+  removeTags,
+} from "../src/tools/attributes";
 import { createPerson, getPerson } from "../src/tools/people";
 
 const ctx: ToolContext = {
@@ -159,6 +166,82 @@ describe("tags", () => {
     await addTags(ctx, { person_id: person.id, tags: ["wcus"] });
     const detail = await removeTags(ctx, { person_id: person.id, tags: ["  WCUS "] });
     expect(detail.tags).toEqual([]);
+  });
+});
+
+describe("subject_id", () => {
+  // Every person-scoped write must record the person id as subject_id, so a
+  // later delete_person can scrub the stored response. Task 7's first draft
+  // called withIdempotency without it on all six of these tools; this is the
+  // regression test for that fix.
+
+  async function subjectIdFor(key: string): Promise<string | null> {
+    const row = await env.DB
+      .prepare("SELECT subject_id FROM idempotency_keys WHERE key = ?")
+      .bind(key)
+      .first<{ subject_id: string | null }>();
+    return row?.subject_id ?? null;
+  }
+
+  it("addContact", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await addContact(ctx, {
+      person_id: person.id,
+      contact_type: "email",
+      value: "a@example.test",
+      idempotency_key: "k1",
+    });
+    expect(await subjectIdFor("add_contact:k1")).toBe(person.id);
+  });
+
+  it("removeContact", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const added = await addContact(ctx, {
+      person_id: person.id,
+      contact_type: "email",
+      value: "a@example.test",
+    });
+    const contact = added.contacts[0];
+    if (contact === undefined) throw new Error("addContact returned no contact");
+    await removeContact(ctx, { person_id: person.id, contact_id: contact.id, idempotency_key: "k1" });
+    expect(await subjectIdFor("remove_contact:k1")).toBe(person.id);
+  });
+
+  it("addLink", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await addLink(ctx, {
+      person_id: person.id,
+      link_type: "website",
+      url: "https://example.test",
+      idempotency_key: "k1",
+    });
+    expect(await subjectIdFor("add_link:k1")).toBe(person.id);
+  });
+
+  it("removeLink", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const added = await addLink(ctx, {
+      person_id: person.id,
+      link_type: "website",
+      url: "https://example.test",
+    });
+    const link = added.links[0];
+    if (link === undefined) throw new Error("addLink returned no link");
+    await removeLink(ctx, { person_id: person.id, link_id: link.id, idempotency_key: "k1" });
+    expect(await subjectIdFor("remove_link:k1")).toBe(person.id);
+  });
+
+  it("addTags", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await addTags(ctx, { person_id: person.id, tags: ["wcus"], idempotency_key: "k1" });
+    expect(await subjectIdFor("add_tags:k1")).toBe(person.id);
+  });
+
+  it("removeTags", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await addTags(ctx, { person_id: person.id, tags: ["wcus"] });
+    await removeTags(ctx, { person_id: person.id, tags: ["wcus"], idempotency_key: "k1" });
+    expect(await subjectIdFor("remove_tags:k1")).toBe(person.id);
   });
 });
 
