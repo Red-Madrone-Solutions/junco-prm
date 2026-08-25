@@ -32,6 +32,80 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM confirmations").run();
 });
 
+/**
+ * Ties `finished_at` between two committed runs, with run1 inserted FIRST but
+ * carrying an id that sorts AFTER run2's. Under the wrong tiebreak (`id DESC`)
+ * run1 wins on every run of the test, not by chance; under `rowid DESC`, which
+ * tracks insertion order, run2 wins. Both roster rows are committed by run2, so
+ * the baseline the query picks changes the answer rather than just the counts'
+ * distribution.
+ *
+ * The same shape is asserted through `searchPeople` in import-finalize.test.ts.
+ * It is repeated here because the two `roster_admin.ts` queries were reached by
+ * nothing at all: reverting the tiebreak in both of them while leaving
+ * `search.ts` correct passed the whole suite, five runs out of five. They share
+ * one constant now, and this covers them directly as well.
+ */
+async function seedTiedRuns(): Promise<{ run1Id: string; run2Id: string }> {
+  const FIXED = "2026-08-20T12:00:00.000Z";
+  const run1Id = "ir_zzzzzzzz-0000-0000-0000-000000000001";
+  const run2Id = "ir_00000000-0000-0000-0000-000000000002";
+
+  await env.DB.prepare(
+    "INSERT INTO roster_sources (id, source_key, label, event, url, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+  )
+    .bind("rs_tie", "tie", "Tie", "Tie", "https://example.test", FIXED)
+    .run();
+
+  for (const runId of [run1Id, run2Id]) {
+    await env.DB.prepare(
+      `INSERT INTO import_runs
+         (id, roster_source_id, format, status, expected_total, started_at, finished_at)
+       VALUES (?, ?, 'json', 'committed', 2, ?, ?)`
+    )
+      .bind(runId, "rs_tie", FIXED, FIXED)
+      .run();
+  }
+
+  // Both rows were re-seen and committed by run2, the later-inserted run.
+  for (const [id, key, name] of [
+    ["re_11111111-1111-1111-1111-111111111111", "k:1", "Tie Ada"],
+    ["re_22222222-2222-2222-2222-222222222222", "k:2", "Tie Grace"],
+  ]) {
+    await env.DB.prepare(
+      `INSERT INTO roster_entries
+         (id, roster_source_id, external_row_key, content_hash, full_name, source_url,
+          source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(id, "rs_tie", key, "sha256:tie", name, "https://example.test", FIXED, "{}",
+            run2Id, run2Id, FIXED, FIXED)
+      .run();
+  }
+
+  return { run1Id, run2Id };
+}
+
+describe("the latest-committed-run baseline, through roster_admin", () => {
+  it("listRosterSources breaks a finished_at tie by insertion order", async () => {
+    await seedTiedRuns();
+    const { sources } = await listRosterSources(ctx);
+    const tie = sources.find((s) => s.source_key === "tie");
+    // Baseline run2: both rows were committed by it, so both read current.
+    // Baseline run1 (the wrong tiebreak): both read stale.
+    expect(tie?.current_count).toBe(2);
+    expect(tie?.stale_count).toBe(0);
+  });
+
+  it("getRosterEntry breaks the same tie the same way", async () => {
+    await seedTiedRuns();
+    const entry = await getRosterEntry(ctx, {
+      roster_entry_id: "re_11111111-1111-1111-1111-111111111111",
+    });
+    expect(entry.stale).toBe(false);
+  });
+});
+
 describe("listRosterSources", () => {
   it("reports entry counts and how many have been promoted", async () => {
     const run = await importRoster(ctx, {

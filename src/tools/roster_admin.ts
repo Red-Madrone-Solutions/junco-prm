@@ -4,6 +4,7 @@ import { ToolError } from "../errors";
 import { assertId } from "../ids";
 import { withIdempotency } from "../idempotency";
 import { nowIso } from "../time";
+import { LATEST_COMMITTED_RUN_CTE } from "./latest_run";
 
 export interface RosterSourceSummary {
   id: string;
@@ -50,18 +51,7 @@ export async function listRosterSources(
 ): Promise<{ sources: RosterSourceSummary[] }> {
   const { results } = await ctx.db
     .prepare(
-      `WITH latest AS (
-         -- EXACTLY ONE ROW PER SOURCE. The tiebreak is rowid DESC, not id DESC:
-         -- import_runs.id is "ir_" followed by crypto.randomUUID(), so ordering
-         -- by it breaks a finished_at tie by comparing two random UUIDs. See
-         -- the identical CTE in src/tools/search.ts.
-         SELECT roster_source_id, run_id, finished_at FROM (
-           SELECT roster_source_id, id AS run_id, finished_at,
-                  ROW_NUMBER() OVER (PARTITION BY roster_source_id
-                                     ORDER BY finished_at DESC, rowid DESC) AS rn
-             FROM import_runs WHERE status = 'committed'
-         ) WHERE rn = 1
-       )
+      `WITH ${LATEST_COMMITTED_RUN_CTE}
        SELECT rs.id AS id, rs.source_key AS source_key, rs.label AS label,
               rs.event AS event, rs.url AS url, rs.purged_at AS purged_at,
               (SELECT COUNT(*) FROM roster_entries re
@@ -132,14 +122,7 @@ export async function getRosterEntry(
 
   const row = await ctx.db
     .prepare(
-      `WITH latest AS (
-         SELECT roster_source_id, run_id, finished_at FROM (
-           SELECT roster_source_id, id AS run_id, finished_at,
-                  ROW_NUMBER() OVER (PARTITION BY roster_source_id
-                                     ORDER BY finished_at DESC, rowid DESC) AS rn
-             FROM import_runs WHERE status = 'committed'
-         ) WHERE rn = 1
-       )
+      `WITH ${LATEST_COMMITTED_RUN_CTE}
        SELECT re.id AS id, rs.source_key AS source_key, rs.label AS source_label,
               rs.event AS source_event, re.external_row_key AS external_row_key,
               re.full_name AS full_name, re.preferred_name AS preferred_name,
