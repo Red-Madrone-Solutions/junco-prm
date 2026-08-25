@@ -63,9 +63,15 @@ describe("tool registry", () => {
     }
   });
 
-  it("names every tool consistently with its registry key", () => {
-    for (const [key, tool] of Object.entries(TOOLS)) {
-      expect(tool.name).toBe(key);
+  it("gives every tool a real description", () => {
+    // `tool.name` is not checked against its registry key here: TOOLS is built
+    // by `.map((tool) => [tool.name, tool])` (src/tools/index.ts), so the key
+    // is derived from `tool.name` itself and the two can never disagree - that
+    // would be vacuous. A `define(...)` call given the wrong name is instead
+    // caught by "exposes exactly the expected tools, in both directions"
+    // above, which compares TOOLS against EXPECTED, a hardcoded, independent
+    // list.
+    for (const tool of Object.values(TOOLS)) {
       expect(tool.description.length).toBeGreaterThan(10);
     }
   });
