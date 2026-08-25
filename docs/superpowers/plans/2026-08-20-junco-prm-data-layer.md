@@ -1640,7 +1640,11 @@ describe("staged schema", () => {
     // EVERY run tied on finished_at, and the LEFT JOIN then duplicates every
     // roster row. That is not hypothetical here: every test in this plan uses a
     // frozen clock, so two runs finalized in one test have byte-identical
-    // timestamps. `id DESC` breaks the tie deterministically.
+    // timestamps. A tiebreak is REQUIRED. This test's ids are hand-seeded and
+    // ordered, so `id DESC` works HERE - but production ids are `ir_` plus a
+    // random UUID, so `id DESC` is a COIN FLIP, not a tiebreak. Every query
+    // that selects a latest run orders by `rowid DESC` for that reason. See
+    // Task 13b, 2026-08-25.
     //
     // CASE WHEN, not `<>`. A bare `<>` against an empty subquery yields SQL
     // NULL, so "no completed run" silently becomes three-valued logic instead
@@ -5337,7 +5341,7 @@ export async function searchPeople(
            SELECT roster_source_id, run_id, finished_at FROM (
              SELECT roster_source_id, id AS run_id, finished_at,
                     ROW_NUMBER() OVER (PARTITION BY roster_source_id
-                                       ORDER BY finished_at DESC, id DESC) AS rn
+                                       ORDER BY finished_at DESC, rowid DESC) AS rn
                FROM import_runs WHERE status = 'committed'
            ) WHERE rn = 1
          )
@@ -5348,7 +5352,7 @@ export async function searchPeople(
                     AND ps.external_row_key = re.external_row_key
                   LIMIT 1) AS promoted_person_id,
                 CASE WHEN l.run_id IS NULL THEN NULL
-                     WHEN re.last_seen_run_id = l.run_id THEN 0
+                     WHEN re.committed_run_id = l.run_id THEN 0
                      ELSE 1 END AS stale,
                 l.finished_at AS source_last_imported_at
            FROM roster_entries re
@@ -8708,7 +8712,7 @@ export async function loadPersonSources(ctx: ToolContext, personId: string): Pro
                 LIMIT 1) AS matches_current
          FROM person_sources ps
         WHERE ps.person_id = ?
-        ORDER BY ps.promoted_at`
+        ORDER BY ps.promoted_at, ps.id`
     )
     .bind(personId)
     .all<Omit<Source, "matches_current"> & { matches_current: number | null }>();
@@ -9393,7 +9397,7 @@ describe("getRosterEntry", () => {
     expect(entry.email).toBe("ada@example.test");
     expect(entry.source_key).toBe("wcus-2026");
     expect(entry.source_label).toBe("WCUS 2026");
-    expect(entry.external_row_key).toBe("1");
+    expect(entry.external_row_key).toBe("k:1");
     expect(entry.stale).toBe(false);
     expect(entry.promoted_person_id).toBeNull();
   });
@@ -9694,7 +9698,7 @@ export async function listRosterSources(
          SELECT roster_source_id, run_id, finished_at FROM (
            SELECT roster_source_id, id AS run_id, finished_at,
                   ROW_NUMBER() OVER (PARTITION BY roster_source_id
-                                     ORDER BY finished_at DESC, id DESC) AS rn
+                                     ORDER BY finished_at DESC, rowid DESC) AS rn
              FROM import_runs WHERE status = 'committed'
          ) WHERE rn = 1
        )
@@ -9705,11 +9709,12 @@ export async function listRosterSources(
               (SELECT COUNT(*) FROM roster_entries re
                 WHERE re.roster_source_id = rs.id
                   AND l.run_id IS NOT NULL
-                  AND re.last_seen_run_id = l.run_id) AS current_count,
+                  AND re.committed_run_id = l.run_id) AS current_count,
               (SELECT COUNT(*) FROM roster_entries re
                 WHERE re.roster_source_id = rs.id
                   AND l.run_id IS NOT NULL
-                  AND re.last_seen_run_id <> l.run_id) AS stale_count,
+                  AND (re.committed_run_id IS NULL
+                    OR re.committed_run_id <> l.run_id)) AS stale_count,
               (SELECT COUNT(*) FROM roster_entries re
                 WHERE re.roster_source_id = rs.id
                   AND EXISTS (SELECT 1 FROM person_sources ps
@@ -9718,7 +9723,7 @@ export async function listRosterSources(
               l.finished_at AS last_imported_at
          FROM roster_sources rs
          LEFT JOIN latest l ON l.roster_source_id = rs.id
-        ORDER BY rs.created_at DESC`
+        ORDER BY rs.created_at DESC, rs.id DESC`
     )
     .all<Omit<RosterSourceSummary, "record_kind">>();
 
@@ -9773,7 +9778,7 @@ export async function getRosterEntry(
          SELECT roster_source_id, run_id, finished_at FROM (
            SELECT roster_source_id, id AS run_id, finished_at,
                   ROW_NUMBER() OVER (PARTITION BY roster_source_id
-                                     ORDER BY finished_at DESC, id DESC) AS rn
+                                     ORDER BY finished_at DESC, rowid DESC) AS rn
              FROM import_runs WHERE status = 'committed'
          ) WHERE rn = 1
        )
@@ -9785,7 +9790,7 @@ export async function getRosterEntry(
               re.source_captured_at AS source_captured_at,
               re.created_at AS created_at, re.updated_at AS updated_at,
               CASE WHEN l.run_id IS NULL THEN NULL
-                   WHEN re.last_seen_run_id = l.run_id THEN 0
+                   WHEN re.committed_run_id = l.run_id THEN 0
                    ELSE 1 END AS stale,
               l.finished_at AS source_last_imported_at,
               (SELECT ps.person_id FROM person_sources ps
