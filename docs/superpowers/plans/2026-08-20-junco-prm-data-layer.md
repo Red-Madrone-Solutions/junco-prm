@@ -8065,7 +8065,7 @@ describe("finalizeImport", () => {
     await env.DB.prepare(
       "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind("ps_1", "p_1", "wcus-2026", "1", "WordCamp US 2026", "WCUS 2026",
+      .bind("ps_1", "p_1", "wcus-2026", "k:1", "WordCamp US 2026", "WCUS 2026",
             "https://example.test/attendees", "2026-08-20T12:00:00.000Z", "{}", "sha256:x",
             "2026-08-20T12:00:00.000Z")
       .run();
@@ -8194,8 +8194,8 @@ export async function finalizeImport(
     const counts = await ctx.db
       .prepare(
         `SELECT COUNT(*) AS total,
-                SUM(CASE WHEN e.last_seen_run_id = ?1 THEN 1 ELSE 0 END) AS current,
-                SUM(CASE WHEN e.last_seen_run_id <> ?1 THEN 1 ELSE 0 END) AS stale,
+                SUM(CASE WHEN e.committed_run_id = ?1 THEN 1 ELSE 0 END) AS current,
+                SUM(CASE WHEN e.committed_run_id IS NULL OR e.committed_run_id <> ?1 THEN 1 ELSE 0 END) AS stale,
                 SUM(CASE WHEN EXISTS (
                       SELECT 1 FROM person_sources ps
                        WHERE ps.source_key = ?3 AND ps.external_row_key = e.external_row_key
@@ -8222,6 +8222,8 @@ export async function finalizeImport(
 `SUM(CASE WHEN ...)` returns null rather than zero over an empty set, which is why every count is coalesced on the way out. It is one of those SQLite behaviors that produces a plausible-looking `null` in a response body rather than an error, and the "finalizes a run that has not reached its expected_total" test is the one that would catch it.
 
 The `promoted` subquery joins on `(source_key, external_row_key)` and not on any staged link, for the same reason everything else in this plan does: that join survives a purge and a re-import a year later.
+
+**The current/stale comparison reads `committed_run_id`, never `last_seen_run_id`, and an earlier draft of this sample had it wrong.** `last_seen_run_id` moves on every write including a write by an open run that is never finalized, so comparing against it directly inverts the annotation for exactly the rows that matter: an abandoned run's touched rows read stale and the rows it omitted read current. `committed_run_id` is promoted from `last_seen_run_id` only by `finalizeImport`, inside the same batch that marks the run committed, and NULL reads as stale because no completed run has ever confirmed the row. See migration `0008_committed_run.sql`. Corrected 2026-08-25 after Task 12c's implementer found the shipped code already right and this sample wrong, and the task reviewer confirmed it against `src/tools/import.ts:438-440`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
