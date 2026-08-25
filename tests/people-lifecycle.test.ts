@@ -189,4 +189,58 @@ describe("deletePerson", () => {
       .first<{ n: number }>();
     expect(remaining?.n).toBe(0);
   });
+
+  it("does not touch an unrelated person's idempotency row just because that person's id appears nested inside it", async () => {
+    // B's create_person response legitimately carries A as a weak duplicate
+    // candidate (same full_name, no other matching fields), so `A.id` sits
+    // nested inside B's stored response_json under `possible_duplicates`.
+    // Deleting A must not delete B's row: B still exists, and a client
+    // retrying B's create with the same idempotency_key must still replay B
+    // rather than mint a second person.
+    const a = await createPerson(ctx, { full_name: "Ada Lovelace" });
+    const b = await createPerson(ctx, {
+      full_name: "Ada Lovelace",
+      idempotency_key: "k-create-b",
+    });
+
+    const first = await deletePerson(ctx, { person_id: a.id });
+    if (first.status !== "confirmation_required") throw new Error("unreachable");
+    await deletePerson(ctx, { person_id: a.id, confirmation_token: first.confirmation_token });
+
+    const row = await env.DB
+      .prepare("SELECT response_json FROM idempotency_keys WHERE key = ?")
+      .bind("create_person:k-create-b")
+      .first<{ response_json: string | null }>();
+    expect(row).not.toBeNull();
+
+    const replayed = await createPerson(ctx, {
+      full_name: "Ada Lovelace",
+      idempotency_key: "k-create-b",
+    });
+    expect(replayed.id).toBe(b.id);
+
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM people").first<{ n: number }>();
+    expect(count?.n).toBe(1);
+  });
+
+  it("refuses a stale confirmation when the person's data changed after the preview", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const first = await deletePerson(ctx, { person_id: person.id });
+    if (first.status !== "confirmation_required") throw new Error("unreachable");
+
+    await addContact(ctx, {
+      person_id: person.id,
+      contact_type: "email",
+      value: "ada@example.test",
+    });
+
+    await expect(
+      deletePerson(ctx, { person_id: person.id, confirmation_token: first.confirmation_token })
+    ).rejects.toThrow(ToolError);
+
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM people WHERE id = ?")
+      .bind(person.id)
+      .first<{ n: number }>();
+    expect(row?.n).toBe(1);
+  });
 });

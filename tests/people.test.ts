@@ -222,13 +222,13 @@ describe("createPerson", () => {
     expect(row?.n).toBe(1);
   });
 
-  it("records no subject_id, because the id does not exist until after the duplicate check runs", async () => {
-    await createPerson(ctx, { full_name: "Ada Lovelace", idempotency_key: "k1" });
+  it("backfills subject_id to the created person's id once run() returns", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada Lovelace", idempotency_key: "k1" });
     const row = await env.DB
       .prepare("SELECT subject_id FROM idempotency_keys WHERE key = ?")
       .bind("create_person:k1")
       .first<{ subject_id: string | null }>();
-    expect(row?.subject_id).toBeNull();
+    expect(row?.subject_id).toBe(person.id);
   });
 });
 

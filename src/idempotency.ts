@@ -24,7 +24,20 @@ export async function withIdempotency<T>(
    * Every tool taking a `person_id` passes it. Tools that are not about one
    * person - import, finalize, purge - pass nothing.
    */
-  subjectId?: string
+  subjectId?: string,
+  /**
+   * For a write that MINTS the id it is about - `create_person` is the only
+   * one - there is no `person_id` to pass as `subjectId` above, because it
+   * does not exist until `run()` returns. Without a way to record it after
+   * the fact, `create_person`'s stored response - a full copy of the person,
+   * same as any other write's - sits under subject_id NULL forever, and
+   * `delete_person`'s scrub can never reach it by id.
+   *
+   * Called once, after `run()` succeeds, with its result. Only the
+   * newly-minted case needs this: everything else already has its subject
+   * before the call and passes it as `subjectId` instead.
+   */
+  subjectFromResult?: (result: T) => string | undefined
 ): Promise<T> {
   if (!key) return run();
 
@@ -76,9 +89,12 @@ export async function withIdempotency<T>(
     throw error;
   }
 
+  const finalSubject = subjectId ?? subjectFromResult?.(result) ?? null;
   await ctx.db
-    .prepare("UPDATE idempotency_keys SET response_json = ?, completed_at = ? WHERE key = ?")
-    .bind(JSON.stringify(result), nowIso(ctx.clock), scoped)
+    .prepare(
+      "UPDATE idempotency_keys SET response_json = ?, completed_at = ?, subject_id = ? WHERE key = ?"
+    )
+    .bind(JSON.stringify(result), nowIso(ctx.clock), finalSubject, scoped)
     .run();
 
   return result;

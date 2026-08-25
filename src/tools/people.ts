@@ -60,7 +60,12 @@ export async function createPerson(
   input: CreatePersonInput
 ): Promise<Person & { possible_duplicates?: DuplicateCandidate[] }> {
   const { idempotency_key, ...rest } = input;
-  return withIdempotency(ctx, "create_person", idempotency_key, rest, async () => {
+  return withIdempotency(
+    ctx,
+    "create_person",
+    idempotency_key,
+    rest,
+    async () => {
     const full_name = requireName(input.full_name);
 
     // The duplicate check runs BEFORE the insert and before the id is minted.
@@ -128,7 +133,12 @@ export async function createPerson(
     // can call delete_person and promote_roster_entry instead. That is strictly
     // more information than it had, and it costs one optional field.
     return candidates.length > 0 ? { ...person, possible_duplicates: candidates } : person;
-  });
+    },
+    // No subjectId: the id does not exist yet at this point, which is exactly
+    // what subjectFromResult below is for.
+    undefined,
+    (person) => person.id
+  );
 }
 
 export interface UpdatePersonInput extends Partial<Record<Writable, string | null>> {
@@ -379,18 +389,7 @@ export async function deletePerson(
         //
         // This tool exists to answer a request to be erased. "We removed most of
         // it" is not an answer to that request.
-        //
-        // `subject_id` alone is not enough: `create_person` cannot record it,
-        // because the id does not exist yet when its idempotency key is claimed
-        // (see the dedicated test for that in tests/people.test.ts) - so its
-        // stored response, a full copy of the freshly created person, sits
-        // under subject_id NULL forever. The OR clause below is the "whatever
-        // it is keyed on" half of the test in Step 5b: it also removes any
-        // response that simply contains this person's id, regardless of what
-        // subject_id (if any) it was filed under.
-        ctx.db
-          .prepare("DELETE FROM idempotency_keys WHERE subject_id = ? OR response_json LIKE ?")
-          .bind(id, `%"id":"${id}"%`),
+        ctx.db.prepare("DELETE FROM idempotency_keys WHERE subject_id = ?").bind(id),
         ctx.db.prepare("DELETE FROM confirmations WHERE target_id = ?").bind(id),
       ]);
 
