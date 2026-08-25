@@ -2,7 +2,7 @@ import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { assertId, newId } from "../ids";
 import { withIdempotency } from "../idempotency";
-import { isLocalDate, localDate, nowIso } from "../time";
+import { isIsoInstant, isLocalDate, localDate, nowIso } from "../time";
 import type { Encounter, PersonDetail } from "../types";
 import { loadEncounter } from "./encounters_read";
 import { getPerson, loadPerson } from "./people";
@@ -26,6 +26,14 @@ function resolveOccurredOn(ctx: ToolContext, value: unknown): string {
   if (value === undefined || value === null) return localDate(ctx.timezone, ctx.clock());
   if (!isLocalDate(value)) {
     throw new ToolError("invalid_input", "occurred_on must be a YYYY-MM-DD local date");
+  }
+  return value;
+}
+
+function resolveOccurredAt(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (!isIsoInstant(value)) {
+    throw new ToolError("invalid_input", "occurred_at must be an ISO-8601 UTC instant");
   }
   return value;
 }
@@ -71,7 +79,7 @@ export async function logEncounter(
           id,
           personId,
           occurredOn,
-          input.occurred_at ?? null,
+          resolveOccurredAt(input.occurred_at),
           input.location ?? null,
           input.event ?? null,
           summary,
@@ -93,6 +101,7 @@ export interface UpdateEncounterInput {
   encounter_id: string;
   summary?: string;
   occurred_on?: string;
+  occurred_at?: string | null;
   location?: string | null;
   event?: string | null;
   idempotency_key?: string;
@@ -120,6 +129,10 @@ export async function updateEncounter(
       if ("occurred_on" in input) {
         sets.push("occurred_on = ?");
         values.push(resolveOccurredOn(ctx, input.occurred_on));
+      }
+      if ("occurred_at" in input) {
+        sets.push("occurred_at = ?");
+        values.push(resolveOccurredAt(input.occurred_at));
       }
       if ("location" in input) {
         sets.push("location = ?");

@@ -80,6 +80,23 @@ describe("logEncounter", () => {
       logEncounter(ctx, { person_id: person.id, summary: "met", occurred_on: "2026-08-15T00:00:00Z" })
     ).rejects.toThrow(ToolError);
   });
+
+  it("accepts an explicit occurred_at ISO-8601 UTC instant", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const { encounter } = await logEncounter(ctx, {
+      person_id: person.id,
+      summary: "met",
+      occurred_at: "2026-08-15T18:30:00Z",
+    });
+    expect(encounter.occurred_at).toBe("2026-08-15T18:30:00Z");
+  });
+
+  it("rejects an occurred_at that is a local date rather than an instant", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await expect(
+      logEncounter(ctx, { person_id: person.id, summary: "met", occurred_at: "2026-08-15" })
+    ).rejects.toThrow(ToolError);
+  });
 });
 
 describe("updateEncounter", () => {
@@ -93,6 +110,24 @@ describe("updateEncounter", () => {
   it("rejects an unknown encounter", async () => {
     await expect(
       updateEncounter(ctx, { encounter_id: newId("enc"), summary: "x" })
+    ).rejects.toThrow(ToolError);
+  });
+
+  it("corrects occurred_at", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const { encounter } = await logEncounter(ctx, { person_id: person.id, summary: "met" });
+    const fixed = await updateEncounter(ctx, {
+      encounter_id: encounter.id,
+      occurred_at: "2026-08-15T18:30:00Z",
+    });
+    expect(fixed.occurred_at).toBe("2026-08-15T18:30:00Z");
+  });
+
+  it("rejects an occurred_at that is a local date rather than an instant", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const { encounter } = await logEncounter(ctx, { person_id: person.id, summary: "met" });
+    await expect(
+      updateEncounter(ctx, { encounter_id: encounter.id, occurred_at: "2026-08-15" })
     ).rejects.toThrow(ToolError);
   });
 });
@@ -155,25 +190,72 @@ describe("listEncounters", () => {
     expect(seen).toEqual(["n5", "n4", "n3", "n2", "n1"]);
   });
 
-  it("paginates correctly when several encounters share one date", async () => {
+  it("orders rows sharing one date by id ascending across pages, not by insertion order", async () => {
+    // Ids are random UUIDs, unrelated to insertion order, so the only way this
+    // test can pass by accident is if SQLite's default scan order happens to
+    // match - which is exactly what let a broken build with no `id ASC`
+    // tiebreak pass a weaker version of this test that checked set membership
+    // only. Sorting the actually-issued ids ourselves and comparing against
+    // that order is what makes a missing tiebreak fail here: the only way the
+    // walk can produce this exact sequence is if the query itself is sorting
+    // by id.
     const person = await createPerson(ctx, { full_name: "Ada" });
+    const logged = [];
     for (let i = 1; i <= 4; i++) {
-      await logEncounter(ctx, {
+      const { encounter } = await logEncounter(ctx, {
         person_id: person.id,
         summary: `same${i}`,
         occurred_on: "2026-08-01",
       });
+      logged.push(encounter);
     }
+    const expected = [...logged].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map((e) => e.summary);
 
     const seen: string[] = [];
     let cursor: string | undefined;
     do {
-      const page = await listEncounters(ctx, { person_id: person.id, limit: 2, cursor });
+      // limit: 1 forces four separate pages, so the tiebreak has to hold at
+      // every cursor boundary, not just within one page's ORDER BY.
+      const page = await listEncounters(ctx, { person_id: person.id, limit: 1, cursor });
       seen.push(...page.results.map((e) => e.summary));
       cursor = page.next_cursor ?? undefined;
     } while (cursor !== undefined);
 
-    expect(seen).toHaveLength(4);
-    expect(new Set(seen).size).toBe(4);
+    expect(seen).toEqual(expected);
+  });
+});
+
+describe("subject_id", () => {
+  // Every person-scoped write must record the person id as subject_id, so a
+  // later delete_person can scrub the stored response. logEncounter passes
+  // personId directly; updateEncounter and deleteEncounter can only learn it
+  // via the subjectFromResult callback, which is unexercised without this.
+
+  async function subjectIdFor(key: string): Promise<string | null> {
+    const row = await env.DB
+      .prepare("SELECT subject_id FROM idempotency_keys WHERE key = ?")
+      .bind(key)
+      .first<{ subject_id: string | null }>();
+    return row?.subject_id ?? null;
+  }
+
+  it("logEncounter", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await logEncounter(ctx, { person_id: person.id, summary: "met", idempotency_key: "k1" });
+    expect(await subjectIdFor("log_encounter:k1")).toBe(person.id);
+  });
+
+  it("updateEncounter", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const { encounter } = await logEncounter(ctx, { person_id: person.id, summary: "met" });
+    await updateEncounter(ctx, { encounter_id: encounter.id, summary: "fixed", idempotency_key: "k1" });
+    expect(await subjectIdFor("update_encounter:k1")).toBe(person.id);
+  });
+
+  it("deleteEncounter", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const { encounter } = await logEncounter(ctx, { person_id: person.id, summary: "met" });
+    await deleteEncounter(ctx, { encounter_id: encounter.id, idempotency_key: "k1" });
+    expect(await subjectIdFor("delete_encounter:k1")).toBe(person.id);
   });
 });

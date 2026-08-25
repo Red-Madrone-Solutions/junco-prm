@@ -38,3 +38,11 @@ export function isLocalDate(value: unknown): value is string {
   const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
   return d <= lastDay;
 }
+
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+
+export function isIsoInstant(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (!ISO_INSTANT.test(value)) return false;
+  return !Number.isNaN(Date.parse(value));
+}
