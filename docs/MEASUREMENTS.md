@@ -128,8 +128,9 @@ reasons are now weaker and stated as such - D1 runs its own SQLite build inside
 workerd and this was not tested there, and an explicit delete states intent at
 the call site. Plan 1 Task 8 Step 5c records what to check against D1 itself.
 
-**Still not established:** whether D1's build behaves the same way. Nobody has
-run this inside workerd, and Task 8 Step 5c now asks the implementer to.
+**Still not established here:** whether D1's build behaves the same way.
+Nobody had run this inside workerd yet. See the fourth run below, from
+Task 10 Step 7c, which checks it.
 
 ---
 
@@ -219,6 +220,35 @@ model behavior rather than a measured platform limit, and this file should not
 pretend otherwise. The number is unchanged; the reason it is that number is
 entirely different, and a future reader raising it should be arguing about tool
 call size rather than about Cloudflare.
+
+---
+
+## Run of 2026-08-24, fourth: D1's own SQLite build, cascades and FTS triggers
+
+Task 10 Step 7c. Run against `tests/people-lifecycle.test.ts`'s hard-delete FTS
+test (extended in Task 10 to also seed and check an encounter) via
+`@cloudflare/vitest-pool-workers`, which runs the test inside workerd against
+D1's own SQLite build - not the local SQLite 3.51 used for the second run
+above.
+
+**Method:** the explicit `DELETE FROM encounters WHERE person_id = ?` in
+`delete_person` was commented out, leaving only the `ON DELETE CASCADE` on
+`encounters.person_id`, and the extended test was run against that.
+
+**The observation: it passed.** The cascade alone removed the encounter, and
+the `encounters_fts_ad` trigger fired and removed its FTS row - same outcome
+as the second run's local SQLite test. D1's build, at least as exposed through
+this test harness, does not diverge from stock SQLite on this point.
+
+**What did not change:** the explicit delete was restored immediately after
+this measurement, per Task 10 Step 7c's instruction not to treat a pass as a
+reason to remove it. It is now measured as defense in depth on both SQLite
+builds available to check, rather than on local SQLite alone.
+
+**Caveat:** `vitest-pool-workers` is Cloudflare's own test harness for D1 and
+is the closest thing to "inside workerd" available without a real deploy, but
+it is still not a production D1 database on Cloudflare's network. Whether a
+deployed D1 instance behaves identically remains unconfirmed.
 
 ---
 

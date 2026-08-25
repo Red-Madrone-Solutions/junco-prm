@@ -6,6 +6,7 @@ import { withIdempotency } from "../idempotency";
 import { nowIso } from "../time";
 import type { Person, PersonDetail } from "../types";
 import { loadContacts, loadLinks, loadTags } from "./attributes_read";
+import { loadRecentEncounters } from "./encounters_read";
 
 export type { Person, PersonDetail } from "../types";
 
@@ -225,6 +226,12 @@ export async function getPerson(ctx: ToolContext, input: GetPersonInput): Promis
     loadLinks(ctx, id),
     loadTags(ctx, id),
   ]);
+  const encounters = await loadRecentEncounters(
+    ctx,
+    id,
+    input.encounter_limit ?? 10,
+    input.encounter_cursor
+  );
   return {
     ...person,
     contacts,
@@ -232,9 +239,9 @@ export async function getPerson(ctx: ToolContext, input: GetPersonInput): Promis
     tags,
     sources: [],
     open_followups: [],
-    recent_encounters: [],
-    encounter_count: 0,
-    encounter_next_cursor: null,
+    recent_encounters: encounters.results,
+    encounter_count: encounters.total,
+    encounter_next_cursor: encounters.next_cursor,
   };
 }
 

@@ -26,16 +26,18 @@ export async function withIdempotency<T>(
    */
   subjectId?: string,
   /**
-   * For a write that MINTS the id it is about - `create_person` is the only
-   * one - there is no `person_id` to pass as `subjectId` above, because it
-   * does not exist until `run()` returns. Without a way to record it after
-   * the fact, `create_person`'s stored response - a full copy of the person,
-   * same as any other write's - sits under subject_id NULL forever, and
-   * `delete_person`'s scrub can never reach it by id.
+   * For a write that does not have its subject's `person_id` in hand before
+   * `run()` executes, either because it MINTS the id (`create_person`) or
+   * because its input names a child row (`update_encounter`,
+   * `delete_encounter`) and the parent is only known once that row is
+   * loaded. Without a way to record it after the fact, the stored response -
+   * a full copy of the person or encounter, same as any other write's - sits
+   * under subject_id NULL forever, and `delete_person`'s scrub can never
+   * reach it by id.
    *
-   * Called once, after `run()` succeeds, with its result. Only the
-   * newly-minted case needs this: everything else already has its subject
-   * before the call and passes it as `subjectId` instead.
+   * Called once, after `run()` succeeds, with its result. Everything else
+   * already has its subject before the call and passes it as `subjectId`
+   * instead.
    */
   subjectFromResult?: (result: T) => string | undefined
 ): Promise<T> {

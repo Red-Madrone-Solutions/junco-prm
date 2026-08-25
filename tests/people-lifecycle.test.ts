@@ -4,6 +4,7 @@ import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
 import { archivePerson, createPerson, deletePerson, unarchivePerson } from "../src/tools/people";
 import { addContact } from "../src/tools/attributes";
+import { logEncounter } from "../src/tools/encounters";
 
 const ctx: ToolContext = {
   db: env.DB,
@@ -114,6 +115,11 @@ describe("deletePerson", () => {
       full_name: "Ada Lovelace",
       notes: "distinctive-note-token",
     });
+    await logEncounter(ctx, {
+      person_id: person.id,
+      occurred_on: "2026-08-20",
+      summary: "distinctive-encounter-token",
+    });
 
     const token = await deletePerson(ctx, { person_id: person.id });
     if (token.status !== "confirmation_required") throw new Error("expected a preview");
@@ -132,6 +138,19 @@ describe("deletePerson", () => {
       .bind('"distinctive-note-token"')
       .first<{ n: number }>();
     expect(inPeople?.n).toBe(0);
+
+    const inEncounters = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM encounters_fts WHERE encounters_fts MATCH ?"
+    )
+      .bind('"distinctive-encounter-token"')
+      .first<{ n: number }>();
+    expect(inEncounters?.n).toBe(0);
+
+    // And the index is not merely empty of matches - the rows are gone.
+    const orphans = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM encounters_fts WHERE id NOT IN (SELECT id FROM encounters)"
+    ).first<{ n: number }>();
+    expect(orphans?.n).toBe(0);
   });
 
   it("leaves NOTHING in the operational tables either", async () => {
