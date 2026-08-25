@@ -3961,8 +3961,8 @@ export interface AddContactInput {
 
 export async function addContact(ctx: ToolContext, input: AddContactInput): Promise<PersonDetail> {
   const { idempotency_key, ...rest } = input;
+  const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "add_contact", idempotency_key, rest, async () => {
-    const personId = assertId("p", input.person_id);
     if (input.contact_type !== "email" && input.contact_type !== "phone") {
       throw new ToolError("invalid_input", 'contact_type must be "email" or "phone"');
     }
@@ -3998,7 +3998,7 @@ export async function addContact(ctx: ToolContext, input: AddContactInput): Prom
       .run();
 
     return getPerson(ctx, { person_id: personId });
-  });
+  }, personId);
 }
 
 export interface RemoveContactInput {
@@ -4009,8 +4009,8 @@ export interface RemoveContactInput {
 
 export async function removeContact(ctx: ToolContext, input: RemoveContactInput): Promise<PersonDetail> {
   const { idempotency_key, ...rest } = input;
+  const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "remove_contact", idempotency_key, rest, async () => {
-    const personId = assertId("p", input.person_id);
     const contactId = assertId("pc", input.contact_id);
     const result = await ctx.db
       .prepare("DELETE FROM person_contacts WHERE id = ? AND person_id = ?")
@@ -4020,7 +4020,7 @@ export async function removeContact(ctx: ToolContext, input: RemoveContactInput)
       throw new ToolError("not_found", `no contact ${contactId} on person ${personId}`);
     }
     return getPerson(ctx, { person_id: personId });
-  });
+  }, personId);
 }
 
 export interface AddLinkInput {
@@ -4032,8 +4032,8 @@ export interface AddLinkInput {
 
 export async function addLink(ctx: ToolContext, input: AddLinkInput): Promise<PersonDetail> {
   const { idempotency_key, ...rest } = input;
+  const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "add_link", idempotency_key, rest, async () => {
-    const personId = assertId("p", input.person_id);
     if (typeof input.link_type !== "string" || input.link_type.trim() === "") {
       throw new ToolError("invalid_input", "link_type is required");
     }
@@ -4052,7 +4052,7 @@ export async function addLink(ctx: ToolContext, input: AddLinkInput): Promise<Pe
       .run();
 
     return getPerson(ctx, { person_id: personId });
-  });
+  }, personId);
 }
 
 export interface RemoveLinkInput {
@@ -4063,8 +4063,8 @@ export interface RemoveLinkInput {
 
 export async function removeLink(ctx: ToolContext, input: RemoveLinkInput): Promise<PersonDetail> {
   const { idempotency_key, ...rest } = input;
+  const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "remove_link", idempotency_key, rest, async () => {
-    const personId = assertId("p", input.person_id);
     const linkId = assertId("pl", input.link_id);
     const result = await ctx.db
       .prepare("DELETE FROM person_links WHERE id = ? AND person_id = ?")
@@ -4074,7 +4074,7 @@ export async function removeLink(ctx: ToolContext, input: RemoveLinkInput): Prom
       throw new ToolError("not_found", `no link ${linkId} on person ${personId}`);
     }
     return getPerson(ctx, { person_id: personId });
-  });
+  }, personId);
 }
 
 export interface TagsInput {
@@ -4117,8 +4117,8 @@ function tagNames(input: TagsInput): string[] {
  */
 export async function addTags(ctx: ToolContext, input: TagsInput): Promise<PersonDetail> {
   const { idempotency_key, ...rest } = input;
+  const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "add_tags", idempotency_key, rest, async () => {
-    const personId = assertId("p", input.person_id);
     const names = tagNames(input);
     await loadPerson(ctx, personId);
 
@@ -4140,7 +4140,7 @@ export async function addTags(ctx: ToolContext, input: TagsInput): Promise<Perso
     );
 
     return getPerson(ctx, { person_id: personId });
-  });
+  }, personId);
 }
 
 /**
@@ -4155,8 +4155,8 @@ export async function addTags(ctx: ToolContext, input: TagsInput): Promise<Perso
  */
 export async function removeTags(ctx: ToolContext, input: TagsInput): Promise<PersonDetail> {
   const { idempotency_key, ...rest } = input;
+  const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "remove_tags", idempotency_key, rest, async () => {
-    const personId = assertId("p", input.person_id);
     const names = tagNames(input);
     await loadPerson(ctx, personId);
 
@@ -4171,7 +4171,7 @@ export async function removeTags(ctx: ToolContext, input: TagsInput): Promise<Pe
       .run();
 
     return getPerson(ctx, { person_id: personId });
-  });
+  }, personId);
 }
 ```
 
