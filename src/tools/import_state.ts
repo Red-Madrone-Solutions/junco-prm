@@ -285,22 +285,43 @@ export async function openOrResumeRun(
     }>();
 
   if (!run) throw new ToolError("not_found", `no import run with id ${runId}`);
+
+  /**
+   * THE NUMBER GOES IN `details`, NOT ONLY IN THE PROSE. The spec: "A mismatch
+   * is a recoverable error: the response carries the run's true `next_offset`
+   * and `remaining`, so the agent's next call is obviously correct rather than
+   * a guess." src/errors.ts documents `details` as carrying exactly this pair.
+   * All three refusals below used to state it in English only, which leaves the
+   * caller parsing a sentence to recover.
+   */
+  const recovery = {
+    run_id: run.id,
+    next_offset: run.next_offset,
+    remaining: run.expected_total - run.next_offset,
+  };
+
   if (run.roster_source_id !== sourceId || run.format !== input.format || run.status !== "open") {
     throw new ToolError(
       "conflict",
-      "import continuation does not match its open run; start a new run without a run_id"
+      "import continuation does not match its open run; start a new run without a run_id",
+      "call import_roster again with no run_id and no offset to open a fresh run",
+      recovery
     );
   }
   if (offset !== run.next_offset) {
     throw new ToolError(
       "conflict",
-      `import run ${runId} expects offset ${run.next_offset}, not ${offset}`
+      `import run ${runId} expects offset ${run.next_offset}, not ${offset}`,
+      `call import_roster again with offset ${recovery.next_offset} and the next ${recovery.remaining} row(s)`,
+      recovery
     );
   }
   if (run.next_offset + input.rows.length > run.expected_total) {
     throw new ToolError(
       "conflict",
-      `import run ${runId} was opened for ${run.expected_total} rows and this chunk would exceed it`
+      `import run ${runId} was opened for ${run.expected_total} rows and this chunk would exceed it`,
+      `send at most ${recovery.remaining} row(s) at offset ${recovery.next_offset}`,
+      recovery
     );
   }
 

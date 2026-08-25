@@ -23,6 +23,17 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM people").run();
 });
 
+/** Runs the call, expects a ToolError, and hands it back for inspection. */
+async function expectToolError(promise: Promise<unknown>): Promise<ToolError> {
+  try {
+    await promise;
+  } catch (e) {
+    expect(e).toBeInstanceOf(ToolError);
+    return e as ToolError;
+  }
+  throw new Error("expected a ToolError, got a result");
+}
+
 describe("parseCsv", () => {
   it("parses a header row and quoted fields containing commas", () => {
     const rows = parseCsv('full_name,organization\n"Lovelace, Ada",Kinsta\n');
@@ -167,12 +178,18 @@ describe("openOrResumeRun", () => {
     expect(resumed.expected_total).toBe(2);
   });
 
-  it("refuses a continuation whose offset skips rows", async () => {
+  it("refuses a continuation whose offset skips rows, with the true offset in details", async () => {
+    // The spec: "A mismatch is a recoverable error: the response carries the
+    // run's true next_offset and remaining, so the agent's next call is
+    // obviously correct rather than a guess." It used to be in the prose only.
     const sourceId = await ensureSource(ctx, SOURCE);
     const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 9 });
-    await expect(
+    const error = await expectToolError(
       openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id, offset: 1 })
-    ).rejects.toThrow(ToolError);
+    );
+    expect(error.code).toBe("conflict");
+    expect(error.details).toEqual({ run_id: opened.run_id, next_offset: 0, remaining: 9 });
+    expect(error.next).toContain("offset 0");
   });
 
   it("refuses a continuation whose offset replays committed rows", async () => {
@@ -181,20 +198,25 @@ describe("openOrResumeRun", () => {
     await env.DB.prepare("UPDATE import_runs SET next_offset = 4 WHERE id = ?")
       .bind(opened.run_id)
       .run();
-    await expect(
+    const error = await expectToolError(
       openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id, offset: 0 })
-    ).rejects.toThrow(ToolError);
+    );
+    expect(error.code).toBe("conflict");
+    expect(error.details).toEqual({ run_id: opened.run_id, next_offset: 4, remaining: 5 });
   });
 
-  it("refuses a continuation that would exceed the declared total", async () => {
+  it("refuses a continuation that would exceed the declared total, with remaining in details", async () => {
     const sourceId = await ensureSource(ctx, SOURCE);
     const opened = await openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, expected_total: 1 });
     await env.DB.prepare("UPDATE import_runs SET next_offset = 1 WHERE id = ?")
       .bind(opened.run_id)
       .run();
-    await expect(
+    const error = await expectToolError(
       openOrResumeRun(ctx, sourceId, { ...SOURCE, rows, run_id: opened.run_id, offset: 1 })
-    ).rejects.toThrow(ToolError);
+    );
+    expect(error.code).toBe("conflict");
+    expect(error.details).toEqual({ run_id: opened.run_id, next_offset: 1, remaining: 0 });
+    expect(error.next).toContain("at most 0");
   });
 
   it("refuses a continuation whose format changed", async () => {
@@ -212,6 +234,18 @@ describe("openOrResumeRun", () => {
         offset: 1,
       })
     ).rejects.toThrow(ToolError);
+
+    const error = await expectToolError(
+      openOrResumeRun(ctx, sourceId, {
+        ...SOURCE,
+        format: "text",
+        rows,
+        run_id: opened.run_id,
+        offset: 1,
+      })
+    );
+    expect(error.code).toBe("conflict");
+    expect(error.details).toEqual({ run_id: opened.run_id, next_offset: 1, remaining: 1 });
   });
 
   it("refuses a run belonging to another source", async () => {
