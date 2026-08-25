@@ -65,8 +65,67 @@ if (SCORE.name + SCORE.organization < STRONG_MATCH || SCORE.email < STRONG_MATCH
 }
 
 /**
+ * How many rows each signal's query may return, applied PER SIGNAL. See the
+ * comment on `findDuplicateCandidates` for why it cannot be one cap per table.
+ * Inlined into the SQL rather than bound, because SQLite will not accept a
+ * parameter in LIMIT on every path and the value is a module constant here.
+ */
+const PER_SIGNAL_LIMIT = 25;
+
+/**
+ * Matches a stored name whose normalized form MAY equal the probe, including
+ * the honorific-suffix case ("Ada Lovelace, PhD" against a probe for "Ada
+ * Lovelace"). Deliberately a superset - `checkRow` decides. LIKE wildcards in
+ * the probe only widen the superset, which the re-check then narrows again.
+ */
+const LOOSE_NAME_PREDICATE =
+  "TRIM(LOWER(full_name)) = ?1 OR TRIM(LOWER(full_name)) LIKE ?1 || ',%'";
+
+interface PersonRow {
+  id: string;
+  full_name: string;
+  organization: string | null;
+  email?: string | null;
+}
+
+interface RosterRow {
+  id: string;
+  full_name: string;
+  organization: string | null;
+  email: string | null;
+}
+
+/**
  * Scans people and staged roster entries. Both, always: the whole point is that
  * "add Jane" must see the roster row nobody has promoted yet.
+ *
+ * ONE BOUNDED QUERY PER SIGNAL, NOT ONE BOUNDED QUERY PER TABLE. An earlier
+ * version ran a single `WHERE name = ? OR email = ? OR organization = ?
+ * LIMIT 25` per table. SQLite returns whichever 25 rows it reaches first, so on
+ * a conference roster the organization arm alone filled the budget and the row
+ * that matched by name was never returned - which meant `createPerson` did not
+ * refuse and created a durable duplicate whose provenance is unrecoverable.
+ * Forty rows sharing an organization was enough. The cap now applies per signal
+ * after that signal has selected, so a large organization can never crowd out
+ * the name match.
+ *
+ * THE PREDICATES ARE DELIBERATELY LOOSER THAN THE MATCH. The bound values come
+ * from `normalizeName` and `normalizeText`, which apply NFKC, collapse
+ * whitespace runs, and strip a known honorific suffix. SQLite's `LOWER()` does
+ * none of that, so `LOWER(full_name) = ?` made a staged "Ada Lovelace, PhD"
+ * completely invisible to a probe for "Ada Lovelace" - not refused, not even
+ * returned as weak evidence, and conference exports carry ", PhD" and ", Jr."
+ * routinely. Each query now fetches a superset and `checkRow` below re-applies
+ * the real normalizer in JavaScript, which is what the scoring half of this
+ * function already did.
+ *
+ * An expression index on the normalized form was the alternative and it cannot
+ * work: no SQL expression reproduces NFKC or the honorific set, so an index
+ * over `LOWER(...)` would still miss the case this fixes. What remains
+ * unmatched by the SQL prefilter is a stored value differing from its
+ * normalized form by NFKC or by an internal whitespace run; those rows are
+ * still invisible, and closing that would mean normalizing every row in
+ * JavaScript on every probe.
  *
  * Staged rows are not FTS-indexed, by design in the spec, so this is a
  * bounded scan over `roster_entries`. NOTE: it is a FULL SCAN. The
@@ -120,37 +179,47 @@ export async function findDuplicateCandidates(
     });
   };
 
+  /**
+   * Every row from every query goes through every applicable signal, not just
+   * the signal whose query returned it. A row the organization query returned
+   * that also shares the name must score 2, and it still must if the name
+   * query hit its own cap before reaching that row.
+   */
+  const checkRow = (
+    kind: "person" | "roster_entry",
+    r: { id: string; full_name: string; organization: string | null; email?: string | null }
+  ) => {
+    if (kind === "person" ? r.id === opts.excludePersonId : r.id === opts.excludeRosterEntryId) {
+      return;
+    }
+    if (email && r.email && normalizeEmail(r.email) === email) {
+      add(kind, r.id, r.full_name, r.organization, "email", "shared email");
+    }
+    if (normalizeName(r.full_name) === name) {
+      add(kind, r.id, r.full_name, r.organization, "name", "shared name");
+    }
+    if (org && r.organization && normalizeText(r.organization) === org) {
+      add(kind, r.id, r.full_name, r.organization, "organization", "shared organization");
+    }
+  };
+
   // --- people, by email ---
   if (email) {
     const { results } = await ctx.db
       .prepare(
-        `SELECT p.id, p.full_name, p.organization
+        `SELECT p.id, p.full_name, p.organization, c.value AS email
            FROM person_contacts c
            JOIN people p ON p.id = c.person_id
-          WHERE c.contact_type = 'email' AND c.normalized_value = ?`
+          WHERE c.contact_type = 'email' AND c.normalized_value = ?
+          LIMIT ${PER_SIGNAL_LIMIT}`
       )
       .bind(email)
-      .all<{ id: string; full_name: string; organization: string | null }>();
+      .all<PersonRow>();
+    // The normalized_value comparison above IS the email match, so score it
+    // directly rather than through checkRow's re-check of `value`.
     for (const r of results) {
       if (r.id === opts.excludePersonId) continue;
       add("person", r.id, r.full_name, r.organization, "email", "shared email");
-    }
-  }
-
-  // --- people, by name and organization ---
-  {
-    const { results } = await ctx.db
-      .prepare(
-        `SELECT id, full_name, organization
-           FROM people
-          WHERE archived_at IS NULL
-            AND (LOWER(full_name) = ? OR (? IS NOT NULL AND LOWER(organization) = ?))
-          LIMIT 25`
-      )
-      .bind(name, org, org)
-      .all<{ id: string; full_name: string; organization: string | null }>();
-    for (const r of results) {
-      if (r.id === opts.excludePersonId) continue;
       if (normalizeName(r.full_name) === name) {
         add("person", r.id, r.full_name, r.organization, "name", "shared name");
       }
@@ -160,31 +229,72 @@ export async function findDuplicateCandidates(
     }
   }
 
-  // --- staged roster entries, same two signals ---
+  // --- people, by name ---
+  {
+    const { results } = await ctx.db
+      .prepare(
+        `SELECT id, full_name, organization
+           FROM people
+          WHERE archived_at IS NULL AND (${LOOSE_NAME_PREDICATE})
+          LIMIT ${PER_SIGNAL_LIMIT}`
+      )
+      .bind(name)
+      .all<PersonRow>();
+    for (const r of results) checkRow("person", r);
+  }
+
+  // --- people, by organization ---
+  if (org) {
+    const { results } = await ctx.db
+      .prepare(
+        `SELECT id, full_name, organization
+           FROM people
+          WHERE archived_at IS NULL AND TRIM(LOWER(organization)) = ?
+          LIMIT ${PER_SIGNAL_LIMIT}`
+      )
+      .bind(org)
+      .all<PersonRow>();
+    for (const r of results) checkRow("person", r);
+  }
+
+  // --- staged roster entries, the same three signals, one query each ---
   {
     const { results } = await ctx.db
       .prepare(
         `SELECT id, full_name, organization, email
            FROM roster_entries
-          WHERE LOWER(full_name) = ?
-             OR (? IS NOT NULL AND LOWER(email) = ?)
-             OR (? IS NOT NULL AND LOWER(organization) = ?)
-          LIMIT 25`
+          WHERE ${LOOSE_NAME_PREDICATE}
+          LIMIT ${PER_SIGNAL_LIMIT}`
       )
-      .bind(name, email, email, org, org)
-      .all<{ id: string; full_name: string; organization: string | null; email: string | null }>();
-    for (const r of results) {
-      if (r.id === opts.excludeRosterEntryId) continue;
-      if (email && r.email && normalizeEmail(r.email) === email) {
-        add("roster_entry", r.id, r.full_name, r.organization, "email", "shared email");
-      }
-      if (normalizeName(r.full_name) === name) {
-        add("roster_entry", r.id, r.full_name, r.organization, "name", "shared name");
-      }
-      if (org && r.organization && normalizeText(r.organization) === org) {
-        add("roster_entry", r.id, r.full_name, r.organization, "organization", "shared organization");
-      }
-    }
+      .bind(name)
+      .all<RosterRow>();
+    for (const r of results) checkRow("roster_entry", r);
+  }
+
+  if (email) {
+    const { results } = await ctx.db
+      .prepare(
+        `SELECT id, full_name, organization, email
+           FROM roster_entries
+          WHERE TRIM(LOWER(email)) = ?
+          LIMIT ${PER_SIGNAL_LIMIT}`
+      )
+      .bind(email)
+      .all<RosterRow>();
+    for (const r of results) checkRow("roster_entry", r);
+  }
+
+  if (org) {
+    const { results } = await ctx.db
+      .prepare(
+        `SELECT id, full_name, organization, email
+           FROM roster_entries
+          WHERE TRIM(LOWER(organization)) = ?
+          LIMIT ${PER_SIGNAL_LIMIT}`
+      )
+      .bind(org)
+      .all<RosterRow>();
+    for (const r of results) checkRow("roster_entry", r);
   }
 
   return [...scored.values()].sort((a, b) => b.score - a.score);

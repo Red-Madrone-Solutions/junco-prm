@@ -214,6 +214,77 @@ describe("createPerson", () => {
     expect(JSON.stringify(candidates)).not.toContain("IGNORE PREVIOUS");
   });
 
+  it("REFUSES when 39 colleagues at one organization sit in front of the name match", async () => {
+    // The organization arm of the scan matches everyone from the same company.
+    // Under a single per-table `LIMIT 25` those 25 arbitrary colleagues filled
+    // the budget, the row matching by NAME was never returned, the score never
+    // reached STRONG_MATCH, and a durable duplicate was created whose
+    // provenance is unrecoverable. Forty rows is nothing; the reference roster
+    // has 798.
+    for (let i = 0; i < 39; i++) {
+      await seedRosterEntry({
+        id: `re_fill_${i}`,
+        full_name: `Filler ${i}`,
+        organization: "Acme Corp",
+        email: null,
+      });
+    }
+    await seedRosterEntry({
+      id: "re_jane",
+      full_name: "Jane Roe",
+      organization: "Acme Corp",
+      email: null,
+    });
+
+    const candidates = await expectConflict(
+      createPerson(ctx, { full_name: "Jane Roe", organization: "Acme Corp" })
+    );
+    const jane = candidates.find((c) => c.id === "re_jane");
+    expect(jane?.evidence).toEqual(
+      expect.arrayContaining(["shared name", "shared organization"])
+    );
+    expect(jane?.score).toBeGreaterThanOrEqual(STRONG_MATCH);
+
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM people").first<{ n: number }>();
+    expect(count?.n).toBe(0);
+  });
+
+  it("sees a staged name carrying an honorific suffix", async () => {
+    // `normalizeName` strips ", PhD"; SQLite's LOWER() does not, so a prefilter
+    // of `LOWER(full_name) = ?` made this row completely invisible - not
+    // refused, and not even returned as weak evidence. Conference exports carry
+    // ", PhD", ", Jr." and ", MBA" routinely. One signal, so it scores 1 and
+    // correctly does NOT refuse; what is asserted is that it is seen at all.
+    await seedRosterEntry({
+      id: "re_ada",
+      full_name: "Ada Lovelace, PhD",
+      organization: null,
+      email: null,
+    });
+
+    const person = await createPerson(ctx, { full_name: "Ada Lovelace" });
+    const hit = person.possible_duplicates?.find((c) => c.id === "re_ada");
+    expect(hit?.evidence).toEqual(["shared name"]);
+    expect(hit?.score).toBe(SCORE_NAME);
+  });
+
+  it("REFUSES when 39 colleagues at one organization sit in front of the name match, people side", async () => {
+    // Same defect, the other table. `people` was scanned by one OR-combined
+    // query under one shared cap, so the organization arm could crowd out the
+    // person who actually shares the name.
+    for (let i = 0; i < 39; i++) {
+      await createPerson(ctx, { full_name: `Filler ${i}`, organization: "Acme Corp" });
+    }
+    const jane = await createPerson(ctx, { full_name: "Jane Roe", organization: "Acme Corp" });
+
+    const candidates = await expectConflict(
+      createPerson(ctx, { full_name: "Jane Roe", organization: "Acme Corp" })
+    );
+    expect(candidates.find((c) => c.id === jane.id)?.evidence).toEqual(
+      expect.arrayContaining(["shared name", "shared organization"])
+    );
+  });
+
   it("replays under the same idempotency_key", async () => {
     const a = await createPerson(ctx, { full_name: "Ada Lovelace", idempotency_key: "k1" });
     const b = await createPerson(ctx, { full_name: "Ada Lovelace", idempotency_key: "k1" });
