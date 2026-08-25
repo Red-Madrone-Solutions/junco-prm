@@ -1,0 +1,5 @@
+external_row_key,full_name,job_title,organization,email,role
+1,Ada Lovelace,Engineer,Analytical Engines,ada@example.test,attendee
+2,Grace Hopper,Programmer,US Navy,grace@example.test,speaker
+3,Chris Smith,Designer,Studio A,chris.a@example.test,attendee
+4,Chris Smith,Developer,Studio B,chris.b@example.test,attendee
