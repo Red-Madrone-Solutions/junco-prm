@@ -12,5 +12,11 @@
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
-  ]
+  ],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "PLACEHOLDER_SET_BY_DEPLOY" }],
+  "vars": {
+    "GITHUB_CLIENT_ID": "PLACEHOLDER_SET_BY_DEPLOY",
+    "OWNER_GITHUB_USER_ID": "PLACEHOLDER_SET_BY_DEPLOY",
+    "OWNER_TIMEZONE": "UTC"
+  }
 }
