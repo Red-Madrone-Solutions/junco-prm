@@ -9108,13 +9108,24 @@ export async function promoteRosterEntry(
       person: await getPerson(ctx, { person_id: personId }),
       linked_existing: false,
     };
-  });
+  },
+  // No subjectId, because this tool does not know which person it is about
+  // until it has either created one or resolved the link - the same situation
+  // update_encounter and delete_encounter are in.
+  undefined,
+  // Phase one returns candidates and is about nobody, so it records no subject.
+  // Phase two returns the person it produced, and the stored response is a full
+  // PersonDetail - without this the copy sits under subject_id NULL forever and
+  // delete_person's scrub can never reach it by id.
+  (result) => (result.status === "promoted" ? result.person.id : undefined));
 }
 ```
 
 Name matching appears in this tool and in `createPerson`, in both cases as *evidence shown to a human or an agent*. It never selects a person. That distinction is the whole reason `promote_roster_entry` has two phases, and it is why the second phase requires an explicit `link_to_person_id` rather than accepting the top candidate.
 
 **The two-phase shape is advisory, and that asymmetry is deliberate.** Nothing forces an agent to look at candidates first, unlike `delete_person` and `purge_roster_source`, which require a token minted by their preview call. Promotion's worst outcome is a duplicate person, which is recoverable, and which the provenance override above already prevents in the one case the system can actually see. A confirmation token on the highest-frequency conference action would cost a round trip every single time.
+
+**`promote_roster_entry` records its idempotency subject through `subjectFromResult`, not as a trailing `subjectId`.** The global constraints say every write's stored response must be reachable by `delete_person`'s scrub, and this tool's stored response is a full `PersonDetail`. It cannot pass the id up front: phase one is about nobody and phase two only knows the person after it creates or resolves one. The callback narrows the union and returns `undefined` for the candidates branch, which is exactly what `update_encounter` does at `src/tools/encounters.ts` and what `subjectFromResult`'s own doc comment describes. Added 2026-08-25; an earlier draft of this sample passed neither argument, which would have left every promoted person's stored response under `subject_id` NULL.
 
 **Committing a promotion is one transaction.** The first draft called `createPerson`, then `addContact`, then batched the two provenance rows, which is three separate writes. A failure after the first leaves a person with no provenance and no link to the roster row that produced them, and the retry creates a second person, because nothing yet records that the entry was promoted. Minting the person id inline and batching every insert makes the whole promotion land or none of it. It is also why this path does not call the public `createPerson` and `addContact` tools: those wrap themselves in their own idempotency handling and cannot be enlisted in someone else's transaction.
 
