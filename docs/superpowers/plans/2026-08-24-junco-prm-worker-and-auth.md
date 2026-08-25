@@ -1045,7 +1045,7 @@ git commit -m "feat: serve /health with the applied schema version"
 - Test: `tests/auth-github.test.ts`
 
 **Interfaces:**
-- Consumes: `Config` from Task 1, `logAuthFailure` from Task 2.
+- Consumes: `Config` from Task 1. **Not `logAuthFailure`**, despite an earlier draft listing it: this task has nowhere to call it from. `logAuthFailure` requires a `requestId`, and none of these four functions receives one; its `reason` is a closed union of `no_token`, `invalid_token`, `not_owner` and `no_props`, none of which describes a GitHub token exchange failing; and the draft that listed it never called it anywhere in its own steps. The auth-failure logging for this flow belongs to Task 5's callback route, which has a request id in hand. Corrected 2026-08-25, found by executing this task.
 - Produces:
   - `function authorizeUrl(config: Config, callbackUrl: string, state: string): string`
   - `function exchangeCode(config: Config, code: string): Promise<string>` - returns the GitHub access token
