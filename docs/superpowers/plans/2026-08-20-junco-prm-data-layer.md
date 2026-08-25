@@ -7191,7 +7191,7 @@ describe("importRoster", () => {
     const row = await env.DB.prepare(
       "SELECT organization FROM roster_entries WHERE external_row_key = ?"
     )
-      .bind("1")
+      .bind("k:1")
       .first<{ organization: string }>();
     expect(row?.organization).toBe("Automattic");
   });
@@ -7317,7 +7317,7 @@ describe("importRoster", () => {
     const row = await env.DB.prepare(
       "SELECT organization FROM roster_entries WHERE external_row_key = ?"
     )
-      .bind("1")
+      .bind("k:1")
       .first<{ organization: string }>();
     expect(row?.organization).toBe("Second");
   });
@@ -7960,7 +7960,7 @@ describe("finalizeImport", () => {
     const grace = await env.DB.prepare(
       "SELECT full_name FROM roster_entries WHERE external_row_key = ?"
     )
-      .bind("2")
+      .bind("k:2")
       .first<{ full_name: string }>();
     expect(grace?.full_name).toBe("Grace");
   });
