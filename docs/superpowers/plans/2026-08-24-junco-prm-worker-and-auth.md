@@ -3392,7 +3392,7 @@ describe("rateLimitedResponse", () => {
 Run: `npx vitest run tests/ratelimit.test.ts`
 Expected: FAIL, cannot resolve `../src/ratelimit`.
 
-- [ ] **Step 3a: Write `src/ratelimit.ts` — the BINDING version**
+- [ ] **Step 3a: Write `src/ratelimit.ts` - the BINDING version**
 
 Build this **only if** `docs/MEASUREMENTS.md` records `RATE_LIMIT_STRATEGY = "binding"`.
 
@@ -3462,7 +3462,7 @@ And in `wrangler.jsonc`:
 
 Sixty requests a minute per IP on the OAuth and health routes, six hundred on `/mcp`. A legitimate OAuth flow is a handful of requests, so sixty is generous enough that nobody real will ever see a 429 there and low enough that a registration loop stops being free. Six hundred on `/mcp` is well above any conversational tool-call rate one person can produce and still bounds an anonymous flood, each request of which costs a KV read while the provider tries to validate whatever token was presented.
 
-- [ ] **Step 3b: Write `src/ratelimit.ts` — the KV TOKEN BUCKET version**
+- [ ] **Step 3b: Write `src/ratelimit.ts` - the KV TOKEN BUCKET version**
 
 Build this **only if** `docs/MEASUREMENTS.md` records `RATE_LIMIT_STRATEGY = "kv_token_bucket"`, meaning Task 0 found the binding unavailable on a free plan.
 
@@ -3651,8 +3651,8 @@ connector actually fails.
 
 ## Deploy
 
-- [ ] `npx wrangler d1 create junco-prm` — paste the `database_id` into `wrangler.jsonc`
-- [ ] `npx wrangler kv namespace create OAUTH_KV` — paste the `id` into `wrangler.jsonc`
+- [ ] `npx wrangler d1 create junco-prm` - paste the `database_id` into `wrangler.jsonc`
+- [ ] `npx wrangler kv namespace create OAUTH_KV` - paste the `id` into `wrangler.jsonc`
 - [ ] `npx wrangler d1 migrations apply junco-prm --remote`
 - [ ] Resolve the numeric GitHub user id:
       `curl -s https://api.github.com/users/<username> | grep '"id"'`
@@ -3662,12 +3662,12 @@ connector actually fails.
 - [ ] `npx wrangler secret put GITHUB_CLIENT_SECRET`
 - [ ] `npx wrangler secret put COOKIE_ENCRYPTION_KEY`
       Generate with: `openssl rand -hex 32`
-- [ ] `npx wrangler deploy` — note the deployed URL
+- [ ] `npx wrangler deploy` - note the deployed URL
 
 ## Set the GitHub callback
 
 - [ ] In the OAuth App settings, set **Authorization callback URL** to
-      `<deployed-url>/callback` — the full URL, not the bare Worker origin.
+      `<deployed-url>/callback` - the full URL, not the bare Worker origin.
       A bare origin fails at consent time with an unhelpful error.
 
 ## Verify the Worker before involving Claude
@@ -3679,7 +3679,7 @@ connector actually fails.
 - [ ] `curl -s <deployed-url>/.well-known/oauth-authorization-server` returns
       metadata naming `/authorize`, `/token`, and `/register`
 - [ ] `curl -s -o /dev/null -w '%{http_code}' <deployed-url>/mcp` returns 401,
-      not 200 and not 500 — the endpoint exists and refuses anonymous callers
+      not 200 and not 500 - the endpoint exists and refuses anonymous callers
 
 ## Fail-closed check, before there is any data to lose
 
@@ -3694,7 +3694,7 @@ connector actually fails.
 - [ ] On **claude.ai or Claude Desktop** (not mobile), add a custom connector
       pointing at `<deployed-url>/mcp`, named `Junco PRM`
 - [ ] The GitHub consent screen appears on first connect
-- [ ] It requests **no scopes** — if it asks for `read:user` or anything else,
+- [ ] It requests **no scopes** - if it asks for `read:user` or anything else,
       stop: `authorizeUrl` is sending a scope parameter it should not
 - [ ] Approving it returns to Claude and the connector shows as connected
 - [ ] The connector lists **28 tools**
@@ -3704,20 +3704,20 @@ connector actually fails.
 - [ ] "Add Ada Lovelace, she works at Kinsta" creates a person
 - [ ] "Add Ada Lovelace at Kinsta" again is **refused** with duplicate candidates
 - [ ] "What's today's date according to my PRM?" answers in **your** time zone,
-      not UTC — check this near midnight if you can, it is the whole reason
+      not UTC - check this near midnight if you can, it is the whole reason
       `OWNER_TIMEZONE` exists
 - [ ] "I met her at the hallway track, she owes me a compiler" logs an encounter
 - [ ] "Remind me to send her the deck by Friday" creates a follow-up
 - [ ] "What am I forgetting?" lists it
 - [ ] "Who do I know at Kinsta?" finds her
-- [ ] Ask for a person who does not exist — the answer is a useful refusal the
+- [ ] Ask for a person who does not exist - the answer is a useful refusal the
       model can act on, **not** a raw error or a crash
 
 ## Reject a stranger
 
 - [ ] Change `OWNER_GITHUB_USER_ID` in `wrangler.jsonc` to any other number and
       `npx wrangler deploy`
-- [ ] The next tool call from Claude fails — **immediately**, without removing
+- [ ] The next tool call from Claude fails - **immediately**, without removing
       the connector or waiting for anything to expire. This is the revocation
       story the spec tells, and it works because the check compares against the
       current variable rather than against anything stored.
