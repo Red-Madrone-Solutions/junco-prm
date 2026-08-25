@@ -26,7 +26,7 @@ Task 5 is redesigned rather than patched: the pending authorization lives in KV 
 
 This is plan 2 of 3 for spec phase 1.
 
-- **Plan 1** - schema, migrations, FTS5, and the full tool module, tested against local D1. Written and reconciled; not yet implemented.
+- **Plan 1** - schema, migrations, FTS5, and the full tool module, tested against local D1. **Implemented and merged to `master` on 2026-08-25** as commit `0355934`: 341 tests across 24 files, 28 tools in the registry, eight migrations. What it leaves for this plan is in `docs/PLAN-1-CARRY-FORWARD.md`, which task 1 should read before task 6b and task 7 need it.
 - **Plan 2 (this document)** - Worker entrypoint, configuration and fail-closed startup, structured logging, `/health`, GitHub OAuth, `workers-oauth-provider`, per-request owner authorization, MCP over stateless Streamable HTTP, and rate limiting the unauthenticated surface.
 - **Plan 3** - `docs/DEPLOY.md` runbook, `docs/UPGRADE.md`, the deploy template, the CLI durable-data export, and the tested restore.
 
