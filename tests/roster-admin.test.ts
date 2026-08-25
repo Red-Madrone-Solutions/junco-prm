@@ -226,6 +226,26 @@ describe("getRosterEntry", () => {
       expect((e as ToolError).next).toContain("list_roster_sources");
     }
   });
+
+  it("reports stale: true for a row staged by a run that hasn't committed", async () => {
+    await seedOne();
+    // A second, later run against the same source, left open: this row is
+    // staged but its committed_run_id is still NULL, so the latest completed
+    // run (still the first one) has not seen it.
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "2", full_name: "Grace Hopper" }],
+    });
+    const second = await env.DB.prepare(
+      "SELECT id FROM roster_entries WHERE external_row_key = ?"
+    )
+      .bind("k:2")
+      .first<{ id: string }>();
+
+    const entry = await getRosterEntry(ctx, { roster_entry_id: second!.id });
+    expect(entry.stale).toBe(true);
+  });
 });
 
 describe("purgeRosterSource", () => {
@@ -414,5 +434,41 @@ describe("purgeRosterSource", () => {
     await expect(
       purgeRosterSource(ctx, { roster_source_id: "rs_00000000-0000-4000-8000-000000000000" })
     ).rejects.toThrow(ToolError);
+  });
+
+  it("reports the row's real purged_at on a repeat purge, not this call's own clock", async () => {
+    // Re-previewing and re-confirming an already-purged source is a fully
+    // valid two-call sequence: nothing refuses it. The returned purged_at must
+    // still be the timestamp the row was actually purged at, not whatever this
+    // later call's clock reads.
+    await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: 1,
+      rows: [{ external_row_key: "1", full_name: "Ada" }],
+    });
+    const source = await env.DB.prepare("SELECT id FROM roster_sources LIMIT 1").first<{ id: string }>();
+
+    const first = await purgeRosterSource(ctx, { roster_source_id: source!.id });
+    if (first.status !== "confirmation_required") throw new Error("unreachable");
+    await purgeRosterSource(ctx, {
+      roster_source_id: source!.id,
+      confirmation_token: first.confirmation_token,
+    });
+
+    const laterCtx: ToolContext = { ...ctx, clock: () => new Date("2026-09-01T00:00:00Z") };
+    const second = await purgeRosterSource(laterCtx, { roster_source_id: source!.id });
+    if (second.status !== "confirmation_required") throw new Error("unreachable");
+    const done = await purgeRosterSource(laterCtx, {
+      roster_source_id: source!.id,
+      confirmation_token: second.confirmation_token,
+    });
+    if (done.status !== "purged") throw new Error("unreachable");
+
+    expect(done.purged.purged_at).toBe("2026-08-20T12:00:00.000Z");
+
+    const row = await env.DB.prepare("SELECT purged_at FROM roster_sources WHERE id = ?")
+      .bind(source!.id)
+      .first<{ purged_at: string | null }>();
+    expect(row?.purged_at).toBe("2026-08-20T12:00:00.000Z");
   });
 });

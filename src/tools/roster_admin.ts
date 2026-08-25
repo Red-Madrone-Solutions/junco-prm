@@ -267,6 +267,11 @@ export async function purgeRosterSource(
         .bind(at, id),
     ]);
 
-    return { status: "purged" as const, purged: { ...preview, purged_at: at } };
+    // preview.purged_at is the row's real stamp, re-read moments earlier: null
+    // when this call is the one that sets it, non-null when a prior purge
+    // already did. The guarded UPDATE above only ever writes `at` on the
+    // former; reporting `at` unconditionally would claim this call set a
+    // stamp it left untouched.
+    return { status: "purged" as const, purged: { ...preview, purged_at: preview.purged_at ?? at } };
   });
 }
