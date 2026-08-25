@@ -52,7 +52,13 @@ describe("loadConfig", () => {
       // nothing at all arrives as "". Present-but-empty must fail like absent.
       const env = validEnv() as Record<string, string>;
       env[missing] = "   ";
-      expect(() => loadConfig(env as never)).toThrow(ConfigError);
+      try {
+        loadConfig(env as never);
+        throw new Error("should have refused");
+      } catch (e) {
+        expect(e).toBeInstanceOf(ConfigError);
+        expect((e as ConfigError).missing).toContain(missing);
+      }
     });
   }
 
@@ -92,7 +98,14 @@ describe("loadConfig", () => {
     // surfaces as a crash in list_due rather than as a refused deploy.
     const env = validEnv() as Record<string, string>;
     env.OWNER_TIMEZONE = "America/Los_Angles";
-    expect(() => loadConfig(env as never)).toThrow(ConfigError);
+    try {
+      loadConfig(env as never);
+      throw new Error("should have refused");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
+      expect((e as ConfigError).missing).toContain("OWNER_TIMEZONE");
+      expect((e as ConfigError).message).toMatch(/IANA/i);
+    }
   });
 
   it("accepts UTC, which is a real zone and a plausible choice", () => {
@@ -104,7 +117,14 @@ describe("loadConfig", () => {
   it("REFUSES a COOKIE_ENCRYPTION_KEY that is too short to be 32 bytes", () => {
     const env = validEnv() as Record<string, string>;
     env.COOKIE_ENCRYPTION_KEY = "abcd";
-    expect(() => loadConfig(env as never)).toThrow(ConfigError);
+    try {
+      loadConfig(env as never);
+      throw new Error("should have refused");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
+      expect((e as ConfigError).missing).toContain("COOKIE_ENCRYPTION_KEY");
+      expect((e as ConfigError).message).toMatch(/32 bytes/i);
+    }
   });
 
   it("never puts a secret in the error message", () => {
@@ -114,7 +134,9 @@ describe("loadConfig", () => {
     env.COOKIE_ENCRYPTION_KEY = "not-long-enough-but-still-a-secret";
     try {
       loadConfig(env as never);
+      throw new Error("should have refused");
     } catch (e) {
+      expect(e).toBeInstanceOf(ConfigError);
       expect((e as ConfigError).message).not.toContain("not-long-enough");
     }
   });
