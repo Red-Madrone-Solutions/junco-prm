@@ -227,7 +227,12 @@ describe("importRoster", () => {
     );
   });
 
-  it("replays a retried chunk without advancing the run twice", async () => {
+  it("replays a retried chunk via idempotency_key without advancing the run twice", async () => {
+    // Exercises withIdempotency's outer claim-and-replay mechanism. A retry
+    // carrying the SAME idempotency_key never reaches findChunkReceipt at all -
+    // withIdempotency returns the stored response first. See the test below for
+    // the mechanism this one does NOT exercise: the chunk-receipt replay a
+    // caller with no idempotency_key falls back to.
     const all = Array.from({ length: 40 }, (_, i) => ({
       external_row_key: String(i),
       full_name: `Person ${i}`,
@@ -247,6 +252,38 @@ describe("importRoster", () => {
     };
     const second = await importRoster(ctx, args);
     // The client never saw the response and sent the same chunk again.
+    const retried = await importRoster(ctx, args);
+
+    expect(retried).toEqual(second);
+    expect(retried.next_offset).toBe(40);
+    expect(await countEntries()).toBe(40);
+  });
+
+  it("replays a retried chunk via the chunk receipt when no idempotency_key is given", async () => {
+    // The spec (line 239) is explicit that a chunk is idempotent on (run_id,
+    // offset) alone: "An explicit idempotency_key is accepted but not required
+    // for this." A model looping over chunks has no reason to mint one per
+    // chunk, so THIS is the path a real dropped-response retry actually takes -
+    // findChunkReceipt, not withIdempotency's outer claim table.
+    const all = Array.from({ length: 40 }, (_, i) => ({
+      external_row_key: String(i),
+      full_name: `Person ${i}`,
+    }));
+    const first = await importRoster(ctx, {
+      ...SOURCE,
+      expected_total: all.length,
+      rows: all.slice(0, 20),
+    });
+
+    const args = {
+      ...SOURCE,
+      rows: all.slice(20),
+      run_id: first.run_id,
+      offset: first.next_offset,
+    };
+    const second = await importRoster(ctx, args);
+    // The client never saw the response and sent the exact same chunk again,
+    // with no idempotency_key to short-circuit through withIdempotency.
     const retried = await importRoster(ctx, args);
 
     expect(retried).toEqual(second);
