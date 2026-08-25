@@ -637,20 +637,29 @@ describe("logAuthFailure", () => {
 });
 
 describe("logRequest", () => {
-  it("records the path but never a query string", async () => {
+  // THE FIXTURE CARRIES A QUERY STRING, and an earlier draft's did not.
+  // That draft passed path: "/authorize" and asserted not.toContain("?"),
+  // which passes identically whether or not anything strips a query, because
+  // there was no query in the input to fail to strip. The assertion could not
+  // fail, and the implementation it was guarding did not in fact strip.
+  // Corrected 2026-08-25, found by executing this task.
+  it("STRIPS a query string rather than trusting the caller to have done it", async () => {
     // An OAuth authorize URL carries state and a redirect_uri in its query.
     // Neither is PRM content, but neither belongs in a log an operator will
     // paste into a support thread either.
     logRequest({
       requestId: "r1",
       method: "GET",
-      path: "/authorize",
+      path: "/authorize?state=abc123&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb",
       status: 302,
       durationMs: 4,
     });
     const entry = JSON.parse(lines[0]!);
     expect(entry.path).toBe("/authorize");
-    expect(JSON.stringify(entry)).not.toContain("?");
+    const serialized = JSON.stringify(entry);
+    expect(serialized).not.toContain("?");
+    expect(serialized).not.toContain("state=abc123");
+    expect(serialized).not.toContain("redirect_uri");
   });
 });
 ```
@@ -738,11 +747,16 @@ export function logRequest(fields: {
   status: number;
   durationMs: number;
 }): void {
+  // THE MODULE STRIPS IT. An earlier draft documented this as a property of
+  // the `path` field and then forwarded fields.path unmodified, which makes
+  // the invariant a thing every future caller has to remember rather than a
+  // thing this function guarantees. The one place that can enforce it is here.
+  const pathname = fields.path.split("?")[0]!;
   emit({
     event: "request",
     request_id: fields.requestId,
     method: fields.method,
-    path: fields.path,
+    path: pathname,
     status: fields.status,
     duration_ms: fields.durationMs,
   });
