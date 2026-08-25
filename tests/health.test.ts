@@ -1,20 +1,34 @@
 import { env, SELF } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+// No real migration file could ever produce this name, so a hardcoded literal
+// in health.ts cannot coincidentally match it the way it could match a value
+// read from the database's own bookkeeping.
+const SYNTHETIC_MIGRATION_NAME = "9999_marker_for_this_test.sql";
 
 beforeEach(async () => {
   await env.DB.prepare("DELETE FROM people").run();
 });
 
+afterEach(async () => {
+  // d1_migrations is shared across every test file in this run (isolate:
+  // false, maxWorkers: 1), so the synthetic row must not outlive this test.
+  await env.DB.prepare("DELETE FROM d1_migrations WHERE name = ?")
+    .bind(SYNTHETIC_MIGRATION_NAME)
+    .run();
+});
+
 describe("GET /health", () => {
   it("reports ok, the applied schema version, and configured state", async () => {
-    // Derived from the database rather than hardcoded: this project's
-    // migrations directory grows over time, and a literal filename here would
-    // go stale the moment a new migration lands, passing regardless of
-    // whether the handler still queries d1_migrations at all.
-    const lastMigration = await env.DB.prepare(
-      "SELECT name FROM d1_migrations ORDER BY id DESC LIMIT 1"
-    ).first<{ name: string }>();
-    expect(lastMigration?.name).toBeTruthy();
+    // Querying d1_migrations for the "real" last migration and asserting the
+    // handler agrees is circular: both sides read the same source, so they
+    // can be wrong together (e.g. if the handler were changed to return a
+    // hardcoded literal that happens to equal today's last migration). Insert
+    // a synthetic row instead, with a name no real migration could produce,
+    // and assert the handler reports exactly that.
+    await env.DB.prepare("INSERT INTO d1_migrations (name) VALUES (?)")
+      .bind(SYNTHETIC_MIGRATION_NAME)
+      .run();
 
     const response = await SELF.fetch("https://example.test/health");
     expect(response.status).toBe(200);
@@ -25,7 +39,7 @@ describe("GET /health", () => {
       configured: boolean;
     };
     expect(body.status).toBe("ok");
-    expect(body.schema_version).toBe(lastMigration!.name);
+    expect(body.schema_version).toBe(SYNTHETIC_MIGRATION_NAME);
     expect(body.configured).toBe(true);
   });
 
