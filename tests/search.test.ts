@@ -126,12 +126,24 @@ describe("searchPeople", () => {
     expect(out.roster_entries[0]?.stale).toBeNull();
   });
 
-  it("breaks a finished_at tie deterministically via id DESC, through searchPeople itself", async () => {
+  it("returns exactly one row per staged entry when two runs tie on finished_at", async () => {
+    // WHAT THIS GUARDS, stated accurately after it was named for something else.
+    //
     // The frozen clock every test in this suite shares makes a finished_at tie
-    // the natural case, not a contrived one. This calls the real exported
-    // searchPeople rather than a hand-copied SQL string, so it actually guards
-    // the `WITH latest AS (...)` CTE in src/tools/search.ts instead of a
-    // string literal that happens to look like it.
+    // the natural case, not a contrived one. On a tie, the obvious
+    // MAX(finished_at) formulation of the baseline joins BOTH tied runs and
+    // duplicates every roster row in the result. This calls the real exported
+    // searchPeople, so it guards the ROW_NUMBER form of the shared CTE in
+    // src/tools/latest_run.ts rather than a string literal that looks like it.
+    //
+    // It does NOT guard the DIRECTION of the tiebreak, which is what its name
+    // used to claim. The ids below are hand-written ir_1 and ir_2, for which
+    // insertion order and lexical order agree, so it passes under `id DESC` and
+    // under `rowid DESC` alike - confirmed by reverting the fix and watching it
+    // stay green. The real guard for the direction is
+    // import-finalize.test.ts > "breaks a finished_at tie by insertion order,
+    // not by comparing run ids", which chooses ids that disagree, plus the two
+    // in roster-admin.test.ts covering the other two call sites.
     await env.DB.prepare(
       "INSERT INTO roster_sources (id, source_key, label, event, url, created_at) VALUES (?, ?, ?, ?, ?, ?)"
     )
@@ -147,8 +159,8 @@ describe("searchPeople", () => {
     )
       .bind("ir_2", "rs_tie", "csv", "committed", 1, 1, T, T)
       .run();
-    // ir_2 sorts higher than ir_1, so `ORDER BY finished_at DESC, id DESC`
-    // makes ir_2 the winner despite the identical finished_at.
+    // ir_2 is inserted second, so it is the baseline under the tiebreak the
+    // CTE actually uses (rowid DESC, which tracks insertion order).
     await env.DB.prepare(
       "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
