@@ -35,6 +35,52 @@ beforeEach(async () => {
   await env.DB.prepare("DELETE FROM people").run();
 });
 
+/** The provenance row a concurrent commit would have left behind. */
+async function insertProvenanceFor(personId: string): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  )
+    .bind("ps_race", personId, "wcus-2026", "k:1", "WCUS 2026", "WCUS 2026",
+          "https://example.test/attendees", "2026-08-20T12:00:00.000Z", "{}", "sha256:x",
+          "2026-08-20T12:00:00.000Z")
+    .run();
+}
+
+/**
+ * A `db` that wedges a concurrent commit into the window the race actually
+ * lives in.
+ *
+ * The unique-constraint violation on (source_key, external_row_key) can only
+ * happen when the conflicting `person_sources` row appears AFTER the commit's
+ * `already` read and BEFORE its batch. A row inserted before the call is
+ * intercepted by the `already` fast path and the batch never runs at all, so a
+ * test that pre-inserts one proves nothing about the batch or its catch.
+ *
+ * This proxies `env.DB` and hooks the FIRST `batch()` call: it runs `before`,
+ * then delegates to the real `env.DB.batch`. Nothing in the code under test is
+ * mocked or replaced - the real D1 constraint fires inside the real batch,
+ * which is also the only way to observe whether an aborted batch rolls the
+ * `people` insert back.
+ */
+function racingDb(before: () => Promise<unknown>): D1Database {
+  let fired = false;
+  return new Proxy(env.DB, {
+    get(target, prop, receiver) {
+      if (prop === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          if (!fired) {
+            fired = true;
+            await before();
+          }
+          return target.batch(statements);
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 describe("promoteRosterEntry, first phase", () => {
   it("writes nothing and returns candidates", async () => {
     const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
@@ -190,31 +236,36 @@ describe("promoteRosterEntry, second phase", () => {
   });
 
   it("never leaves an ORPHAN PERSON when the provenance insert loses", async () => {
-    // The concurrency case, forced deterministically: write the provenance row
-    // by hand first, then promote. The insert violates the unique constraint,
-    // the batch aborts, and the person must go with it rather than surviving
-    // with no origin.
+    // The concurrency case, forced deterministically and in the right place.
+    //
+    // An earlier version of this test pre-inserted the provenance row before
+    // calling, which the `already` fast path intercepts - so the batch and its
+    // catch never ran, and the test was a third copy of coverage that "is
+    // idempotent" and "overrides create_new: true" already have. `racingDb`
+    // inserts the conflicting row between the `already` read and the batch,
+    // which is the only window where the constraint can actually fire.
     const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
     const winner = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
-    await env.DB.prepare(
-      "INSERT INTO person_sources (id, person_id, source_key, external_row_key, source_label, source_event, source_url, source_captured_at, raw_record_snapshot, content_hash_at_promotion, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-      .bind("ps_pre", winner.id, "wcus-2026", "k:1", "WCUS 2026", "WCUS 2026",
-            "https://example.test/attendees", "2026-08-20T12:00:00.000Z", "{}", "sha256:x",
-            "2026-08-20T12:00:00.000Z")
-      .run();
 
-    const out = await promoteRosterEntry(ctx, { roster_entry_id: entryId, create_new: true });
+    const out = await promoteRosterEntry(
+      { ...ctx, db: racingDb(() => insertProvenanceFor(winner.id)) },
+      { roster_entry_id: entryId, create_new: true }
+    );
     if (out.status !== "promoted") throw new Error("unreachable");
     expect(out.person.id).toBe(winner.id);
+    expect(out.linked_existing).toBe(true);
 
-    // Only the winner exists. The provenance row pre-inserted above is what a
-    // concurrent call would have left behind after committing; this call reads
-    // it via the same "already" check that also protects the true race, finds
-    // the winner, and never attempts its own insert - so no orphan and no
-    // second person are created.
-    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM people").first<{ n: number }>();
-    expect(count?.n).toBe(1);
+    // THE ORPHAN ASSERTION. The batch inserted a person and then aborted on the
+    // provenance row. If that person survived the abort, this is 2 and the
+    // database holds a durable record with no origin and no way to notice.
+    const people = await env.DB.prepare("SELECT COUNT(*) AS n FROM people").first<{ n: number }>();
+    expect(people?.n).toBe(1);
+
+    // And exactly one promotion is recorded - the winner's.
+    const sources = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM person_sources"
+    ).first<{ n: number }>();
+    expect(sources?.n).toBe(1);
   });
 
   it("stays idempotent ACROSS A PURGE AND RE-IMPORT of the same roster", async () => {
@@ -325,26 +376,63 @@ describe("promoteRosterEntry, second phase", () => {
     expect(count?.n).toBe(0);
   });
 
-  it("refuses to promote one roster entry onto a second person", async () => {
+  it("REFUSES a link that loses the roster row to a concurrent commit", async () => {
+    // The link path's race, which the `already` check cannot catch because both
+    // callers read no provenance. The loser must refuse with a code from the
+    // closed set of seven and name the winner, not surface a raw D1
+    // unique-constraint error.
+    //
+    // This slot previously held "refuses to promote one roster entry onto a
+    // second person," which asserted the same two things as "REFUSES to hand
+    // back a different person than the caller named" a few tests above - both
+    // promoted with create_new, linked to someone else, and landed on the same
+    // refusal in the `already` branch. That coverage is kept there; this is the
+    // same refusal reached through the branch nothing else exercises.
     const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
-    const other = await createPerson(ctx, { full_name: "Someone Else" });
-    const first = await promoteRosterEntry(ctx, { roster_entry_id: entryId, create_new: true });
-    if (first.status !== "promoted") throw new Error("unreachable");
+    const named = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
+    const winner = await createPerson(ctx, { full_name: "Someone Else" });
 
-    // The entry is already linked. Handing it to a different person under a
-    // success status, with linked_existing: true, would be a write against the
-    // wrong person reported as if it went where the caller meant - one roster
-    // row is one human, and that is the failure this whole design refuses.
     try {
-      await promoteRosterEntry(ctx, {
-        roster_entry_id: entryId,
-        link_to_person_id: other.id,
-      });
+      await promoteRosterEntry(
+        { ...ctx, db: racingDb(() => insertProvenanceFor(winner.id)) },
+        { roster_entry_id: entryId, link_to_person_id: named.id }
+      );
       throw new Error("expected a refusal");
     } catch (e) {
+      expect(e).toBeInstanceOf(ToolError);
       expect((e as ToolError).code).toBe("conflict");
-      expect((e as ToolError).next).toContain(first.person.id);
+      expect((e as ToolError).next).toContain(winner.id);
+      expect((e as ToolError).details).toEqual({ promoted_person_id: winner.id });
     }
+
+    // The winner's row is the only one. The refused call wrote nothing.
+    const sources = await env.DB.prepare(
+      "SELECT person_id, COUNT(*) AS n FROM person_sources"
+    ).first<{ person_id: string; n: number }>();
+    expect(sources?.n).toBe(1);
+    expect(sources?.person_id).toBe(winner.id);
+  });
+
+  it("accepts a link that loses to a concurrent commit naming the SAME person", async () => {
+    // The other half of the link path's recovery. The caller asked for this
+    // person and this person is who the roster row now belongs to, so the loser
+    // returns them rather than refusing - the same answer a sequential retry
+    // gets from the `already` branch.
+    const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
+    const named = await createPerson(ctx, { full_name: "Ada Lovelace", force: true });
+
+    const out = await promoteRosterEntry(
+      { ...ctx, db: racingDb(() => insertProvenanceFor(named.id)) },
+      { roster_entry_id: entryId, link_to_person_id: named.id }
+    );
+    if (out.status !== "promoted") throw new Error("unreachable");
+    expect(out.person.id).toBe(named.id);
+    expect(out.linked_existing).toBe(true);
+
+    const sources = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM person_sources"
+    ).first<{ n: number }>();
+    expect(sources?.n).toBe(1);
   });
 
   it("writes the person, the email, and the provenance together or not at all", async () => {

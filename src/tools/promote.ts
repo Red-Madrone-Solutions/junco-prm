@@ -294,7 +294,49 @@ export async function promoteRosterEntry(
         .first<{ id: string }>();
       if (!exists) throw new ToolError("not_found", `no person with id ${personId}`);
 
-      await ctx.db.batch(provenance(personId));
+      // THE LINK PATH LOSES RACES TOO, and it is the branch where losing one
+      // does the most damage. Two concurrent commits on the same
+      // (source_key, external_row_key) - one create_new, one link_to_person_id -
+      // both read no prior provenance at the `already` check above. The create
+      // path recovers below. Without the same recovery here, the link path
+      // surfaces a raw D1 unique-constraint error: no code from the closed set
+      // of seven, no reason in this tool's vocabulary, and no corrective next
+      // call for a caller that is a model and will otherwise guess.
+      //
+      // An earlier draft put this recovery in the create path's catch instead,
+      // where `wantsLink` is necessarily false because this branch returns
+      // first, so it could never fire.
+      try {
+        await ctx.db.batch(provenance(personId));
+      } catch (e) {
+        const winner = await ctx.db
+          .prepare(
+            "SELECT person_id FROM person_sources WHERE source_key = ? AND external_row_key = ?"
+          )
+          .bind(entry.source_key, entry.external_row_key)
+          .first<{ person_id: string }>();
+
+        // Only a lost race explains a winner being there now. Anything else is
+        // a real failure and must not be dressed up as a successful promotion.
+        if (!winner) throw e;
+
+        // Someone other than the person this call named got the roster row.
+        // This is the same refusal the `already` branch makes, reached a few
+        // milliseconds later, and it carries the same code and the same next
+        // call so the caller cannot tell the two timings apart.
+        if (winner.person_id !== personId) {
+          throw new ToolError(
+            "conflict",
+            `roster entry ${entryId} was promoted to a different person while this call was in flight`,
+            `call get_person with person_id ${winner.person_id} to see who this roster row belongs to`,
+            { promoted_person_id: winner.person_id }
+          );
+        }
+
+        // The winner IS the person this call named, so the caller's intent was
+        // satisfied by whoever got there first. Fall through and return them,
+        // which is the same answer the sequential retry gives.
+      }
 
       return {
         status: "promoted" as const,
@@ -362,15 +404,10 @@ export async function promoteRosterEntry(
       // real failure and must not be dressed up as a successful promotion.
       if (!winner) throw e;
 
-      if (wantsLink && input.link_to_person_id !== winner.person_id) {
-        throw new ToolError(
-          "conflict",
-          `roster entry ${entryId} was promoted to a different person while this call was in flight`,
-          `call get_person with person_id ${winner.person_id} to see who this roster row belongs to`,
-          { promoted_person_id: winner.person_id }
-        );
-      }
-
+      // No `wantsLink` check here. The link branch above returns before this
+      // point, so `wantsLink` is necessarily false and a copy of that refusal
+      // in this catch could never fire. It lives in the link branch instead,
+      // which is the branch that can actually reach it.
       return {
         status: "promoted" as const,
         person: await getPerson(ctx, { person_id: winner.person_id }),
