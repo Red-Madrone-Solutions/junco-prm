@@ -25,9 +25,9 @@ async function seedRoster() {
     .bind("ir_a", "rs_a", "csv", "committed", 1, 1, T, T)
     .run();
   await env.DB.prepare(
-    "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind("re_1", "rs_a", "row-1", "sha256:x", "Grace Hopper", "Navy", "https://example.test", T, "{}", "ir_a", T, T)
+    .bind("re_1", "rs_a", "row-1", "sha256:x", "Grace Hopper", "Navy", "https://example.test", T, "{}", "ir_a", "ir_a", T, T)
     .run();
 }
 
@@ -150,14 +150,14 @@ describe("searchPeople", () => {
     // ir_2 sorts higher than ir_1, so `ORDER BY finished_at DESC, id DESC`
     // makes ir_2 the winner despite the identical finished_at.
     await env.DB.prepare(
-      "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind("re_tie_current", "rs_tie", "row-tie-1", "sha256:x", "Hopper Tie Current", null, "https://example.test", T, "{}", "ir_2", T, T)
+      .bind("re_tie_current", "rs_tie", "row-tie-1", "sha256:x", "Hopper Tie Current", null, "https://example.test", T, "{}", "ir_2", "ir_2", T, T)
       .run();
     await env.DB.prepare(
-      "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, organization, source_url, source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-      .bind("re_tie_stale", "rs_tie", "row-tie-2", "sha256:x", "Hopper Tie Stale", null, "https://example.test", T, "{}", "ir_1", T, T)
+      .bind("re_tie_stale", "rs_tie", "row-tie-2", "sha256:x", "Hopper Tie Stale", null, "https://example.test", T, "{}", "ir_1", "ir_1", T, T)
       .run();
 
     const out = await searchPeople(ctx, { query: "Hopper Tie", scope: "roster" });

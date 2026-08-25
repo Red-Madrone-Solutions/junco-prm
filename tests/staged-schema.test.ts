@@ -32,12 +32,14 @@ function insertEntry(
   key: string,
   runId: string,
   hash = "sha256:content-1",
-  name = "Ada Lovelace"
+  name = "Ada Lovelace",
+  /** Simulates finalize_import's promotion. Defaults to unpromoted (NULL). */
+  committedRunId: string | null = null
 ) {
   return env.DB.prepare(
-    "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, source_url, source_captured_at, raw_record, last_seen_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO roster_entries (id, roster_source_id, external_row_key, content_hash, full_name, source_url, source_captured_at, raw_record, last_seen_run_id, committed_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind(id, sourceId, key, hash, name, "https://example.test/a", T, "{}", runId, T, T)
+    .bind(id, sourceId, key, hash, name, "https://example.test/a", T, "{}", runId, committedRunId, T, T)
     .run();
 }
 
@@ -96,14 +98,20 @@ describe("staged schema", () => {
 
   it("derives staleness from the source's latest completed run, with no column for it", async () => {
     // A row seen in August and absent from September is stale. Nothing writes a
-    // flag; the fact falls out of last_seen_run_id against the latest completed
-    // run. Task 14 and Task 9 both read it this way.
+    // flag; the fact falls out of committed_run_id against the latest completed
+    // run - never last_seen_run_id, which stamps unconditionally on every
+    // write, open run included, and so would invert staleness the instant an
+    // abandoned run touched a row. committed_run_id only moves when
+    // finalize_import promotes it (migrations/0008). Task 14 and Task 9 both
+    // read it this way.
     const sourceId = await seedSource();
     const august = await seedRun(sourceId, "ir_aug", "committed", "2026-08-01T00:00:00Z");
     const september = await seedRun(sourceId, "ir_sep", "committed", "2026-09-01T00:00:00Z");
 
-    await insertEntry("re_current", sourceId, "row-1", september);
-    await insertEntry("re_stale", sourceId, "row-2", august);
+    // Both runs are seeded already committed, so both entries simulate having
+    // been promoted by finalize_import at the time their run finished.
+    await insertEntry("re_current", sourceId, "row-1", september, undefined, undefined, september);
+    await insertEntry("re_stale", sourceId, "row-2", august, undefined, undefined, august);
 
     // THE SAME FORMULATION TASKS 9 AND 14 USE, verbatim. Two things about it
     // are load-bearing and neither is obvious.
@@ -128,7 +136,7 @@ describe("staged schema", () => {
        )
        SELECT e.id,
               CASE WHEN l.run_id IS NULL THEN NULL
-                   WHEN e.last_seen_run_id = l.run_id THEN 0
+                   WHEN e.committed_run_id = l.run_id THEN 0
                    ELSE 1 END AS stale
          FROM roster_entries e
          LEFT JOIN latest l ON l.roster_source_id = e.roster_source_id

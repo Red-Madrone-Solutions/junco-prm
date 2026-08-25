@@ -296,9 +296,14 @@ export async function searchPeople(
     // join survives a purge and a re-import a year later; a link to a staged
     // row does not.
     //
-    // `stale` is DERIVED from last_seen_run_id against the source's latest
-    // completed run. No column stores it, because a caller assertion cannot
-    // gate a destructive operation and so nothing is allowed to write one.
+    // `stale` is DERIVED from committed_run_id against the source's latest
+    // completed run - never from last_seen_run_id, which stamps unconditionally
+    // on every write, open run included, and so would flip a row stale the
+    // instant an abandoned run touched it. committed_run_id only ever moves
+    // when finalize_import promotes it, so an abandoned run cannot reach this
+    // comparison at all. See migrations/0008. No column stores `stale` itself,
+    // because a caller assertion cannot gate a destructive operation and so
+    // nothing is allowed to write one.
     //
     // The WHERE clause has no `retired_at IS NULL`. Nothing is ever retired, and
     // a stale row stays searchable on purpose.
@@ -329,7 +334,7 @@ export async function searchPeople(
                     AND ps.external_row_key = re.external_row_key
                   LIMIT 1) AS promoted_person_id,
                 CASE WHEN l.run_id IS NULL THEN NULL
-                     WHEN re.last_seen_run_id = l.run_id THEN 0
+                     WHEN re.committed_run_id = l.run_id THEN 0
                      ELSE 1 END AS stale,
                 l.finished_at AS source_last_imported_at
            FROM roster_entries re
