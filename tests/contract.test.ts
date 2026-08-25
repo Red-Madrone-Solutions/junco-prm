@@ -353,9 +353,23 @@ describe("tool registry", () => {
     for (const [name, input] of wrongKind) {
       const tool = TOOLS[name];
       if (!tool) throw new Error(`no tool ${name}`);
-      await expect(tool.run(ctx, input as never), `${name} accepted a wrong-kind id`).rejects.toThrow(
-        ToolError
-      );
+      // ASSERTING THE CODE, NOT THE CLASS, and that is the whole test.
+      // Ids carry a UUID and are unique across every table, so a p_ id simply
+      // matches no roster source - every tool here throws `not_found` on a
+      // wrong-kind id even with the prefix check removed from assertId
+      // entirely. Proven: deleting that check passed all 16 contract tests, and
+      // dropping assertId from purge_roster_source alone passed all 330. What
+      // the discipline actually buys is the `invalid_id` code and the
+      // corrective next call that tells a model to promote the roster entry
+      // first, and only this assertion binds to it.
+      let thrown: unknown;
+      try {
+        await tool.run(ctx, input as never);
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown, `${name} accepted a wrong-kind id`).toBeInstanceOf(ToolError);
+      expect((thrown as ToolError).code, `${name} did not report invalid_id`).toBe("invalid_id");
     }
   });
 });

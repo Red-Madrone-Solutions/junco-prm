@@ -127,9 +127,17 @@ describe("importRoster", () => {
       external_row_key: String(i),
       full_name: `Person ${i}`,
     }));
-    await expect(
-      importRoster(ctx, { ...SOURCE, expected_total: rows.length, rows })
-    ).rejects.toThrow(ToolError);
+    let thrown: unknown;
+    try {
+      await importRoster(ctx, { ...SOURCE, expected_total: rows.length, rows });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(ToolError);
+    // `limit_exceeded` and not `invalid_input`: the fix is "ask for less", and
+    // an agent that reads the code decides to re-chunk rather than to give up.
+    expect((thrown as ToolError).code).toBe("limit_exceeded");
+    expect((thrown as ToolError).next).toContain("run_id");
     expect(await countEntries()).toBe(0);
   });
 

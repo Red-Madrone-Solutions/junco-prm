@@ -188,7 +188,16 @@ describe("promoteRosterEntry, first phase", () => {
   });
 
   it("rejects a person id where a roster entry id belongs", async () => {
-    await expect(promoteRosterEntry(ctx, { roster_entry_id: newId("p") })).rejects.toThrow(ToolError);
+    try {
+      await promoteRosterEntry(ctx, { roster_entry_id: newId("p") });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ToolError);
+      // `invalid_id`, not `not_found`. Ids are unique across tables, so a p_ id
+      // simply matches no roster entry and the tool would refuse either way -
+      // what the prefix check buys is this code and the next call it names.
+      expect((e as ToolError).code).toBe("invalid_id");
+    }
   });
 });
 
