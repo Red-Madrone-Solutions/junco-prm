@@ -8385,7 +8385,7 @@ describe("promoteRosterEntry, second phase", () => {
       expect.objectContaining({ contact_type: "email", value: "ada@example.test" }),
     ]);
     expect(out.person.sources).toEqual([
-      expect.objectContaining({ source_key: "wcus-2026", external_row_key: "1" }),
+      expect.objectContaining({ source_key: "wcus-2026", external_row_key: "k:1" }),
     ]);
   });
 
@@ -8625,7 +8625,7 @@ describe("promoteRosterEntry, second phase", () => {
     const linked = await env.DB.prepare(
       "SELECT person_id, raw_record_snapshot FROM person_sources WHERE source_key = ? AND external_row_key = ?"
     )
-      .bind("wcus-2026", "1")
+      .bind("wcus-2026", "k:1")
       .first<{ person_id: string; raw_record_snapshot: string }>();
     expect(linked?.person_id).toBe(out.person.id);
     expect(linked?.raw_record_snapshot).toBeTruthy();
