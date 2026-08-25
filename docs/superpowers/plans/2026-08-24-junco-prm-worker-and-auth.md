@@ -135,8 +135,10 @@ Plan 1 owns `src/tools/`, `src/errors.ts`, `src/ids.ts`, `src/time.ts`, `src/nor
 
 **Tests**
 
-- `tests/config.test.ts`, `tests/health.test.ts`, `tests/auth-github.test.ts`, `tests/authorize.test.ts`, `tests/mcp.test.ts`, `tests/ratelimit.test.ts`
+- `tests/config.test.ts`, `tests/health.test.ts`, `tests/auth-github.test.ts`, `tests/authorize.test.ts`, `tests/idempotency-retention.test.ts`, `tests/mcp.test.ts`, `tests/ratelimit.test.ts`
 - `tests/deployed.md` - the manual end-to-end script for Task 9. A markdown checklist rather than a test file, because it runs against a real deployment through a real client and no runner can drive it.
+
+**Task 6b modifies plan 1's `src/idempotency.ts`, and it is the only plan 2 task that reaches back into plan 1.** That is deliberate: the defect it closes is invisible until a Worker with a request lifetime is in front of the database, and the fix's correctness depends on knowing what that lifetime is. Plan 1 had no way to know. Nothing else in this plan edits plan 1 code, and a task that finds itself wanting to should stop and say so instead.
 
 **There is no `src/auth/index.ts` re-exporting the other three.** A barrel file over three modules whose whole point is that they do different jobs would undo the separation this plan is organized around. `src/index.ts` imports each by name, and the import list is a readable summary of what the Worker is made of.
 
@@ -2419,6 +2421,333 @@ git commit -m "feat: check the owner's numeric id on every request"
 
 ---
 
+### Task 6b: Reclaiming a wedged idempotency claim, and pruning what completed
+
+**Files:**
+- Modify: `src/idempotency.ts` (plan 1)
+- Test: `tests/idempotency-retention.test.ts`
+
+**Interfaces:**
+- Consumes: `ToolContext` and `nowIso` from plan 1.
+- Produces:
+  - `const IN_FLIGHT_RECLAIM_MS` and `const IDEMPOTENCY_RETENTION_MS`, both exported so tests bind to them rather than to literals
+  - no new exported function; `withIdempotency`'s signature is unchanged
+
+**This task modifies plan 1's code from inside plan 2, which is deliberate and is the reason it sits here rather than in plan 1.** The defect it closes is invisible until a Worker with a request lifetime is in front of the database, and the fix's correctness depends on knowing what that lifetime is. Plan 1 had no way to know. Task 7 is what makes it reachable, so this lands immediately before Task 7 and not after.
+
+**The defect, exactly.** `withIdempotency` claims a key by inserting a row with `response_json` NULL, runs the operation, then fills in `response_json` and `completed_at`. The `catch` around `run()` deletes the claim so a corrected retry can reuse the key. **Nothing covers the gap between the mutation committing and the response being recorded.** If the isolate is evicted there, the row stays with `response_json` NULL forever, and every later call with that key takes the branch at `src/idempotency.ts:92` and throws `conflict` saying "still in flight; retry once the first call returns". The first call is never going to return. That key is dead for the life of the deployment.
+
+`idempotency_keys` has no `expires_at`, unlike `confirmations`, so nothing reclaims it and nothing prunes it.
+
+**Why a TTL reclaim rather than one atomic batch.** The alternative considered was making the claim and the mutation a single `db.batch()`, so there is no gap to crash in. That requires every tool's writes to be expressible as one batch, and `createPerson` and `promoteRosterEntry` are not: promotion reads provenance, decides, and then writes, and its create path deliberately lets a UNIQUE violation abort the batch and reloads the winner. Forcing those into one batch to satisfy the idempotency layer is the tail wagging the dog. The spec already promises that "rows older than a retention window are prunable", so a window is a mechanism this design has committed to elsewhere.
+
+**State the cost honestly, because this trade is real.** Reclaiming a wedged claim and re-running the tool can execute a mutation that already committed. For `finalize_import`, `complete_followup`, `cancel_followup` and `promote_roster_entry` that is harmless: each is guarded by a `WHERE` clause or a prior-provenance check that makes a second run a no-op or a `conflict`. For `create_person` the duplicate check catches most cases and the caller sees candidates. For `log_encounter` a second run genuinely logs a second encounter.
+
+**That is not a new hazard, and this is the argument that settles it.** Today a caller facing a wedged key has exactly one escape: call again with a *different* key, which re-runs the mutation with no protection at all. The reclaim does not introduce double-execution; it makes the existing escape hatch automatic, bounded by a window long enough that the original call is certainly dead, and **observable**, which the current workaround is not. A reclaim that happens silently is worse than the wedge it fixes, so it logs.
+
+**The window has to be longer than any request can live.** A Worker request cannot outlive its own invocation, so a claim older than fifteen minutes belongs to an isolate that is gone. Fifteen minutes is far past any real request and far short of a human noticing a broken key. `IN_FLIGHT_RECLAIM_MS` is fifteen minutes. Do not make it configurable: an operator who tunes it down turns a safety margin into a double-write.
+
+**The prune is a separate concern in the same table.** Completed rows accumulate forever, and `response_json` holds whatever the tool returned, which for most writes is a full person record. That makes the table a slow shadow copy of the PRM, which is the same reason `delete_person` redacts what it stores. `IDEMPOTENCY_RETENTION_MS` is thirty days, well beyond any retry a client would attempt.
+
+**The prune runs opportunistically, bounded, on a successful claim, and not on a cron.** A Cron Trigger was the alternative and would keep the hot path clean, but it adds a scheduled handler, a `wrangler.jsonc` section, and a second entrypoint to test, for a table that grows by one row per idempotent write. One bounded `DELETE` per newly claimed key is self-healing, needs no deploy surface, and cannot fall behind faster than it is filled. Bound it at 100 rows per call so a long-neglected instance does not spend an unbounded delete on one unlucky request.
+
+**Express the bound as a subquery, not as `DELETE ... LIMIT`.** `DELETE` with `LIMIT` requires a SQLite compiled with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` and D1's build is not documented to have it. `DELETE FROM idempotency_keys WHERE key IN (SELECT key FROM ... LIMIT ?)` works everywhere.
+
+**The prune sweeps two shapes, and missing the second one leaves the original bug half-fixed.** Completed rows older than the retention window, and *claims* older than it that were never reclaimed because nobody ever retried that key. A wedged claim nobody retries is still a row that never goes away.
+
+**Tests need two instants, so this test file does not use a frozen clock.** Every other `ToolContext` in the suite pins one instant, and that is exactly what hid three separate defects in plan 1: a tiebreak decided by comparing random UUIDs, a staleness branch that only appears on a NULL, and a repeat purge reporting a timestamp the row did not hold. A feature whose whole subject is elapsed time cannot be tested that way. Use a mutable `let now` and advance it.
+
+- [ ] **Step 1: Write the failing test `tests/idempotency-retention.test.ts`**
+
+```ts
+import { env } from "cloudflare:test";
+import { beforeEach, describe, expect, it } from "vitest";
+import type { ToolContext } from "../src/context";
+import { ToolError } from "../src/errors";
+import {
+  IDEMPOTENCY_RETENTION_MS,
+  IN_FLIGHT_RECLAIM_MS,
+  withIdempotency,
+} from "../src/idempotency";
+
+// A MUTABLE clock, unlike every other test file in this suite. See the note
+// above: a frozen instant cannot test a feature about elapsed time, and three
+// defects in plan 1 hid behind exactly that.
+let now = new Date("2026-08-20T12:00:00Z");
+const ctx: ToolContext = {
+  db: env.DB,
+  timezone: "UTC",
+  clock: () => now,
+};
+
+const advance = (ms: number) => {
+  now = new Date(now.getTime() + ms);
+};
+
+beforeEach(async () => {
+  now = new Date("2026-08-20T12:00:00Z");
+  await env.DB.prepare("DELETE FROM idempotency_keys").run();
+});
+
+/** Wedge a key the way an evicted isolate does: claim it, never complete it. */
+async function wedge(key: string, tool = "log_encounter") {
+  await expect(
+    withIdempotency(ctx, tool, key, { a: 1 }, async () => {
+      throw new Error("isolate evicted");
+    })
+  ).rejects.toThrow("isolate evicted");
+  // withIdempotency's catch releases the claim, so put it back by hand - the
+  // crash this task is about happens AFTER run() returns, where no catch runs.
+  await env.DB.prepare(
+    `INSERT INTO idempotency_keys (key, tool, subject_id, request_hash, response_json, created_at)
+     VALUES (?, ?, NULL, ?, NULL, ?)`
+  )
+    .bind(`${tool}:${key}`, tool, await hashOf({ a: 1 }), now.toISOString())
+    .run();
+}
+
+async function hashOf(input: unknown) {
+  const { hashJson } = await import("../src/idempotency");
+  return hashJson(input);
+}
+
+describe("a wedged claim", () => {
+  it("still refuses a retry while the original call could plausibly be running", async () => {
+    await wedge("k1");
+    advance(IN_FLIGHT_RECLAIM_MS - 1000);
+
+    await expect(
+      withIdempotency(ctx, "log_encounter", "k1", { a: 1 }, async () => "second run")
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("is RECLAIMED once no isolate could still be holding it", async () => {
+    await wedge("k2");
+    advance(IN_FLIGHT_RECLAIM_MS + 1000);
+
+    const result = await withIdempotency(
+      ctx,
+      "log_encounter",
+      "k2",
+      { a: 1 },
+      async () => "second run"
+    );
+    expect(result).toBe("second run");
+
+    // And the reclaimed key now behaves like any completed key.
+    const replay = await withIdempotency(
+      ctx,
+      "log_encounter",
+      "k2",
+      { a: 1 },
+      async () => "third run"
+    );
+    expect(replay).toBe("second run");
+  });
+
+  it("is reclaimed only for the SAME arguments", async () => {
+    await wedge("k3");
+    advance(IN_FLIGHT_RECLAIM_MS + 1000);
+
+    await expect(
+      withIdempotency(ctx, "log_encounter", "k3", { a: 2 }, async () => "different input")
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("is reclaimed by exactly one of two concurrent retries", async () => {
+    await wedge("k4");
+    advance(IN_FLIGHT_RECLAIM_MS + 1000);
+
+    const runs: string[] = [];
+    const both = await Promise.allSettled([
+      withIdempotency(ctx, "log_encounter", "k4", { a: 1 }, async () => {
+        runs.push("A");
+        return "A";
+      }),
+      withIdempotency(ctx, "log_encounter", "k4", { a: 1 }, async () => {
+        runs.push("B");
+        return "B";
+      }),
+    ]);
+
+    // One reclaims and runs. The other either replays its result or is refused
+    // as in flight, but it must NOT run the operation a second time.
+    expect(runs).toHaveLength(1);
+    expect(both.some((r) => r.status === "fulfilled")).toBe(true);
+  });
+});
+
+describe("the prune", () => {
+  it("removes a COMPLETED row past the retention window", async () => {
+    await withIdempotency(ctx, "log_encounter", "old", { a: 1 }, async () => "done");
+    advance(IDEMPOTENCY_RETENTION_MS + 1000);
+
+    // Any later claim triggers the opportunistic sweep.
+    await withIdempotency(ctx, "log_encounter", "new", { a: 1 }, async () => "done");
+
+    const row = await env.DB.prepare("SELECT key FROM idempotency_keys WHERE key = ?")
+      .bind("log_encounter:old")
+      .first();
+    expect(row).toBeNull();
+  });
+
+  it("removes a WEDGED claim nobody ever retried", async () => {
+    await wedge("abandoned");
+    advance(IDEMPOTENCY_RETENTION_MS + 1000);
+
+    await withIdempotency(ctx, "log_encounter", "unrelated", { a: 1 }, async () => "done");
+
+    const row = await env.DB.prepare("SELECT key FROM idempotency_keys WHERE key = ?")
+      .bind("log_encounter:abandoned")
+      .first();
+    expect(row).toBeNull();
+  });
+
+  it("leaves a row that is inside the window", async () => {
+    await withIdempotency(ctx, "log_encounter", "recent", { a: 1 }, async () => "done");
+    advance(IDEMPOTENCY_RETENTION_MS - 1000);
+
+    await withIdempotency(ctx, "log_encounter", "other", { a: 1 }, async () => "done");
+
+    const row = await env.DB.prepare("SELECT key FROM idempotency_keys WHERE key = ?")
+      .bind("log_encounter:recent")
+      .first();
+    expect(row).not.toBeNull();
+  });
+
+  it("deletes at most PRUNE_BATCH rows in one call", async () => {
+    for (let i = 0; i < 150; i++) {
+      await withIdempotency(ctx, "log_encounter", `bulk-${i}`, { a: 1 }, async () => "done");
+    }
+    advance(IDEMPOTENCY_RETENTION_MS + 1000);
+
+    await withIdempotency(ctx, "log_encounter", "trigger", { a: 1 }, async () => "done");
+
+    const { n } = (await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM idempotency_keys"
+    ).first<{ n: number }>())!;
+    // 150 old rows minus one bounded sweep of 100, plus the trigger row itself.
+    expect(n).toBe(51);
+  });
+});
+```
+
+- [ ] **Step 2: Run it to make sure it fails**
+
+Run: `npx vitest run tests/idempotency-retention.test.ts`
+
+Expected: FAIL. `IN_FLIGHT_RECLAIM_MS` and `IDEMPOTENCY_RETENTION_MS` are not exported yet, so the file does not import.
+
+- [ ] **Step 3: Add the reclaim and the prune to `src/idempotency.ts`**
+
+Both constants exported, the reclaim inside the existing `claim.meta.changes === 0` branch, and the prune after a successful claim.
+
+```ts
+/**
+ * How long a claim with no response can sit before another call may take it
+ * over. A Worker request cannot outlive its own invocation, so a claim older
+ * than this belongs to an isolate that is gone.
+ *
+ * NOT configurable on purpose. An operator who tunes this down turns a safety
+ * margin into a double-write.
+ */
+export const IN_FLIGHT_RECLAIM_MS = 15 * 60 * 1000;
+
+/**
+ * How long a row survives after it completes. `response_json` holds whatever
+ * the tool returned, which for most writes is a full person record, so this
+ * table is a slow shadow copy of the PRM if nothing prunes it.
+ */
+export const IDEMPOTENCY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Bounded so a long-neglected instance cannot spend an unbounded delete on one request. */
+const PRUNE_BATCH = 100;
+```
+
+In the contention branch, before the in-flight refusal at the existing
+`existing.response_json === null` check, attempt the reclaim:
+
+```ts
+if (existing.response_json === null) {
+  // THE RECLAIM. Take the claim over only if no isolate could still hold it.
+  // The UPDATE is the lock: its WHERE re-checks both the NULL response and the
+  // age, so two concurrent retries cannot both win it.
+  const cutoff = new Date(Date.parse(at) - IN_FLIGHT_RECLAIM_MS).toISOString();
+  const reclaimed = await ctx.db
+    .prepare(
+      `UPDATE idempotency_keys SET created_at = ?
+        WHERE key = ? AND response_json IS NULL AND created_at < ?`
+    )
+    .bind(at, scoped, cutoff)
+    .run();
+
+  if (reclaimed.meta.changes === 0) {
+    throw new ToolError(
+      "conflict",
+      `idempotency_key "${key}" is still in flight for ${tool}; retry once the first call returns`
+    );
+  }
+
+  // A reclaim that happens silently is worse than the wedge it fixes: the
+  // operation is about to run a second time, and if the first one committed
+  // before its isolate died, this is the moment a duplicate is created.
+  console.log(JSON.stringify({ event: "idempotency_claim_reclaimed", tool }));
+  // Fall through to run(). Do NOT return.
+}
+```
+
+**Note what the log line does not contain: no key, no input, no subject.** Plan 1's
+constraint that logs never carry PRM content holds here, and the key itself is
+caller-chosen text that a roster could have supplied.
+
+**It is a bare `console.log` rather than Task 2's `logToolCall`, and that is on
+purpose.** `src/idempotency.ts` is plan 1 code with no Worker dependencies, and
+importing plan 2's logger into it would invert the dependency the whole plan
+rests on. The line carries no field Task 2's redaction exists to protect, and
+`ToolContext` has no `requestId` to correlate it with. If Task 2's logger later
+grows a form that plan 1 can import without pulling in `Env`, move it then.
+
+After a successful claim insert, sweep:
+
+```ts
+// Opportunistic, bounded, and expressed as a subquery because DELETE ... LIMIT
+// needs a SQLite built with SQLITE_ENABLE_UPDATE_DELETE_LIMIT and D1's build is
+// not documented to have it.
+//
+// Two shapes, and missing the second leaves the wedge half-fixed: rows that
+// COMPLETED long ago, and claims nobody ever retried, which would otherwise
+// never be reclaimed and never removed.
+const staleBefore = new Date(Date.parse(at) - IDEMPOTENCY_RETENTION_MS).toISOString();
+await ctx.db
+  .prepare(
+    `DELETE FROM idempotency_keys WHERE key IN (
+       SELECT key FROM idempotency_keys
+        WHERE (completed_at IS NOT NULL AND completed_at < ?1)
+           OR (response_json IS NULL AND created_at < ?1)
+        LIMIT ?2
+     )`
+  )
+  .bind(staleBefore, PRUNE_BATCH)
+  .run();
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run tests/idempotency-retention.test.ts` then the full suite.
+
+Expected: PASS, and the whole suite green. `withIdempotency`'s signature did not change, so nothing else should move.
+
+**Prove the reclaim test is sensitive before you believe it.** Set `IN_FLIGHT_RECLAIM_MS` to `Number.MAX_SAFE_INTEGER` and confirm "is RECLAIMED once no isolate could still be holding it" fails while "still refuses a retry" stays green. Then set it to `0` and confirm the opposite. A test that passes under both is testing nothing.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/idempotency.ts tests/idempotency-retention.test.ts
+git commit -m "feat: reclaim a wedged idempotency claim and prune what completed"
+```
+
+---
+
 ### Task 7: MCP over stateless Streamable HTTP
 
 **Files:**
@@ -2433,7 +2762,7 @@ git commit -m "feat: check the owner's numeric id on every request"
   - `function buildServer(config: Config, env: Env, requestId: string): Server` - the **low-level** `Server`, not `McpServer`; see Step 4
   - `function mcpHandler(config: Config, requestId: string): ExportedHandler`
 
-**This is the task that makes everything before it usable.** Plan 1 built 28 tools nobody could reach; Tasks 1 through 6 built a Worker that authenticates but serves nothing. This connects them, and it is deliberately thin: it iterates the registry, dispatches, and maps errors. Every decision about *what* a tool does was made in plan 1.
+**This is the task that makes everything before it usable.** Plan 1 built 28 tools nobody could reach; Tasks 1 through 6b built a Worker that authenticates, keeps its own retry bookkeeping honest, and serves nothing. This connects them, and it is deliberately thin: it iterates the registry, dispatches, and maps errors. Every decision about *what* a tool does was made in plan 1.
 
 **Stateless, with no Durable Object.** Cloudflare's `McpAgent` templates are deprecated for new servers, and stateless avoids both an extra binding and a class of session bugs. Concretely: a new `McpServer` and a new transport are constructed per request, used once, and discarded. There is no session id to track, no `GET` long-poll to hold open, and no state that can diverge between a client's view and the server's.
 
