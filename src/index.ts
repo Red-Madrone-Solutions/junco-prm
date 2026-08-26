@@ -3,6 +3,7 @@ import { ConfigError, configErrorResponse, loadConfig } from "./config";
 import { health } from "./health";
 import { logRequest, newRequestId } from "./log";
 import { mcpHandler } from "./mcp/transport";
+import { checkRateLimit, rateLimitedResponse } from "./ratelimit";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -20,6 +21,28 @@ export default {
       });
       return response;
     };
+
+    // WRAPS THE PROVIDER, AND COVERS EVERY ROUTE INCLUDING /health AND /mcp.
+    //
+    // The previous version exempted both, and the reasoning for each was wrong.
+    //
+    // /health was exempt because the branch above returns before this line. The
+    // spec names /health explicitly as one of the routes the limiter exists to
+    // protect, and it costs a D1 query per hit.
+    //
+    // /mcp was exempt on the grounds that "rate-limiting the owner's own tool
+    // calls would throttle the only legitimate traffic." That confused a path
+    // with a caller. /mcp is not the authenticated path, it is the path that
+    // REQUIRES authentication - and it is reachable by anyone. An anonymous
+    // flood of token-shaped garbage still costs a Worker invocation and a KV
+    // read for each token the provider tries to validate, which is exactly the
+    // quota this limiter exists to defend.
+    //
+    // The real argument was for a HIGHER limit on /mcp, not for no limit.
+    const bucket = url.pathname === "/mcp" ? "mcp" : "public";
+    if (!(await checkRateLimit(env, request, bucket))) {
+      return finish(rateLimitedResponse(requestId));
+    }
 
     // /health answers before configuration is checked, and it is the ONLY
     // route that does. An operator debugging an unconfigured instance needs
