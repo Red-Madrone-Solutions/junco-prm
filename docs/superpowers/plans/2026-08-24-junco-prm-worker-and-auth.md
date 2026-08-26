@@ -100,7 +100,8 @@ Every variable and binding this Worker reads, in one place, because a fail-close
 |---|---|
 | `DB` | The D1 database from plan 1. |
 | `OAUTH_KV` | Workers KV. Required by `workers-oauth-provider` for authorization state and issued grants. |
-| `RATE_LIMITER` | The Workers rate-limiting binding, **only if Task 0 found it available on the free plan.** See Task 8. |
+| `RATE_LIMITER` | The Workers rate-limiting binding for the OAuth and `/health` routes, 60 per 60s. Task 0 confirmed the binding IS available on a free plan. See Task 8. |
+| `MCP_RATE_LIMITER` | The same binding for `/mcp`, at 600 per 60s. **An earlier draft of this table listed only `RATE_LIMITER` while Task 8's code used both**, which was found by executing Task 1 and ruled on at Task 8. See the note there. |
 
 **`OWNER_GITHUB_USER_ID` is a plain variable rather than a secret, and that is deliberate.** It is not a credential - it is a public number anyone can look up from a username - and making it a secret would hide it from `wrangler deploy` output and the dashboard, which is exactly where an operator needs to see it when debugging why their own requests are being refused. Its secrecy was never what protects the instance; the OAuth flow is.
 
@@ -3344,7 +3345,13 @@ git commit -m "feat: serve the tool registry over stateless MCP"
 
 ---
 
-### Task 8: Rate limiting the unauthenticated surface
+### Task 8: Rate limiting what strangers can reach
+
+**The title used to say "the unauthenticated surface", and the two limiters this task builds did not fit under it.** `RATE_LIMITER` covers the OAuth and `/health` routes, which the spec enumerates. `MCP_RATE_LIMITER` covers `/mcp`, which is authenticated - and which is nonetheless **reachable by anyone who finds the URL**, because refusing a stranger still costs a Worker invocation and a KV token lookup before `assertOwner` ever gets to say no.
+
+**Ruling, 2026-08-25: both limiters stay, and the configuration table was the defect rather than the code.** The spec's rate-limiting bullet enumerates the OAuth and `/health` routes and does not name `/mcp`, but its stated reason is that unlimited requests "burn Worker requests, D1 reads, and the deployer's own GitHub application quota" - and an anonymous flood of invalid tokens at `/mcp` burns exactly those. The omission reads as an oversight from writing that bullet while thinking about the OAuth surface, not as a decision to leave `/mcp` unprotected. The two ceilings differ because the traffic does: 60 per minute is generous for a human completing a sign-in, and 600 is what the owner's own tool calls need.
+
+**Cost if this ruling is wrong:** one extra binding on a free plan, which Task 0 measured as costing nothing, and a ceiling the owner could hit only by making ten tool calls a second.
 
 **Files:**
 - Create: `src/ratelimit.ts`
