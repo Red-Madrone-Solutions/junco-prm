@@ -7,6 +7,26 @@ export async function hashJson(value: unknown): Promise<string> {
   return sha256Hex(canonicalJson(value));
 }
 
+/**
+ * How long a claim with no response can sit before another call may take it
+ * over. A Worker request cannot outlive its own invocation, so a claim older
+ * than this belongs to an isolate that is gone.
+ *
+ * NOT configurable on purpose. An operator who tunes this down turns a safety
+ * margin into a double-write.
+ */
+export const IN_FLIGHT_RECLAIM_MS = 15 * 60 * 1000;
+
+/**
+ * How long a row survives after it completes. `response_json` holds whatever
+ * the tool returned, which for most writes is a full person record, so this
+ * table is a slow shadow copy of the PRM if nothing prunes it.
+ */
+export const IDEMPOTENCY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Bounded so a long-neglected instance cannot spend an unbounded delete on one request. */
+const PRUNE_BATCH = 100;
+
 export async function withIdempotency<T>(
   ctx: ToolContext,
   tool: string,
@@ -89,13 +109,41 @@ export async function withIdempotency<T>(
         `idempotency_key "${key}" was already used by ${tool} with different arguments`
       );
     }
-    if (existing.response_json === null) {
+    if (existing.response_json !== null) {
+      return JSON.parse(existing.response_json) as T;
+    }
+
+    // THE RECLAIM. Take the claim over only if no isolate could still hold it.
+    // The UPDATE is the lock: its WHERE re-checks both the NULL response and the
+    // age, so two concurrent retries cannot both win it.
+    const cutoff = new Date(Date.parse(at) - IN_FLIGHT_RECLAIM_MS).toISOString();
+    const reclaimed = await ctx.db
+      .prepare(
+        `UPDATE idempotency_keys SET created_at = ?
+          WHERE key = ? AND response_json IS NULL AND created_at < ?`
+      )
+      .bind(at, scoped, cutoff)
+      .run();
+
+    if (reclaimed.meta.changes === 0) {
       throw new ToolError(
         "conflict",
         `idempotency_key "${key}" is still in flight for ${tool}; retry once the first call returns`
       );
     }
-    return JSON.parse(existing.response_json) as T;
+
+    // A reclaim that happens silently is worse than the wedge it fixes: the
+    // operation is about to run a second time, and if the first one committed
+    // before its isolate died, this is the moment a duplicate is created.
+    //
+    // Not routed through src/log.ts: this module is plan 1 code with no
+    // Worker dependency, and importing plan 2's logger would invert the
+    // dependency the whole plan rests on. The console-guard test carries a
+    // matching, narrowly-scoped exception for exactly this line - see the
+    // comment there. No key, no input, no subject: the key itself is
+    // caller-chosen text a roster could have supplied.
+    console.log(JSON.stringify({ event: "idempotency_claim_reclaimed", tool }));
+    // Fall through to run(). Do NOT return.
   }
 
   let result: T;
@@ -118,6 +166,26 @@ export async function withIdempotency<T>(
       finalSubject,
       scoped
     )
+    .run();
+
+  // Opportunistic, bounded, and expressed as a subquery because DELETE ... LIMIT
+  // needs a SQLite built with SQLITE_ENABLE_UPDATE_DELETE_LIMIT and D1's build is
+  // not documented to have it.
+  //
+  // Two shapes, and missing the second leaves the wedge half-fixed: rows that
+  // COMPLETED long ago, and claims nobody ever retried, which would otherwise
+  // never be reclaimed and never removed.
+  const staleBefore = new Date(Date.parse(at) - IDEMPOTENCY_RETENTION_MS).toISOString();
+  await ctx.db
+    .prepare(
+      `DELETE FROM idempotency_keys WHERE key IN (
+         SELECT key FROM idempotency_keys
+          WHERE (completed_at IS NOT NULL AND completed_at < ?1)
+             OR (response_json IS NULL AND created_at < ?1)
+          LIMIT ?2
+       )`
+    )
+    .bind(staleBefore, PRUNE_BATCH)
     .run();
 
   return result;
