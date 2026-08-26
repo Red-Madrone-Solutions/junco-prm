@@ -23,6 +23,19 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// Every refusal must be pinned to its reason, not only its error class: a
+// mutation that keeps throwing NotOwnerError for the wrong reason has to
+// fail a test, not just pass one that stops at toThrow.
+function refusalReason(props: unknown): "no_props" | "not_owner" {
+  try {
+    assertOwner(config, props, "r1");
+  } catch (err) {
+    if (err instanceof NotOwnerError) return err.reason;
+    throw err;
+  }
+  throw new Error("expected assertOwner to throw NotOwnerError");
+}
+
 describe("assertOwner", () => {
   it("accepts the owner", () => {
     expect(assertOwner(config, { githubUserId: "583231" }, "r1")).toBe("583231");
@@ -37,9 +50,21 @@ describe("assertOwner", () => {
   it("REFUSES every shape of missing props", () => {
     // The fail-open a defensive reflex introduces is
     // `if (props?.githubUserId && props.githubUserId !== owner) throw`,
-    // which lets a grant with NO props straight through.
-    for (const props of [null, undefined, {}, { githubUserId: null }, "583231", ["583231"], 583231]) {
-      expect(() => assertOwner(config, props, "r1"), String(props)).toThrow(NotOwnerError);
+    // which lets a grant with NO props straight through. Every shape here
+    // must land on no_props specifically, not merely throw: a guard that
+    // still throws but reports not_owner is a broken diagnostic, not a
+    // passing test.
+    const shapes: Array<[string, unknown]> = [
+      ["null", null],
+      ["undefined", undefined],
+      ["{}", {}],
+      ["{ githubUserId: null }", { githubUserId: null }],
+      ['"583231"', "583231"],
+      ['["583231"]', ["583231"]],
+      ["583231", 583231],
+    ];
+    for (const [label, props] of shapes) {
+      expect(refusalReason(props), label).toBe("no_props");
     }
   });
 
@@ -47,12 +72,18 @@ describe("assertOwner", () => {
     // Props round-trip through JSON in KV. A number that was stored as a number
     // must not pass a comparison written for strings, and must not silently
     // coerce either - it means the write path changed and should be noticed.
-    expect(() => assertOwner(config, { githubUserId: 583231 }, "r1")).toThrow(NotOwnerError);
+    // A non-string githubUserId fails the typeof guard before any comparison,
+    // so it must be reported as no_props with a null presented id - not
+    // misread as a wrong-owner probe carrying a number in a string field.
+    expect(refusalReason({ githubUserId: 583231 })).toBe("no_props");
+    const entry = JSON.parse(lines[0]!);
+    expect(entry.presented_user_id).toBeNull();
+    expect(entry.reason).toBe("no_props");
   });
 
   it("REFUSES a padded or whitespaced id rather than trimming it", () => {
-    expect(() => assertOwner(config, { githubUserId: " 583231" }, "r1")).toThrow(NotOwnerError);
-    expect(() => assertOwner(config, { githubUserId: "0583231" }, "r1")).toThrow(NotOwnerError);
+    expect(refusalReason({ githubUserId: " 583231" })).toBe("not_owner");
+    expect(refusalReason({ githubUserId: "0583231" })).toBe("not_owner");
   });
 
   it("compares against the CURRENT config, which is what makes revocation immediate", () => {
