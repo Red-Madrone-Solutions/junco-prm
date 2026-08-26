@@ -148,7 +148,13 @@ describe("tools/call", () => {
 
   it("reports an unknown tool without reaching the registry", async () => {
     const { body } = await rpc("tools/call", { name: "drop_everything", arguments: {} });
-    expect(JSON.stringify(body)).toMatch(/unknown|not found/i);
+    expect(body.error).toBeUndefined();
+
+    const result = body.result as { isError: boolean; content: { text: string }[] };
+    expect(result.isError).toBe(true);
+    const payload = JSON.parse(result.content[0]!.text);
+    expect(payload.error.code).toBe("not_found");
+    expect(payload.error.reason).toContain("drop_everything");
   });
 
   it("NEVER leaks an internal exception message", async () => {
@@ -162,6 +168,41 @@ describe("tools/call", () => {
     // A real refusal, with a real code - not a stack trace.
     expect(payload.error.code).toBe("limit_exceeded");
     expect(JSON.stringify(payload)).not.toMatch(/\bat .*\.ts:\d+/);
+  });
+
+  it("reports a non-ToolError throw as `internal`, distinguishable by shape, with no leaked message", async () => {
+    // `unexpectedErrorResult` is the eighth code, exercised nowhere else in the
+    // suite. `search_people`'s own throw always lands as `limit_exceeded`, a
+    // ToolError - so this forces a genuinely unexpected exception the same way
+    // the review did: override a registry entry's `run`.
+    const tool = TOOLS.search_people!;
+    const original = tool.run;
+    const leak = "SELECT full_name FROM people WHERE full_name = 'Ada Lovelace'";
+    tool.run = async () => {
+      throw new TypeError(leak);
+    };
+    try {
+      const { body } = await rpc("tools/call", {
+        name: "search_people",
+        arguments: { query: "Ada" },
+      });
+      expect(body.error).toBeUndefined();
+
+      const result = body.result as { isError: boolean; content: { text: string }[] };
+      expect(result.isError).toBe(true);
+      const payload = JSON.parse(result.content[0]!.text);
+      expect(payload.error.code).toBe("internal");
+      expect(payload.error.next).toBeUndefined();
+      expect(payload.error.details).toBeUndefined();
+      expect(payload.error.request_id).toBe("r1");
+      // The shape check, not just the name: nothing of the thrown message
+      // survives into the payload the model sees.
+      expect(JSON.stringify(payload)).not.toContain(leak);
+      expect(JSON.stringify(payload)).not.toMatch(/Ada Lovelace/);
+      expect(JSON.stringify(payload)).not.toMatch(/SELECT/);
+    } finally {
+      tool.run = original;
+    }
   });
 });
 
