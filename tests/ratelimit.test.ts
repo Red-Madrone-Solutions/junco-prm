@@ -54,6 +54,22 @@ describe("checkRateLimit", () => {
     expect(await checkRateLimit(broken, requestFrom("203.0.113.5"))).toBe(true);
   });
 
+  it("FAILS OPEN when the limiter's limit() call throws", async () => {
+    // The test above never reaches the try/catch - an undefined binding
+    // returns at the `if (!limiter)` line before the try block starts. This
+    // one supplies a bound limiter whose limit() rejects, so it is the only
+    // test that actually exercises the catch.
+    const broken = {
+      ...env,
+      RATE_LIMITER: {
+        limit: async () => {
+          throw new Error("boom");
+        },
+      },
+    } as never;
+    expect(await checkRateLimit(broken, requestFrom("203.0.113.7"))).toBe(true);
+  });
+
   it("routes the \"public\" bucket to RATE_LIMITER and the \"mcp\" bucket to MCP_RATE_LIMITER", async () => {
     // The brief's own risk section: "a test that shows a 429 came back cannot
     // tell you the OAuth limiter fired on an /mcp request." This asserts the
