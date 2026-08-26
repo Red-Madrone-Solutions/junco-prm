@@ -3362,7 +3362,7 @@ git commit -m "feat: serve the tool registry over stateless MCP"
 **Interfaces:**
 - Consumes: Plan 1 Task 0's finding, recorded in `docs/MEASUREMENTS.md` as `RATE_LIMIT_STRATEGY`.
 - Produces:
-  - `function checkRateLimit(env: Env, request: Request, bucket: "public" | "mcp"): Promise<boolean>` - the same signature either way
+  - `function checkRateLimit(env: Env, request: Request, bucket?: "public" | "mcp"): Promise<boolean>` - the same signature either way. **`bucket` is OPTIONAL and defaults to `"public"`, and an earlier draft made it required while its own test file called the function with two arguments in five of its seven cases** - six call sites, since one case calls twice - so the draft did not typecheck against itself. `"public"` is the safe default because a forgetful call site then throttles `/mcp` traffic at the tighter ceiling, which is visible, rather than sending OAuth traffic to the looser one, which would be silent and worse. Corrected 2026-08-25, found by executing this task.
   - `const PUBLIC_LIMIT: number`, `const MCP_LIMIT: number` - two buckets, because `/mcp` carries the owner's real traffic and the OAuth routes carry none
   - `function rateLimitedResponse(requestId: string): Response`
 
@@ -3495,7 +3495,7 @@ export const MCP_LIMIT = 600;
 export async function checkRateLimit(
   env: Env,
   request: Request,
-  bucket: "public" | "mcp"
+  bucket: "public" | "mcp" = "public"
 ): Promise<boolean> {
   const limiter = bucket === "mcp" ? env.MCP_RATE_LIMITER : env.RATE_LIMITER;
   if (!limiter) return true; // fail open - see below
@@ -3570,7 +3570,7 @@ export const MCP_LIMIT = 600;
 export async function checkRateLimit(
   env: Env,
   request: Request,
-  bucket: "public" | "mcp"
+  bucket: "public" | "mcp" = "public"
 ): Promise<boolean> {
   if (!env.OAUTH_KV) return true; // fail open
 
@@ -3620,9 +3620,13 @@ Replace the top of the handler, between `finish` and the `/health` branch:
     //
     // The previous version exempted both, and the reasoning for each was wrong.
     //
-    // /health was exempt because the branch above returns before this line. The
-    // spec names /health explicitly as one of the routes the limiter exists to
-    // protect, and it costs a D1 query per hit.
+    // /health is NOT exempt. The spec names it explicitly as one of the routes
+    // the limiter exists to protect, and it costs a D1 query per hit.
+    //
+    // An earlier draft of this comment said "/health was exempt because the
+    // branch above returns before this line", describing a layout this file
+    // does not have - the /health branch is below, not above. It was narrating
+    // a previous arrangement in the present tense. Corrected 2026-08-25.
     //
     // /mcp was exempt on the grounds that "rate-limiting the owner's own tool
     // calls would throttle the only legitimate traffic." That confused a path
