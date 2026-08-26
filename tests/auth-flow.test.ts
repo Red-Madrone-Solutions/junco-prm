@@ -179,6 +179,10 @@ describe("POST /authorize/approve, through the dispatch chain", () => {
 
     expect(response.status).toBe(400);
     expect(response.headers.get("location")).toBeNull();
+    // Distinguishes the correct refusal from the catch-all one: a cookieless
+    // call must be refused by the no-cookie guard itself, not by falling
+    // through to KV and crashing on a null presented value.
+    await expect(response.text()).resolves.toContain("not valid for the browser");
   });
 
   it("REFUSES a handle from one browser's consent approved with another's cookie", async () => {

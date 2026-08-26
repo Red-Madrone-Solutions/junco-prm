@@ -182,7 +182,9 @@ export async function consumeConsent(
   // probed again.
   await env.OAUTH_KV.delete(`pending:${handle}`);
 
-  const presentedSecrets = presented.split(CONSENT_SECRET_DELIMITER);
+  const presentedSecrets = presented
+    .split(CONSENT_SECRET_DELIMITER)
+    .slice(0, MAX_CONSENT_SECRETS);
   let matched = false;
   const remaining: string[] = [];
   for (const candidate of presentedSecrets) {
