@@ -2719,7 +2719,18 @@ In the contention branch, before the in-flight refusal at the existing
 `existing.response_json === null` check, attempt the reclaim:
 
 ```ts
-if (existing.response_json === null) {
+// INVERT THE REPLAY CHECK FIRST. An earlier draft of this step wrapped the
+// reclaim in `if (existing.response_json === null) { ... }` and left the
+// original `return JSON.parse(existing.response_json) as T` after it. That
+// returns AFTER a successful reclaim, parsing `null` and handing the caller
+// `null` instead of running the tool - a comment reading "fall through to
+// run(), do NOT return" above a structure that returns anyway. Corrected
+// 2026-08-25, found by executing this task.
+if (existing.response_json !== null) {
+  return JSON.parse(existing.response_json) as T;
+}
+
+{
   // THE RECLAIM. Take the claim over only if no isolate could still hold it.
   // The UPDATE is the lock: its WHERE re-checks both the NULL response and the
   // age, so two concurrent retries cannot both win it.
@@ -2750,6 +2761,14 @@ if (existing.response_json === null) {
 **Note what the log line does not contain: no key, no input, no subject.** Plan 1's
 constraint that logs never carry PRM content holds here, and the key itself is
 caller-chosen text that a roster could have supplied.
+
+**`tests/console-guard.test.ts` fails the suite on any `console` call under `src/` outside
+`src/log.ts`,** and this line is in `src/idempotency.ts`. The guard was added by Task 4's fix round
+after this task was written, so the two contradict each other and both were authored on 2026-08-25.
+**Resolved by keeping the log and adding an exception to the guard keyed to the exact call text**,
+not to the file and not to a line number - so any other `console` call in this module, or a change
+to this one that starts interpolating free text, still fails. Do not widen it to a file-level
+exemption.
 
 **It is a bare `console.log` rather than Task 2's `logToolCall`, and that is on
 purpose.** `src/idempotency.ts` is plan 1 code with no Worker dependencies, and
