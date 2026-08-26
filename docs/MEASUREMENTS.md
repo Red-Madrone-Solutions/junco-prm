@@ -252,6 +252,29 @@ deployed D1 instance behaves identically remains unconfirmed.
 
 ---
 
+## Rate limiting
+
+Plan 2 Task 8, against `RATE_LIMIT_STRATEGY = "binding"` recorded above.
+
+- Implementation built: binding
+- Built on: 2026-08-25
+
+Two `[[ratelimits]]` bindings, per the ruling that both the OAuth/health surface
+and `/mcp` burn quota when hit anonymously: `RATE_LIMITER` (60/60s) wraps
+`workers-oauth-provider`'s own routes and `/health`; `MCP_RATE_LIMITER` (600/60s)
+covers `/mcp`. Both sit ahead of the provider in `src/index.ts`, above the
+`/health` branch, so nothing below - including the routes the provider serves
+itself - is reachable before the check runs.
+
+**A defect found in this task's own brief:** the produced interface,
+`checkRateLimit(env, request, bucket)`, listed `bucket` as a required parameter,
+but the brief's own verbatim `tests/ratelimit.test.ts` calls it with two
+arguments in five of its seven cases. `tsc --noEmit` fails on that file against
+a required third parameter (`Expected 3 arguments, but got 2`). `bucket`
+defaults to `"public"` in the shipped code, which makes the brief's test file
+typecheck and matches every production call site in `src/index.ts`, which
+always passes `bucket` explicitly.
+
 ## What was NOT established
 
 - **The actual free-plan CPU ceiling.** The probe found no failure up to 163 ms

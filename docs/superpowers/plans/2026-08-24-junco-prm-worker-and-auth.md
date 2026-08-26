@@ -26,7 +26,7 @@ Task 5 is redesigned rather than patched: the pending authorization lives in KV 
 
 This is plan 2 of 3 for spec phase 1.
 
-- **Plan 1** - schema, migrations, FTS5, and the full tool module, tested against local D1. Written and reconciled; not yet implemented.
+- **Plan 1** - schema, migrations, FTS5, and the full tool module, tested against local D1. **Implemented and merged to `master` on 2026-08-25** as commit `0355934`: 341 tests across 24 files, 28 tools in the registry, eight migrations. What it leaves for this plan is in `docs/PLAN-1-CARRY-FORWARD.md`, which task 1 should read before task 6b and task 7 need it.
 - **Plan 2 (this document)** - Worker entrypoint, configuration and fail-closed startup, structured logging, `/health`, GitHub OAuth, `workers-oauth-provider`, per-request owner authorization, MCP over stateless Streamable HTTP, and rate limiting the unauthenticated surface.
 - **Plan 3** - `docs/DEPLOY.md` runbook, `docs/UPGRADE.md`, the deploy template, the CLI durable-data export, and the tested restore.
 
@@ -100,7 +100,8 @@ Every variable and binding this Worker reads, in one place, because a fail-close
 |---|---|
 | `DB` | The D1 database from plan 1. |
 | `OAUTH_KV` | Workers KV. Required by `workers-oauth-provider` for authorization state and issued grants. |
-| `RATE_LIMITER` | The Workers rate-limiting binding, **only if Task 0 found it available on the free plan.** See Task 8. |
+| `RATE_LIMITER` | The Workers rate-limiting binding for the OAuth and `/health` routes, 60 per 60s. Task 0 confirmed the binding IS available on a free plan. See Task 8. |
+| `MCP_RATE_LIMITER` | The same binding for `/mcp`, at 600 per 60s. **An earlier draft of this table listed only `RATE_LIMITER` while Task 8's code used both**, which was found by executing Task 1 and ruled on at Task 8. See the note there. |
 
 **`OWNER_GITHUB_USER_ID` is a plain variable rather than a secret, and that is deliberate.** It is not a credential - it is a public number anyone can look up from a username - and making it a secret would hide it from `wrangler deploy` output and the dashboard, which is exactly where an operator needs to see it when debugging why their own requests are being refused. Its secrecy was never what protects the instance; the OAuth flow is.
 
@@ -637,20 +638,29 @@ describe("logAuthFailure", () => {
 });
 
 describe("logRequest", () => {
-  it("records the path but never a query string", async () => {
+  // THE FIXTURE CARRIES A QUERY STRING, and an earlier draft's did not.
+  // That draft passed path: "/authorize" and asserted not.toContain("?"),
+  // which passes identically whether or not anything strips a query, because
+  // there was no query in the input to fail to strip. The assertion could not
+  // fail, and the implementation it was guarding did not in fact strip.
+  // Corrected 2026-08-25, found by executing this task.
+  it("STRIPS a query string rather than trusting the caller to have done it", async () => {
     // An OAuth authorize URL carries state and a redirect_uri in its query.
     // Neither is PRM content, but neither belongs in a log an operator will
     // paste into a support thread either.
     logRequest({
       requestId: "r1",
       method: "GET",
-      path: "/authorize",
+      path: "/authorize?state=abc123&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb",
       status: 302,
       durationMs: 4,
     });
     const entry = JSON.parse(lines[0]!);
     expect(entry.path).toBe("/authorize");
-    expect(JSON.stringify(entry)).not.toContain("?");
+    const serialized = JSON.stringify(entry);
+    expect(serialized).not.toContain("?");
+    expect(serialized).not.toContain("state=abc123");
+    expect(serialized).not.toContain("redirect_uri");
   });
 });
 ```
@@ -738,11 +748,16 @@ export function logRequest(fields: {
   status: number;
   durationMs: number;
 }): void {
+  // THE MODULE STRIPS IT. An earlier draft documented this as a property of
+  // the `path` field and then forwarded fields.path unmodified, which makes
+  // the invariant a thing every future caller has to remember rather than a
+  // thing this function guarantees. The one place that can enforce it is here.
+  const pathname = fields.path.split("?")[0]!;
   emit({
     event: "request",
     request_id: fields.requestId,
     method: fields.method,
-    path: fields.path,
+    path: pathname,
     status: fields.status,
     duration_ms: fields.durationMs,
   });
@@ -805,8 +820,16 @@ describe("GET /health", () => {
       configured: boolean;
     };
     expect(body.status).toBe("ok");
-    // The migrations from plan 1 have been applied by the test harness.
-    expect(body.schema_version).toBe("0004_search.sql");
+    // THE EXPECTED VALUE IS INJECTED BY THIS TEST, not read from real migration
+    // state, and both earlier drafts of this assertion were wrong in different
+    // ways. The first hardcoded "0004_search.sql", which went stale the moment
+    // plan 1 grew past four migrations. The obvious repair - have the test query
+    // d1_migrations itself and compare - is CIRCULAR: it reads the same source
+    // the handler reads, so replacing the handler's query with a hardcoded
+    // "0008_committed_run.sql" would still pass. A marker name no real migration
+    // could produce cannot be matched by a hardcode coincidentally.
+    // Corrected 2026-08-25, found by executing this task and its review.
+    expect(body.schema_version).toBe("9999_marker_for_this_test.sql");
     expect(body.configured).toBe(true);
   });
 
@@ -849,10 +872,35 @@ describe("GET /health", () => {
     expect(body.configured).toBe(false);
   });
 
+  // DO NOT DROP A REAL TABLE HERE, and an earlier draft did exactly that.
+  //
+  // vitest.config.ts sets `isolate: false` with `maxWorkers: 1`, so every test
+  // file in a run shares ONE D1 instance. `DROP TABLE IF EXISTS d1_migrations`
+  // against env.DB left the bookkeeping table gone for every file that ran
+  // afterwards: each one's apply-migrations setup could no longer see which
+  // migrations had run, reapplied them against tables that already existed, and
+  // failed with "table people already exists". Measured: ELEVEN other suites
+  // broke. It is deterministic, not a flake, and it appears the first time
+  // anyone runs the suite.
+  //
+  // A stand-in binding reaches the same catch branch and touches nothing shared.
+  // Corrected 2026-08-25. This is the second isolate:false shared-D1 hazard in
+  // this project; plan 1 had one in a test file's cleanup ordering.
   it("reports a null schema version rather than failing when migrations have not run", async () => {
-    await env.DB.prepare("DROP TABLE IF EXISTS d1_migrations").run();
+    const broken = {
+      ...env,
+      DB: {
+        prepare() {
+          return {
+            first() {
+              throw new Error("no such table: d1_migrations");
+            },
+          };
+        },
+      },
+    } as unknown as Env;
     const { health } = await import("../src/health");
-    const body = (await (await health(env, "r1")).json()) as { schema_version: string | null };
+    const body = (await (await health(broken, "r1")).json()) as { schema_version: string | null };
     expect(body.schema_version).toBeNull();
   });
 });
@@ -998,7 +1046,7 @@ git commit -m "feat: serve /health with the applied schema version"
 - Test: `tests/auth-github.test.ts`
 
 **Interfaces:**
-- Consumes: `Config` from Task 1, `logAuthFailure` from Task 2.
+- Consumes: `Config` from Task 1. **Not `logAuthFailure`**, despite an earlier draft listing it: this task has nowhere to call it from. `logAuthFailure` requires a `requestId`, and none of these four functions receives one; its `reason` is a closed union of `no_token`, `invalid_token`, `not_owner` and `no_props`, none of which describes a GitHub token exchange failing; and the draft that listed it never called it anywhere in its own steps. The auth-failure logging for this flow belongs to Task 5's callback route, which has a request id in hand. Corrected 2026-08-25, found by executing this task.
 - Produces:
   - `function authorizeUrl(config: Config, callbackUrl: string, state: string): string`
   - `function exchangeCode(config: Config, code: string): Promise<string>` - returns the GitHub access token
@@ -1363,7 +1411,11 @@ git commit -m "feat: resolve the owner's numeric GitHub id and discard the token
 
 **The pending authorization lives in KV under a random single-use handle, and only the handle travels in `state`.** An attacker who starts a flow gets a handle for *their* transaction; they cannot make it describe someone else's, and they cannot forge one, because the handle is random and the record is server-side.
 
-**A cookie binds the transaction to the browser that started it.** This is the piece that actually defeats the attack. The attacker's flow began in the attacker's browser, so the cookie lives there. When the owner clicks the attacker's link, the owner's browser presents no matching cookie and the callback refuses. Signing the state instead would not have worked, and one reviewer said so plainly: a signature proves the Worker minted that state, not that this browser started the flow, and the attacker obtains a validly signed state simply by starting a real flow.
+**A cookie binds the flow to the browser that started it, and THE BINDING MUST BE MINTED AT THE CONSENT PAGE, not at approval.** This is the piece that actually defeats the attack. Signing the state instead would not have worked, and one reviewer said so plainly: a signature proves the Worker minted that state, not that this browser started the flow, and the attacker obtains a validly signed state simply by starting a real flow.
+
+**An earlier draft bound it one step too late, and the result was a second working takeover.** It set the cookie when `POST /authorize/approve` was handled. That binds the transaction to whichever browser submitted the approve form, and any third-party page can make that the owner's browser with one auto-submitting form. The chain: the attacker starts a real connector flow from their own Claude account, capturing an `/authorize` URL carrying their own `client_id`, `state` and PKCE challenge with a `redirect_uri` that IS on the allowlist; issues that GET from their own server and scrapes the hidden handle out of the consent HTML, setting no cookie and consuming no rate limit; then serves the owner a page that auto-submits that handle. A simple form POST needs no preflight, and `form-action 'self'` on our consent page says nothing about a form on someone else's page. **The owner never sees the consent screen.** The Worker then sets the transaction cookie in the owner's browser, GitHub auto-approves because the owner authorized the app long ago, and the callback's cookie check SUCCEEDS, because the browser presenting the cookie is the browser we gave it to. Every guard reports success while a grant carrying the owner's id is minted for the attacker's client.
+
+**So the pending record carries its own secret from the moment it is created.** The `/authorize` GET mints a random secret alongside the pending handle, stores it in the `pending:` record, and sets it as a cookie on the consent response. `/authorize/approve` reads that cookie and compares it constant-time to the stored value before `beginTransaction` runs, refusing when absent or mismatched. The POST is additionally rejected when `Sec-Fetch-Site` is present and is not `same-origin`, or `Origin` is present and is not this Worker's origin. **Those two header checks are worth only what a browser makes them worth: a non-browser sends neither and is not refused for it, so the cookie is the layer that carries the property in that case.** Corrected 2026-08-25, found by executing this task.
 
 **The transaction is consumed atomically and once.** A replayed handle is refused, so a captured callback URL is not reusable.
 
@@ -2668,7 +2720,18 @@ In the contention branch, before the in-flight refusal at the existing
 `existing.response_json === null` check, attempt the reclaim:
 
 ```ts
-if (existing.response_json === null) {
+// INVERT THE REPLAY CHECK FIRST. An earlier draft of this step wrapped the
+// reclaim in `if (existing.response_json === null) { ... }` and left the
+// original `return JSON.parse(existing.response_json) as T` after it. That
+// returns AFTER a successful reclaim, parsing `null` and handing the caller
+// `null` instead of running the tool - a comment reading "fall through to
+// run(), do NOT return" above a structure that returns anyway. Corrected
+// 2026-08-25, found by executing this task.
+if (existing.response_json !== null) {
+  return JSON.parse(existing.response_json) as T;
+}
+
+{
   // THE RECLAIM. Take the claim over only if no isolate could still hold it.
   // The UPDATE is the lock: its WHERE re-checks both the NULL response and the
   // age, so two concurrent retries cannot both win it.
@@ -2699,6 +2762,14 @@ if (existing.response_json === null) {
 **Note what the log line does not contain: no key, no input, no subject.** Plan 1's
 constraint that logs never carry PRM content holds here, and the key itself is
 caller-chosen text that a roster could have supplied.
+
+**`tests/console-guard.test.ts` fails the suite on any `console` call under `src/` outside
+`src/log.ts`,** and this line is in `src/idempotency.ts`. The guard was added by Task 4's fix round
+after this task was written, so the two contradict each other and both were authored on 2026-08-25.
+**Resolved by keeping the log and adding an exception to the guard keyed to the exact call text**,
+not to the file and not to a line number - so any other `console` call in this module, or a change
+to this one that starts interpolating free text, still fails. Do not widen it to a file-level
+exemption.
 
 **It is a bare `console.log` rather than Task 2's `logToolCall`, and that is on
 purpose.** `src/idempotency.ts` is plan 1 code with no Worker dependencies, and
@@ -3274,7 +3345,13 @@ git commit -m "feat: serve the tool registry over stateless MCP"
 
 ---
 
-### Task 8: Rate limiting the unauthenticated surface
+### Task 8: Rate limiting what strangers can reach
+
+**The title used to say "the unauthenticated surface", and the two limiters this task builds did not fit under it.** `RATE_LIMITER` covers the OAuth and `/health` routes, which the spec enumerates. `MCP_RATE_LIMITER` covers `/mcp`, which is authenticated - and which is nonetheless **reachable by anyone who finds the URL**, because refusing a stranger still costs a Worker invocation and a KV token lookup before `assertOwner` ever gets to say no.
+
+**Ruling, 2026-08-25: both limiters stay, and the configuration table was the defect rather than the code.** The spec's rate-limiting bullet enumerates the OAuth and `/health` routes and does not name `/mcp`, but its stated reason is that unlimited requests "burn Worker requests, D1 reads, and the deployer's own GitHub application quota" - and an anonymous flood of invalid tokens at `/mcp` burns exactly those. The omission reads as an oversight from writing that bullet while thinking about the OAuth surface, not as a decision to leave `/mcp` unprotected. The two ceilings differ because the traffic does: 60 per minute is generous for a human completing a sign-in, and 600 is what the owner's own tool calls need.
+
+**Cost if this ruling is wrong:** one extra binding on a free plan, which Task 0 measured as costing nothing, and a ceiling the owner could hit only by making ten tool calls a second.
 
 **Files:**
 - Create: `src/ratelimit.ts`
@@ -3285,7 +3362,7 @@ git commit -m "feat: serve the tool registry over stateless MCP"
 **Interfaces:**
 - Consumes: Plan 1 Task 0's finding, recorded in `docs/MEASUREMENTS.md` as `RATE_LIMIT_STRATEGY`.
 - Produces:
-  - `function checkRateLimit(env: Env, request: Request, bucket: "public" | "mcp"): Promise<boolean>` - the same signature either way
+  - `function checkRateLimit(env: Env, request: Request, bucket?: "public" | "mcp"): Promise<boolean>` - the same signature either way. **`bucket` is OPTIONAL and defaults to `"public"`, and an earlier draft made it required while its own test file called the function with two arguments in five of its seven cases** - six call sites, since one case calls twice - so the draft did not typecheck against itself. `"public"` is the safe default because a forgetful call site then throttles `/mcp` traffic at the tighter ceiling, which is visible, rather than sending OAuth traffic to the looser one, which would be silent and worse. Corrected 2026-08-25, found by executing this task.
   - `const PUBLIC_LIMIT: number`, `const MCP_LIMIT: number` - two buckets, because `/mcp` carries the owner's real traffic and the OAuth routes carry none
   - `function rateLimitedResponse(requestId: string): Response`
 
@@ -3418,7 +3495,7 @@ export const MCP_LIMIT = 600;
 export async function checkRateLimit(
   env: Env,
   request: Request,
-  bucket: "public" | "mcp"
+  bucket: "public" | "mcp" = "public"
 ): Promise<boolean> {
   const limiter = bucket === "mcp" ? env.MCP_RATE_LIMITER : env.RATE_LIMITER;
   if (!limiter) return true; // fail open - see below
@@ -3493,7 +3570,7 @@ export const MCP_LIMIT = 600;
 export async function checkRateLimit(
   env: Env,
   request: Request,
-  bucket: "public" | "mcp"
+  bucket: "public" | "mcp" = "public"
 ): Promise<boolean> {
   if (!env.OAUTH_KV) return true; // fail open
 
@@ -3543,9 +3620,13 @@ Replace the top of the handler, between `finish` and the `/health` branch:
     //
     // The previous version exempted both, and the reasoning for each was wrong.
     //
-    // /health was exempt because the branch above returns before this line. The
-    // spec names /health explicitly as one of the routes the limiter exists to
-    // protect, and it costs a D1 query per hit.
+    // /health is NOT exempt. The spec names it explicitly as one of the routes
+    // the limiter exists to protect, and it costs a D1 query per hit.
+    //
+    // An earlier draft of this comment said "/health was exempt because the
+    // branch above returns before this line", describing a layout this file
+    // does not have - the /health branch is below, not above. It was narrating
+    // a previous arrangement in the present tense. Corrected 2026-08-25.
     //
     // /mcp was exempt on the grounds that "rate-limiting the owner's own tool
     // calls would throttle the only legitimate traffic." That confused a path
