@@ -352,6 +352,7 @@ export default defineConfig({
           setupFiles: ["./tests/apply-migrations.ts"],
           isolate: false,
           maxWorkers: 1,
+          sequence: { groupOrder: 0 },
         },
       },
       {
@@ -362,6 +363,11 @@ export default defineConfig({
           name: "scripts",
           environment: "node",
           include: ["scripts/**/*.test.mjs"],
+          // Two projects with different maxWorkers must also declare different
+          // group orders, or vitest 4.1.11 refuses to run and reports zero
+          // tests. Found by running Step 6; it does not appear in --help or in
+          // the type definitions, only when both projects execute together.
+          sequence: { groupOrder: 1 },
         },
       },
     ],
@@ -593,10 +599,17 @@ An archive nobody can verify is a file, not a backup. The manifest is what makes
 ```javascript
 // scripts/lib/manifest.test.mjs
 import { describe, expect, it } from "vitest";
+import { BACKED_UP } from "./inventory.mjs";
 import { buildManifest, checksum, verifyManifest } from "./manifest.mjs";
 
+// Every table in BACKED_UP, not just the two under test. verifyManifest
+// checks the manifest's table set against the inventory, so a fixture
+// carrying a subset is itself an incomplete archive and is correctly
+// refused. Found during execution, when the two-table version failed
+// "accepts an untampered archive" with nine missing-table problems.
 const archive = (overrides = {}) => {
-  const tables = { people: [{ id: "p_1", full_name: "Ada" }], tags: [] };
+  const tables = Object.fromEntries(BACKED_UP.map((t) => [t, []]));
+  tables.people = [{ id: "p_1", full_name: "Ada" }];
   return {
     manifest: buildManifest({
       tables,
@@ -812,7 +825,7 @@ export function verifyManifest(archive) {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx vitest run --project scripts scripts/lib/manifest.test.mjs`
-Expected: PASS, 11 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Confirm the checksum test is not blind**
 
@@ -1017,7 +1030,9 @@ export async function readTable(name, { database, remote = true, run = runWrangl
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `npx vitest run --project scripts scripts/lib/d1.test.mjs`
-Expected: PASS, 7 tests.
+Expected: PASS, 8 tests.
+
+**Redact before recording.** `docs/MEASUREMENTS.md` is committed to a public repository, and a `SELECT` against `people` returns live contact rows. Record the JSON envelope and replace the row content with placeholders.
 
 - [ ] **Step 6: Confirm the silence test is not blind**
 
@@ -1388,7 +1403,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import { readRaw } from "./lib/d1.mjs";
+import { countRows } from "./export.mjs";
 import { BACKED_UP } from "./lib/inventory.mjs";
 import { verifyManifest } from "./lib/manifest.mjs";
 
@@ -1478,17 +1493,20 @@ async function main() {
   // A brand-new D1 has no tables at all, so the count query errors. That error
   // is the signal for "fresh and safe", and it is the only error tolerated
   // here.
-  const countSql = BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(
-    " UNION ALL "
-  );
-  let existing = [];
+  // Reuse countRows from export.mjs rather than composing a UNION ALL here.
+  // D1 rejects a compound SELECT past 5 terms with SQLITE_ERROR 7500, found by
+  // executing Task 6 against the live database, and countRows already batches
+  // around it. Writing the join again here would duplicate the bug.
+  let existing = {};
   try {
-    existing = await readRaw(countSql, { database });
+    existing = await countRows({ database });
   } catch (error) {
     if (!/no such table/i.test(error.message)) throw error;
     process.stdout.write(`${database} has no Junco tables yet. Treating as empty.\n`);
   }
-  const occupied = existing.filter((r) => Number(r.n) > 0);
+  const occupied = Object.entries(existing)
+    .filter(([, n]) => Number(n) > 0)
+    .map(([t, n]) => ({ t, n }));
   if (occupied.length > 0) {
     process.stderr.write(
       `Refusing to restore into ${database}: it already holds data.\n` +
@@ -1528,11 +1546,7 @@ async function main() {
   }
 
   // Never claim success on the strength of an exit code. Count what landed.
-  const after = await readRaw(
-    BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(" UNION ALL "),
-    { database }
-  );
-  const actual = Object.fromEntries(after.map((r) => [r.t, Number(r.n)]));
+  const actual = await countRows({ database });
   const wrong = BACKED_UP.filter(
     (t) => actual[t] !== (archive.manifest.tables[t]?.count ?? 0)
   );
@@ -1660,6 +1674,8 @@ if the export read short, both sides agree and both are wrong.
 Run the identical statement against both databases. All eleven tables, not a
 subset; the earlier version of this step omitted `tags`, `roster_sources`, and
 `import_runs` while claiming every count matched.
+
+**D1 rejects a compound SELECT past 5 terms** with `SQLITE_ERROR 7500`, found by executing Task 6. Run the comparison in three batches rather than one statement, or reuse the export's own `countRows`, which already batches. The single statement below will fail as written; split it.
 
 ```bash
 COUNTS="SELECT 'people' t, COUNT(*) n FROM people

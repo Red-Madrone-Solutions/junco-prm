@@ -284,3 +284,178 @@ always passes `bucket` explicitly.
   one D1 region (WNAM), one day.
 - **Whether `batch()` has an upper bound on statement count at all.** 500 worked.
   Larger was not tried, because no plausible chunk needs it.
+
+---
+
+## Run of 2026-08-27: D1 Time Travel availability
+
+Answers the spec's open question of whether the live database is on a backend
+that supports Time Travel. Run against the live `junco-prm` database, not the
+spike.
+
+Wrangler 4.125.0.
+
+    npx wrangler d1 time-travel info junco-prm
+
+Verbatim output (ANSI color codes stripped):
+
+```
+ ⛅️ wrangler 4.125.0 (update available 4.127.0)
+───────────────────────────────────────────────
+Resource location: remote 
+
+🚧 Time Traveling...
+⚠️ The current bookmark is '0000002d-00000000-000050d4-b7c899f681622bb0df214f940a12aa39'
+⚡️ To restore to this specific bookmark, run:
+ `wrangler d1 time-travel restore junco-prm --bookmark=0000002d-00000000-000050d4-b7c899f681622bb0df214f940a12aa39`
+```
+
+**Answer: yes, Time Travel is available on `junco-prm`.** The command
+succeeded and returned a current bookmark. It did not print a separate
+timestamp field - the bookmark is itself the addressable point-in-time
+reference that `wrangler d1 time-travel restore --bookmark=<value>` accepts,
+so the missing timestamp field does not leave the open question unresolved.
+The command was run twice, a few seconds apart, and returned the same
+bookmark both times, consistent with no writes happening against the
+database in between.
+
+---
+
+## Run of 2026-08-27: `wrangler d1 execute --json` output shape
+
+Answers Task 5's open question about what `wrangler d1 execute --json` actually
+prints, so `parseExecuteJson` is written against an observed shape rather than
+a guess. Run against the live `junco-prm` database, not the spike.
+
+Wrangler 4.125.0.
+
+    npx wrangler d1 execute junco-prm --remote --json --command "SELECT id, full_name FROM people LIMIT 2"
+
+Verbatim shape observed (real names replaced with placeholders; the row
+content is a live contact database and does not belong in this file):
+
+```json
+[
+  {
+    "results": [
+      { "id": "p_PLACEHOLDER_1", "full_name": "REDACTED" },
+      { "id": "p_PLACEHOLDER_2", "full_name": "REDACTED" }
+    ],
+    "success": true,
+    "meta": {
+      "served_by": "v3-prod",
+      "served_by_region": "WNAM",
+      "served_by_colo": "SJC",
+      "served_by_primary": true,
+      "timings": { "sql_duration_ms": 0.6645 },
+      "duration": 0.6645,
+      "changes": 0,
+      "last_row_id": 0,
+      "changed_db": false,
+      "size_after": 1597440,
+      "rows_read": 2,
+      "rows_written": 0,
+      "total_attempts": 1
+    }
+  }
+]
+```
+
+**Answer: the top level is a JSON array**, one element per statement executed
+(one statement here, so one element). The rows live under `results` on that
+element, alongside `success` and a `meta` object with `served_by`, `timings`,
+`rows_read`, and other fields. This matches the shape the brief's fixture
+assumed; no fixture change was needed.
+
+Then against a table known to be empty:
+
+    npx wrangler d1 execute junco-prm --remote --json --command "SELECT * FROM confirmations LIMIT 1"
+
+```json
+[
+  {
+    "results": [],
+    "success": true,
+    "meta": {
+      "served_by": "v3-prod",
+      "served_by_region": "WNAM",
+      "served_by_colo": "SJC",
+      "served_by_primary": true,
+      "timings": { "sql_duration_ms": 0.3285 },
+      "duration": 0.3285,
+      "changes": 0,
+      "last_row_id": 0,
+      "changed_db": false,
+      "size_after": 1597440,
+      "rows_read": 1,
+      "rows_written": 0,
+      "total_attempts": 1
+    }
+  }
+]
+```
+
+**Answer: an empty result is `results: []`** on an otherwise normal, still
+`success: true` element - not a missing `results` key, not a shorter array at
+the top level, and not an error. `rows_read` is 1 even though 0 rows came
+back, because the engine still read the (empty) table to answer the query.
+
+No `code 7403 not authorized` error was hit on either run, so no retry was
+needed.
+
+---
+
+## Run of 2026-08-27: the restore drill
+
+Plan 1 Task 8. The first time `npm run restore` was ever run against a real
+database. Disposable database `junco-restore-drill`, created and deleted
+within this run, id `9b50c073-b885-416e-a8fb-6c762cccdca0` (recorded here for
+provenance only; the database no longer exists).
+
+A fresh export was taken rather than reusing the archive already on disk,
+because the live database had changed since that earlier export.
+
+**Row counts, live `junco-prm` vs freshly exported archive vs restored
+`junco-restore-drill`, batched through `countRows` (D1 rejects a compound
+`SELECT` past 5 terms):**
+
+| table | live | archive | restored |
+|---|---:|---:|---:|
+| people | 50 | 50 | 50 |
+| tags | 5 | 5 | 5 |
+| person_contacts | 27 | 27 | 27 |
+| person_links | 85 | 85 | 85 |
+| person_tags | 35 | 35 | 35 |
+| encounters | 25 | 25 | 25 |
+| followups | 6 | 6 | 6 |
+| roster_sources | 1 | 1 | 1 |
+| import_runs | 1 | 1 | 1 |
+| roster_entries | 798 | 798 | 798 |
+| person_sources | 41 | 41 | 41 |
+
+All eleven tables matched. No live write landed between the export and the
+comparison, so no re-run was needed.
+
+**Content, not just count.** The restored database was re-exported and its
+manifest diffed against the manifest of the archive that was restored from.
+`diff` printed nothing: every table's row count and SHA-256 checksum matched,
+which is content equality rather than cardinality equality. The round-trip
+archive was deleted afterward so it is not mistaken for a backup of the real
+database.
+
+**FTS rebuilt, both indexes, counted and searched:**
+
+- `people_fts`: 50 rows, matching the `people` count.
+- `encounters_fts`: 25 rows, matching the `encounters` count.
+- `SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM
+  people_fts f WHERE people_fts MATCH '<search term>')` returned the expected
+  row, a real contact's full name. The FTS triggers fired during the bulk
+  insert; the indexes are not just populated, they answer a real query
+  correctly.
+
+**Nothing surprising.** Every step matched the brief on the first attempt:
+the `wrangler.jsonc` config entry was required and sufficient for
+`migrations apply`, the batched count comparison avoided the compound-SELECT
+limit, and the FTS reinsertion strategy in `restore.mjs` worked without a
+code change. The drill passed cleanly, was recorded, and both database and
+config entry were removed at the end.

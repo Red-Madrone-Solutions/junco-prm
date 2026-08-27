@@ -38,6 +38,45 @@ The deciding argument is the failure mode the hand-written version carried: a sc
 
 A reviewer warned that unknown property names would be echoed into retained logs. `logToolCall` in `src/log.ts` accepts `requestId`, `tool`, `durationMs`, `outcome`, and `code`, and never a message. Refusal text reaches the model in the tool result and does not reach the log.
 
+## Known gaps at this boundary, not fixed by this plan
+
+Found on 2026-08-27 while executing plan 1, at the same transport boundary this plan touches. Recorded here so whoever executes plan 2 sees it and does not have to rediscover it, and so nobody mistakes it for something plan 2 introduced.
+
+### `GET /mcp` returns 200 and causes an infinite client reconnect loop
+
+**Measured, not inferred.** A 45 second capture of `wrangler tail` against the live Worker recorded 196 requests. Every one of them was `GET /mcp` with `accept: text/event-stream`, returning 200, from `claude-code/2.1.247 (cli)`. That is 4.4 requests per second, 261 per minute, roughly 15,700 per hour, sustained, with no tool call involved and no user action.
+
+**The mechanism, in three files.** `src/mcp/transport.ts` runs stateless Streamable HTTP and says so in its own header comment: no Durable Object, no session id, no held-open GET. But the SDK's `webStandardStreamableHttp.js:220` accepts a `GET` carrying `text/event-stream` and opens a standalone SSE stream for it. `src/mcp/transport.ts` then closes the transport in a `finally` on every request, and the SDK documents what that does at `streamableHttp.js:154`: "Close the standalone GET SSE stream, triggering client reconnection." So the server opens a stream it does not intend to hold, closes it immediately, and the client reads that as a dropped connection and reconnects at once. Forever.
+
+**What it costs.** Every request is an authenticated request, so the OAuth provider reads `token:{userId}:{grantId}:{id}` and the grant from Workers KV. Measured against the same window, KV reads track Worker requests almost exactly: 16,932 reads against 16,984 requests in one hour. The free tier allows 100,000 KV reads per day, so one open Claude Code session with this connector configured spends the entire daily budget in about six and a half hours, doing nothing.
+
+**Why it matters beyond cost.** The KV budget is account-wide and shared by every client. When it is exhausted, the provider cannot read grants or tokens, and Claude on desktop, mobile, and the web all stop working. The client that burns the budget is the CLI; the client that suffers is the phone, which is the one the whole hosting architecture exists to serve.
+
+**The fix.** Answer `GET /mcp` with **405 Method Not Allowed** rather than letting the SDK open a stream this server will not hold. A 405 tells the client no SSE stream exists and clients stop retrying; a 200 followed by an immediate close reads as a failure worth retrying. The SDK already has a 405 path at `webStandardStreamableHttp.js:451`, so this is about routing the GET there rather than writing new behaviour.
+
+**Why it is not a task in this plan.** This plan's scope is tool descriptions and argument validation. The fix belongs to whoever owns the transport, it needs its own test proving a `GET` returns 405 and that a `POST` still works, and it should not ride along inside a change to refusal semantics. It is listed here rather than in the deferred set because it is live, continuous, and currently the largest operational problem the project has.
+
+### A KV quota error escapes as an unhandled exception and a Cloudflare error page
+
+Observed live on 2026-08-27 at 22:05 UTC, once the account crossed its daily KV read ceiling:
+
+```
+"message": "KV get() limit exceeded for the day."
+"stack":   "at OAuthProviderImpl.handleApiRequest (index.js:10186:38)
+            at async OAuthProviderImpl.fetch (index.js:8988:24)"
+"outcome": "exception"
+```
+
+The caller received Cloudflare's `Error 1101: Worker threw exception`, HTTP 500, carrying a ray id and the sentence "the site owner must fix the Worker script."
+
+This project fails closed deliberately everywhere else, and keeps a closed set of seven error codes precisely so a client always receives something it can read and act on. A dependency being over quota is not in that set and is caught nowhere, so the single failure a free-plan deployment is most likely to meet is the one that produces a raw stack-trace page rather than anything this project wrote.
+
+The throw is inside `workers-oauth-provider`, so the fix is a boundary that catches it rather than a change to the library. The 405 guard shipped the same day removes the traffic that caused this particular exhaustion; it does not close the handling gap. Any future exhaustion, of KV or anything else, lands identically.
+
+Worth deciding rather than inheriting: whether an over-quota instance should answer 503 with a body naming the exhausted resource and the reset time, in the same shape `src/config.ts` already uses when a variable is missing. That precedent exists and is argued well in the spec. This is the same category of failure and should probably look the same to a caller.
+
+**Related, and separate.** The connector was registered as a user-level MCP server in `~/.claude.json`, so every Claude Code session on the machine, in any project, ran this loop. It was moved to project scope on 2026-08-27. That reduces how many sessions trigger it. It does not fix the loop.
+
 ## Global Constraints
 
 - **No em dashes or en dashes anywhere**, in code, comments, docs, or commit messages. Plain hyphens only.
