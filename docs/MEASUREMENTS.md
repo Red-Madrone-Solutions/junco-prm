@@ -402,3 +402,59 @@ back, because the engine still read the (empty) table to answer the query.
 
 No `code 7403 not authorized` error was hit on either run, so no retry was
 needed.
+
+---
+
+## Run of 2026-08-27: the restore drill
+
+Plan 1 Task 8. The first time `npm run restore` was ever run against a real
+database. Disposable database `junco-restore-drill`, created and deleted
+within this run, id `9b50c073-b885-416e-a8fb-6c762cccdca0` (recorded here for
+provenance only; the database no longer exists).
+
+A fresh export was taken rather than reusing the archive already on disk,
+because the live database had changed since that earlier export.
+
+**Row counts, live `junco-prm` vs freshly exported archive vs restored
+`junco-restore-drill`, batched through `countRows` (D1 rejects a compound
+`SELECT` past 5 terms):**
+
+| table | live | archive | restored |
+|---|---:|---:|---:|
+| people | 50 | 50 | 50 |
+| tags | 5 | 5 | 5 |
+| person_contacts | 27 | 27 | 27 |
+| person_links | 85 | 85 | 85 |
+| person_tags | 35 | 35 | 35 |
+| encounters | 25 | 25 | 25 |
+| followups | 6 | 6 | 6 |
+| roster_sources | 1 | 1 | 1 |
+| import_runs | 1 | 1 | 1 |
+| roster_entries | 798 | 798 | 798 |
+| person_sources | 41 | 41 | 41 |
+
+All eleven tables matched. No live write landed between the export and the
+comparison, so no re-run was needed.
+
+**Content, not just count.** The restored database was re-exported and its
+manifest diffed against the manifest of the archive that was restored from.
+`diff` printed nothing: every table's row count and SHA-256 checksum matched,
+which is content equality rather than cardinality equality. The round-trip
+archive was deleted afterward so it is not mistaken for a backup of the real
+database.
+
+**FTS rebuilt, both indexes, counted and searched:**
+
+- `people_fts`: 50 rows, matching the `people` count.
+- `encounters_fts`: 25 rows, matching the `encounters` count.
+- `SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM
+  people_fts f WHERE people_fts MATCH 'heaney')` returned `Rory Heaney`, the
+  expected row. The FTS triggers fired during the bulk insert; the indexes
+  are not just populated, they answer a real query correctly.
+
+**Nothing surprising.** Every step matched the brief on the first attempt:
+the `wrangler.jsonc` config entry was required and sufficient for
+`migrations apply`, the batched count comparison avoided the compound-SELECT
+limit, and the FTS reinsertion strategy in `restore.mjs` worked without a
+code change. The drill passed cleanly, was recorded, and both database and
+config entry were removed at the end.
