@@ -51,6 +51,34 @@ export function mcpHandler(config: Config, requestId: string): FetchHandler {
         throw e;
       }
 
+      // A GET here asks for a standalone SSE stream. This transport is
+      // stateless and never holds one, and the SDK will open one anyway: it
+      // accepts a GET carrying `text/event-stream`, and the `finally` below
+      // then closes the transport, which the SDK's own comment describes as
+      // "triggering client reconnection". The client reads a 200 followed by
+      // an immediate close as a dropped stream and reconnects at once, so the
+      // server manufactures an infinite loop against itself.
+      //
+      // Measured on 2026-08-27 before this guard existed: 196 requests in 45
+      // seconds, every one a GET /mcp returning 200, with no tool call and no
+      // user action. That is roughly 15,700 requests an hour, each spending a
+      // Workers request and a Workers KV read, against free-tier ceilings of
+      // 100,000 a day for each. One open client exhausted both.
+      //
+      // 405 is what the MCP specification prescribes for a server with no GET
+      // stream, and it is what stops a client retrying. Returning it before
+      // the server is built also means a GET costs nothing beyond the
+      // authorization check above.
+      if (request.method === "GET") {
+        return new Response(
+          JSON.stringify({ error: "method_not_allowed", request_id: requestId }),
+          {
+            status: 405,
+            headers: { allow: "POST", "content-type": "application/json" },
+          }
+        );
+      }
+
       const server = buildServer(config, env, requestId);
       const transport = new WebStandardStreamableHTTPServerTransport({
         // Stateless: no session id, no held-open GET, nothing to diverge

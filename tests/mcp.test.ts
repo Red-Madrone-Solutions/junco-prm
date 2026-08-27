@@ -21,6 +21,22 @@ import { TOOLS } from "../src/tools/index";
  * test nothing. `arguments.length` is what tells "omitted" and "explicitly
  * undefined" apart.
  */
+/**
+ * Issues a bare GET to /mcp, the way an MCP client asks for a standalone SSE
+ * stream. Separate from `rpc` because the point is the method, not a payload.
+ */
+async function get(props?: unknown) {
+  const effectiveProps = arguments.length >= 1 ? props : { githubUserId: "583231" };
+  const { mcpHandler } = await import("../src/mcp/transport");
+  const { loadConfig } = await import("../src/config");
+  const handler = mcpHandler(loadConfig(env), "r1");
+  const request = new Request("https://example.test/mcp", {
+    method: "GET",
+    headers: { accept: "text/event-stream" },
+  });
+  return handler.fetch!(request, env as never, { props: effectiveProps } as ExecutionContext);
+}
+
 async function rpc(method: string, params: unknown, props?: unknown) {
   const effectiveProps = arguments.length >= 3 ? props : { githubUserId: "583231" };
   const { mcpHandler } = await import("../src/mcp/transport");
@@ -237,5 +253,50 @@ describe("statelessness", () => {
     const second = await rpc("tools/list", {});
     expect((first.body.result as { tools: unknown[] }).tools).toHaveLength(28);
     expect((second.body.result as { tools: unknown[] }).tools).toHaveLength(28);
+  });
+});
+
+
+describe("GET /mcp", () => {
+  /**
+   * THE RECONNECT LOOP. This transport is stateless and holds no SSE stream,
+   * but the SDK opens one for a GET carrying text/event-stream, and closing
+   * the transport afterwards is documented by the SDK as "triggering client
+   * reconnection". A 200 followed by an immediate close reads to a client as a
+   * dropped stream, so it reconnects, forever.
+   *
+   * Measured before the guard: 196 requests in 45 seconds, all GET /mcp, all
+   * 200, with no tool call and no user action. Each one spent a Workers
+   * request and a KV read against free-tier ceilings of 100,000 a day.
+   *
+   * Deleting the method check in src/mcp/transport.ts turns this red.
+   */
+  it("refuses a GET with 405 rather than opening a stream it will not hold", async () => {
+    const response = await get();
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("POST");
+  });
+
+  it("names the refusal in a shape a client can read", async () => {
+    const response = await get();
+    const body = (await response.json()) as { error: string; request_id: string };
+    expect(body.error).toBe("method_not_allowed");
+    expect(body.request_id).toBe("r1");
+  });
+
+  /**
+   * The guard sits after the ownership check on purpose. A stranger must not
+   * learn which methods the endpoint accepts before being refused, and moving
+   * the method check above assertOwner would turn this test red.
+   */
+  it("still refuses a stranger with 403 rather than 405", async () => {
+    const response = await get({ githubUserId: "999999" });
+    expect(response.status).toBe(403);
+  });
+
+  /** The guard must not have broken the path that actually carries traffic. */
+  it("leaves POST working", async () => {
+    const { body } = await rpc("tools/list", {});
+    expect(Array.isArray((body.result as { tools: unknown[] }).tools)).toBe(true);
   });
 });
