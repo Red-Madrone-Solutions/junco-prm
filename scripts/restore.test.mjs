@@ -1,5 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { checkTargetEmpty, insertStatements, MAX_STATEMENT_BYTES } from "./restore.mjs";
+import {
+  checkTargetEmpty,
+  insertStatements,
+  loadIntoTarget,
+  MAX_STATEMENT_BYTES,
+  staleArchiveMessage,
+} from "./restore.mjs";
+import { BACKED_UP } from "./lib/inventory.mjs";
+
+const zeroCounts = () => Object.fromEntries(BACKED_UP.map((t) => [t, 0]));
+const zeroManifest = () => Object.fromEntries(BACKED_UP.map((t) => [t, { count: 0 }]));
 
 describe("insertStatements", () => {
   it("emits an INSERT per row, in inventory order", () => {
@@ -52,6 +62,15 @@ describe("insertStatements", () => {
   it("allows a row comfortably under the ceiling", () => {
     const ok = { id: "re_2", raw_record: "x".repeat(1000) };
     expect(() => insertStatements({ roster_entries: [ok] })).not.toThrow();
+  });
+
+  // A semicolon or a newline inside a note is ordinary content, not a
+  // statement separator: it sits inside a quoted string literal, so it must
+  // not split or corrupt the generated SQL.
+  it("preserves a semicolon and a newline inside a quoted value", () => {
+    const sql = insertStatements({ people: [{ id: "p_1", notes: "line one;\nline two" }] });
+    expect(sql).toContain("'line one;\nline two'");
+    expect(sql.match(/INSERT INTO/g)).toHaveLength(1);
   });
 });
 
@@ -143,5 +162,113 @@ describe("checkTargetEmpty", () => {
       failure("D1_ERROR: no such table: encounters: SQLITE_ERROR"),
     ]);
     await expect(checkTargetEmpty({ database: "test-db", run })).rejects.toThrow(/no such table/i);
+  });
+});
+
+// The concrete failure this explains: a migration adds a table (say
+// `reminders`), the inventory grows to require it, and restoring an archive
+// taken before that migration then fails verifyManifest with "reminders:
+// required by the inventory, absent from this archive" - true, but useless
+// to an operator mid-recovery who has no idea a migration is the reason.
+describe("staleArchiveMessage", () => {
+  it("returns null when the archive matches the newest migration on disk", () => {
+    const message = staleArchiveMessage({
+      archiveVersion: "0008_committed_run.sql",
+      migrationsOnDisk: ["0001_durable_core.sql", "0008_committed_run.sql"],
+    });
+    expect(message).toBeNull();
+  });
+
+  it("returns null when the archive is newer than anything on disk", () => {
+    const message = staleArchiveMessage({
+      archiveVersion: "0009_reminders.sql",
+      migrationsOnDisk: ["0001_durable_core.sql", "0008_committed_run.sql"],
+    });
+    expect(message).toBeNull();
+  });
+
+  it("names the archive version, the newer version, and the remedy when the archive predates a migration on disk", () => {
+    const message = staleArchiveMessage({
+      archiveVersion: "0008_committed_run.sql",
+      migrationsOnDisk: [
+        "0001_durable_core.sql",
+        "0008_committed_run.sql",
+        "0009_reminders.sql",
+      ],
+    });
+    expect(message).toMatch(/0008_committed_run\.sql/);
+    expect(message).toMatch(/0009_reminders\.sql/);
+    expect(message).toMatch(/check out the commit/i);
+    expect(message).toMatch(/apply the later migrations/i);
+  });
+});
+
+// The safety property that matters is the ORDER: an occupied target must be
+// refused before migrations ever run against it. An earlier version applied
+// migrations first, which meant a mistyped database name got Junco's schema
+// created in it before the script decided to refuse.
+describe("loadIntoTarget", () => {
+  it("checks emptiness before applying migrations, and applies migrations before loading rows", async () => {
+    const calls = [];
+    const actual = { ...zeroCounts(), people: 1 };
+    const result = await loadIntoTarget({
+      database: "test-db",
+      sql: "INSERT INTO people (id) VALUES ('p_1');",
+      manifestTables: { ...zeroManifest(), people: { count: 1 } },
+      checkTargetEmpty: async () => {
+        calls.push("checkTargetEmpty");
+        return { empty: true, occupied: [] };
+      },
+      applyMigrations: async () => {
+        calls.push("applyMigrations");
+      },
+      loadRows: async () => {
+        calls.push("loadRows");
+      },
+      countRows: async () => {
+        calls.push("countRows");
+        return actual;
+      },
+    });
+
+    expect(calls).toEqual(["checkTargetEmpty", "applyMigrations", "loadRows", "countRows"]);
+    expect(result).toEqual({ ok: true, actual });
+  });
+
+  it("refuses an occupied target without ever calling applyMigrations or loadRows", async () => {
+    const applyMigrations = vi.fn();
+    const loadRows = vi.fn();
+    const result = await loadIntoTarget({
+      database: "test-db",
+      sql: "",
+      manifestTables: {},
+      checkTargetEmpty: async () => ({ empty: false, occupied: [{ t: "people", n: 3 }] }),
+      applyMigrations,
+      loadRows,
+      countRows: vi.fn(),
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "occupied",
+      status: { empty: false, occupied: [{ t: "people", n: 3 }] },
+    });
+    expect(applyMigrations).not.toHaveBeenCalled();
+    expect(loadRows).not.toHaveBeenCalled();
+  });
+
+  it("reports a count mismatch after loading rather than claiming success", async () => {
+    const actual = { ...zeroCounts(), people: 3 };
+    const result = await loadIntoTarget({
+      database: "test-db",
+      sql: "",
+      manifestTables: { ...zeroManifest(), people: { count: 5 } },
+      checkTargetEmpty: async () => ({ empty: true, occupied: [] }),
+      applyMigrations: async () => {},
+      loadRows: async () => {},
+      countRows: async () => actual,
+    });
+
+    expect(result).toEqual({ ok: false, reason: "count-mismatch", actual, wrong: ["people"] });
   });
 });
