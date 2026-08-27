@@ -86,6 +86,52 @@ plan holds.
 
 **This is plan 1 of 3.** Plan 2 covers the documentation corrections and argument validation (spec P2 and P3). Plan 3 covers the read surface and `update_followup` (spec P4 and P5). This plan touches no Worker code and requires no migration, which is why it goes first: everything in plans 2 and 3 modifies a live database that currently has no backup.
 
+### Revised again, same day, after a second review of the revision
+
+The second round found that the first round's own fixes introduced a blocking
+defect and left three gaps. Recorded because "the fix broke something" is the
+failure this project keeps producing.
+
+**The revision broke Task 8.** Making export filenames minute-precise, to stop
+a second export destroying the first, left Step 3 still opening
+`junco-backup-$(date +%F).json.bz2`. Two reviewers caught it independently.
+Step 3 now uses the newest matching file. This is exactly the class of defect
+the first round was praised for finding and the revision then committed.
+
+**The restore mutated a mistyped target before refusing it.** The emptiness
+check ran after `migrations apply`, so pointing it at the wrong database
+created Junco's schema there and only then declined. The check now runs first,
+treating "no such table" as the signal for a fresh database, which is the only
+error it tolerates.
+
+**`--force` is gone.** It let the operator merge an archive into a populated
+database, which duplicates every row whose id does not collide and reports
+success. There is no flag for that now, and the refusal says why.
+
+**The 100 KB statement limit is no longer something this plan has to be right
+about.** Round one rejected it on the grounds that `--file` uses D1's import
+path; round two argued D1 still documents a per-statement limit that the
+import path must also honour. That dispute is unresolved and could not be
+settled here, so `insertStatements` now refuses to generate a statement over
+90 KB and says which row caused it. A row that cannot be restored is found at
+export time rather than during a recovery.
+
+**Two smaller ones.** Task 2 Step 3 predicted the wrong failure: vitest's
+default glob does match `*.test.mjs`, so the file is collected and fails in the
+Workers pool rather than going uncollected. And the drill compared row counts
+only, so identical counts with different content passed; it now re-exports from
+the restored database and diffs the manifests, which is content equality.
+
+**Round two also confirmed** the `readRaw` chain, the inventory check in
+`verifyManifest`, the FTS column fix, the temporary config entry, and that
+`test.projects` is correct vitest 4.
+
+**One agent returned nothing.** claude-opus timed out at 540 seconds with no
+output. It completed the previous round in 529 seconds against a 1,339 line
+plan; this plan is now 1,725 lines. The margin was the plan's growth, not a
+fault. A third review of this document should either target a smaller slice or
+accept that one reviewer will not finish.
+
 ## Global Constraints
 
 - **No em dashes or en dashes anywhere**, in code, comments, docs, or commit messages. Plain hyphens only.
@@ -257,9 +303,14 @@ describe("the scripts test project", () => {
 - [ ] **Step 3: Run it and watch it fail**
 
 Run: `npx vitest run scripts/lib/smoke.test.mjs`
-Expected: FAIL. The file is not matched by any `include` in the current configuration, so vitest reports no test files found.
 
-If it somehow runs and passes, stop: the configuration is not what this task assumes, and the rest of this task will be building on a wrong premise.
+Expected: FAIL, because the file runs in the Workers pool. Vitest's default
+glob does match `*.test.mjs`, so the file IS collected; the current config
+applies `cloudflareTest` to everything it collects, and workerd cannot spawn
+a child process.
+
+If it passes, stop. The configuration is not what this task assumes and the
+rest of the task is built on a wrong premise.
 
 - [ ] **Step 4: Restructure `vitest.config.ts` into two projects**
 
@@ -1080,6 +1131,7 @@ Expected: FAIL, "Cannot find module ./export.mjs".
 ```javascript
 // scripts/export.mjs
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, readFile, rename, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -1175,6 +1227,12 @@ async function main() {
   await execFileAsync("bzip2", ["-f", tmpJson]);
   await execFileAsync("bzip2", ["-t", `${tmpJson}.bz2`]);
   await chmod(`${tmpJson}.bz2`, 0o600);
+  // Refuse to replace an existing archive. Minutes make a collision unlikely
+  // rather than impossible, and the archive being overwritten may be the one
+  // taken before whatever went wrong.
+  if (existsSync(finalPath)) {
+    throw new Error(`${finalPath} already exists. Refusing to overwrite an existing archive.`);
+  }
   await rename(`${tmpJson}.bz2`, finalPath);
 
   const total = Object.values(archive.tables).reduce((n, rows) => n + rows.length, 0);
@@ -1214,6 +1272,7 @@ Append to `.gitignore`:
 junco-backup-*.json
 junco-backup-*.json.bz2
 junco-backup-*.json.partial
+junco-backup-*.json.partial.bz2
 ```
 
 - [ ] **Step 6: Run it against the live database**
@@ -1257,7 +1316,7 @@ git commit -m "feat: export every durable table to a checksummed, compressed arc
 ```javascript
 // scripts/restore.test.mjs
 import { describe, expect, it } from "vitest";
-import { insertStatements } from "./restore.mjs";
+import { insertStatements, MAX_STATEMENT_BYTES } from "./restore.mjs";
 
 describe("insertStatements", () => {
   it("emits an INSERT per row, in inventory order", () => {
@@ -1296,6 +1355,20 @@ describe("insertStatements", () => {
   it("skips tables that are not in the inventory", () => {
     const sql = insertStatements({ people: [{ id: "p_1" }], idempotency_keys: [{ id: "x" }] });
     expect(sql).not.toContain("idempotency_keys");
+  });
+
+  // The failure this prevents is the nastiest one available: a row that
+  // exports cleanly and cannot be restored, discovered during a recovery.
+  // Whether D1's 100 KB statement limit reaches the import path is disputed,
+  // so this refuses to find out the hard way.
+  it("refuses to generate a statement over the size ceiling", () => {
+    const huge = { id: "re_1", raw_record: "x".repeat(MAX_STATEMENT_BYTES + 1) };
+    expect(() => insertStatements({ roster_entries: [huge] })).toThrow(/re_1.*ceiling|ceiling.*re_1/s);
+  });
+
+  it("allows a row comfortably under the ceiling", () => {
+    const ok = { id: "re_2", raw_record: "x".repeat(1000) };
+    expect(() => insertStatements({ roster_entries: [ok] })).not.toThrow();
   });
 });
 ```
@@ -1339,6 +1412,20 @@ function literal(value) {
  * `encounters` fires the triggers from migrations 0004 and 0006, which is
  * what repopulates the indexes.
  */
+/**
+ * D1 documents a 100 KB maximum SQL statement. Whether that applies to the
+ * bulk import path `--file` uses is genuinely disputed: one reviewer read
+ * wrangler's source and concluded the file is handed to D1's import endpoint
+ * rather than executed statement by statement, another pointed out that D1
+ * still documents the per-statement limit and the import path still has to
+ * parse the SQL.
+ *
+ * Rather than depend on being right, refuse to generate one. A statement that
+ * would exceed the limit fails LOUDLY here, at export or drill time, instead
+ * of during a recovery. 90 KB leaves headroom for encoding differences.
+ */
+export const MAX_STATEMENT_BYTES = 90_000;
+
 export function insertStatements(tables) {
   const out = [];
   for (const name of BACKED_UP) {
@@ -1347,7 +1434,16 @@ export function insertStatements(tables) {
     for (const row of rows) {
       const columns = Object.keys(row);
       const values = columns.map((c) => literal(row[c])).join(", ");
-      out.push(`INSERT INTO ${name} (${columns.join(", ")}) VALUES (${values});`);
+      const statement = `INSERT INTO ${name} (${columns.join(", ")}) VALUES (${values});`;
+      const bytes = Buffer.byteLength(statement, "utf8");
+      if (bytes > MAX_STATEMENT_BYTES) {
+        throw new Error(
+          `${name} row ${row.id ?? "(no id)"} produces a ${bytes} byte statement, over the ` +
+            `${MAX_STATEMENT_BYTES} byte ceiling. D1 documents a 100 KB statement limit. ` +
+            `This row cannot be restored by this script and needs a different path.`
+        );
+      }
+      out.push(statement);
     }
   }
   return out.join("\n");
@@ -1375,29 +1471,41 @@ async function main() {
   process.stdout.write(`Archive verified. Exported ${archive.manifest.exported_at}\n`);
   process.stdout.write(`Schema at export: ${archive.manifest.schema_version}\n`);
 
-  // Refuse a target that already holds data. Without this, a typo turns
-  // `npm run restore -- backup.bz2 junco-prm` into a merge against the live
-  // database: ids that do not collide simply insert, and the operator has
-  // duplicated their PRM while being told the restore succeeded.
+  // Refuse a non-empty target BEFORE touching it. An earlier version applied
+  // migrations first, which meant a mistyped database name had Junco's schema
+  // created in it before the script decided to refuse. Check, then mutate.
+  //
+  // A brand-new D1 has no tables at all, so the count query errors. That error
+  // is the signal for "fresh and safe", and it is the only error tolerated
+  // here.
+  const countSql = BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(
+    " UNION ALL "
+  );
+  let existing = [];
+  try {
+    existing = await readRaw(countSql, { database });
+  } catch (error) {
+    if (!/no such table/i.test(error.message)) throw error;
+    process.stdout.write(`${database} has no Junco tables yet. Treating as empty.\n`);
+  }
+  const occupied = existing.filter((r) => Number(r.n) > 0);
+  if (occupied.length > 0) {
+    process.stderr.write(
+      `Refusing to restore into ${database}: it already holds data.\n` +
+        occupied.map((r) => `  ${r.t}: ${r.n} rows`).join("\n") +
+        `\n\nRestore targets an empty database. There is deliberately no flag` +
+        ` to override this: merging an archive into a populated database` +
+        ` duplicates every row whose id does not collide, and reports success.` +
+        ` If you mean to replace this database, empty it first, or use` +
+        ` Time Travel instead.\n`
+    );
+    process.exit(1);
+  }
+
   process.stdout.write(`Applying migrations to ${database}\n`);
   await execFileAsync("npx", [
     "wrangler", "d1", "migrations", "apply", database, "--remote",
   ]);
-
-  const existing = await readRaw(
-    BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(" UNION ALL "),
-    { database }
-  );
-  const occupied = existing.filter((r) => Number(r.n) > 0);
-  if (occupied.length > 0 && !process.argv.includes("--force")) {
-    process.stderr.write(
-      `Refusing to restore into ${database}: it already holds data.\n` +
-        occupied.map((r) => `  ${r.t}: ${r.n} rows`).join("\n") +
-        `\n\nRestore targets an empty database. Pass --force only if you have` +
-        ` decided to merge into this one.\n`
-    );
-    process.exit(1);
-  }
 
   // Written to the system temp directory, not the repository root. The old
   // path put every note and contact in the database into a plaintext file
@@ -1530,11 +1638,18 @@ Note the per-table row counts it prints. These are the numbers Step 4 compares a
 
 - [ ] **Step 3: Restore into the disposable database**
 
+Use the filename the export actually printed in Step 2. It carries minutes,
+not just a date, so `$(date +%F)` will not find it.
+
 ```bash
-npm run restore -- junco-backup-$(date +%F).json.bz2 junco-restore-drill
+ls -t junco-backup-*.json.bz2 | head -1        # the newest archive
+npm run restore -- "$(ls -t junco-backup-*.json.bz2 | head -1)" junco-restore-drill
 ```
 
-Expected: verification passes, migrations apply, rows load, no error.
+Expected: verification passes, the target is confirmed empty, migrations
+apply, rows load, and the final line reports that row counts match the
+archive. Any other final line means the restore did not complete, regardless
+of the exit code.
 
 - [ ] **Step 4: Compare the restored database against the LIVE one**
 
@@ -1572,6 +1687,31 @@ failed; record which table and stop rather than proceeding to Step 5.
 Note the live counts may legitimately have moved if a write landed between the
 export and now. If they differ, re-run the export and the drill back to back
 rather than explaining the difference away.
+
+**Counts are necessary and not sufficient.** The same number of rows carrying
+different content passes the check above. So compare content too, by
+re-exporting from the restored database and diffing the manifests. The export
+already targets whichever database `JUNCO_D1_DATABASE` names, and the drill
+database is in `wrangler.jsonc` from Step 1, so this needs no new code:
+
+```bash
+JUNCO_D1_DATABASE=junco-restore-drill npm run export
+
+ORIGINAL="$(ls -t junco-backup-*.json.bz2 | sed -n 2p)"   # the one restored from
+ROUNDTRIP="$(ls -t junco-backup-*.json.bz2 | head -1)"    # the one just taken
+
+diff <(bzcat "$ORIGINAL"  | python3 -c "import json,sys;print(json.dumps(json.load(sys.stdin)['manifest']['tables'],indent=1,sort_keys=True))") \
+     <(bzcat "$ROUNDTRIP" | python3 -c "import json,sys;print(json.dumps(json.load(sys.stdin)['manifest']['tables'],indent=1,sort_keys=True))")
+```
+
+Expected: `diff` prints nothing. Every table's row count and SHA-256 matches,
+which is content equality rather than cardinality equality.
+
+If checksums differ while counts match, the likely cause is row ordering:
+these queries carry no `ORDER BY`, and the checksum is order-sensitive by
+design. Re-run both exports with a deterministic order before concluding the
+data differs, and record what you found. Delete the round-trip archive
+afterwards so it is not mistaken for a backup of the real database.
 
 - [ ] **Step 5: Prove the FTS indexes rebuilt**
 
