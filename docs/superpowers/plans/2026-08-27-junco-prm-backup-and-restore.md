@@ -10,6 +10,80 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-27-junco-prm-read-surface-and-export-design.md` (phases P0 and P1)
 
+## Revised 2026-08-27 after a four-agent code review
+
+Ten defects, all verified against the repository or wrangler's own bundled
+source before being accepted. Recorded because two of them made the plan
+unexecutable and because two confident review findings were wrong.
+
+**Blocking.** `wrangler d1 migrations apply` resolves a database only from
+`wrangler.jsonc`, unlike `d1 execute`, which falls back to the API. Task 8
+created the drill database but never added it to the config, so the restore
+died on its first wrangler call, every time, in the task the whole plan exists
+to reach. Task 8 Step 1 now adds the entry and Step 6 removes it.
+
+**Blocking.** Task 8 Step 5 queried `people_fts.record_id`. Migration 0004
+declares the column as `id`. The plan calls that step the one most likely to
+fail and tells the implementer to read a failure as evidence the triggers did
+not fire, so they would have debugged the wrong thing.
+
+**The verification was circular.** The manifest counted whatever the export
+returned, and the drill compared the restore against that manifest. A stray
+`LIMIT 100` would have passed every test in this plan. The export now asks the
+database for independent counts and aborts on a mismatch, and Step 4 diffs the
+restored database against the live one across all eleven tables rather than
+the eight it previously listed while claiming every count matched.
+
+**`verifyManifest` blessed archives missing whole tables**, because the
+manifest is built from the payload and can only describe what is present. It
+now checks the table set against the inventory, so the archive is
+self-describing at recovery time on a machine without this repository.
+
+**The compressed artifact was not atomic.** The JSON was renamed into place and
+compressed there, so an interrupted `bzip2` left a truncated file under the
+name of a trusted backup. Compression and integrity checking now happen under
+a temporary name. Filenames carry minutes, because a date-only name plus
+`bzip2 -f` meant the second export of a day destroyed the first.
+
+**The restore had no target guard.** `npm run restore -- backup.bz2 junco-prm`
+would have merged the archive into production. It now refuses a non-empty
+target without `--force`.
+
+**A declined prompt read as success.** Remote `--file` warns and prompts on a
+TTY; declining returns null and exits 0, and the script printed "Restore
+complete" over a database that received nothing. It now passes `--yes` and
+verifies row counts before claiming anything.
+
+**Task 2's smoke test would have passed before the change it was meant to
+fail against**, because `nodejs_compat` gives workerd `node:crypto`. It now
+spawns a child process, which workerd genuinely cannot do.
+
+**Three smaller ones:** the ordering test never asserted `import_runs` before
+`roster_entries` despite two real foreign keys; `parseExecuteJson` matched the
+`[` in a `[WARNING]` banner; and the restore SQL was written to the repository
+root in plaintext rather than the temp directory.
+
+### Two review findings rejected, with the evidence
+
+**`test.projects` is correct.** One reviewer called it Jest syntax that vitest
+silently ignores, which would have dropped the Workers pool and destroyed 475
+tests. `projects?: TestProjectConfiguration` is in vitest 4.1.11's own type
+definitions and `workspace` no longer exists. Two other reviewers confirmed it
+independently.
+
+**The 100 KB per-statement and 30 s query limits do not apply to `--file`.**
+Two reviewers built findings on them, one recommending explicit transactions
+and one predicting that a large `raw_record` would fail on restore. Wrangler's
+bundled source shows `--file` never sends statements: it uploads to R2 and
+calls D1's `import` endpoint, which is why it prints "if the execution fails to
+complete, your DB will return to its original state". Thousands of INSERTs in
+one file is the supported path.
+
+**One assumption was confirmed rather than corrected.** A reviewer loaded all
+eight migrations into in-memory SQLite and inserted a person and an encounter;
+both FTS tables received a row through their triggers. The riskiest bet in this
+plan holds.
+
 **This is plan 1 of 3.** Plan 2 covers the documentation corrections and argument validation (spec P2 and P3). Plan 3 covers the read surface and `update_followup` (spec P4 and P5). This plan touches no Worker code and requires no migration, which is why it goes first: everything in plans 2 and 3 modifies a live database that currently has no backup.
 
 ## Global Constraints
@@ -156,20 +230,26 @@ If `projects` is not supported as written below, consult `node_modules/vitest/pa
 ```javascript
 // scripts/lib/smoke.test.mjs
 import { describe, expect, it } from "vitest";
-import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 describe("the scripts test project", () => {
-  // Fails if this test is running in the Workers pool rather than Node:
-  // node:crypto's createHash is not available in workerd.
-  it("runs in a Node environment with node: builtins available", () => {
-    const digest = createHash("sha256").update("junco").digest("hex");
-    expect(digest).toHaveLength(64);
+  // Spawning a process is the capability these scripts actually need and the
+  // one workerd genuinely cannot provide. An earlier draft of this test used
+  // node:crypto, which would have PASSED before the config change: this
+  // Worker sets nodejs_compat and Cloudflare supports node:crypto, so the
+  // "watch it fail" step would have failed to fail.
+  it("can spawn a child process", async () => {
+    const { stdout } = await execFileAsync("node", ["-e", "process.stdout.write('ok')"]);
+    expect(stdout).toBe("ok");
   });
 
-  // Fails if the project's `include` is wrong and this file was picked up
-  // by the workers project instead, where process.versions.node is absent.
-  it("has a real Node process", () => {
-    expect(process.versions.node).toBeTruthy();
+  // Fails if the project's `include` is wrong and this file was picked up by
+  // the workers project instead.
+  it("has a real Node process with a version", () => {
+    expect(process.versions.node).toMatch(/^\d+\./);
   });
 });
 ```
@@ -177,7 +257,9 @@ describe("the scripts test project", () => {
 - [ ] **Step 3: Run it and watch it fail**
 
 Run: `npx vitest run scripts/lib/smoke.test.mjs`
-Expected: FAIL. The file is either not matched by the current `include`, or it is matched and run in the Workers pool where `node:crypto` cannot resolve.
+Expected: FAIL. The file is not matched by any `include` in the current configuration, so vitest reports no test files found.
+
+If it somehow runs and passes, stop: the configuration is not what this task assumes, and the rest of this task will be building on a wrong premise.
 
 - [ ] **Step 4: Restructure `vitest.config.ts` into two projects**
 
@@ -313,6 +395,10 @@ describe("the table inventory", () => {
     expect(pos("people")).toBeLessThan(pos("followups"));
     expect(pos("roster_sources")).toBeLessThan(pos("import_runs"));
     expect(pos("roster_sources")).toBeLessThan(pos("roster_entries"));
+    // Two real foreign keys, both easy to miss: roster_entries.last_seen_run_id
+    // is NOT NULL REFERENCES import_runs(id) (migration 0002), and
+    // committed_run_id references it too (migration 0008).
+    expect(pos("import_runs")).toBeLessThan(pos("roster_entries"));
     expect(pos("people")).toBeLessThan(pos("person_sources"));
     expect(pos("roster_sources")).toBeLessThan(pos("person_sources"));
   });
@@ -546,6 +632,34 @@ describe("verifyManifest", () => {
     delete a.tables.tags;
     expect(verifyManifest(a).ok).toBe(false);
   });
+
+  // THE ONE THAT MATTERS. The manifest is built from the payload, so it can
+  // only ever describe what is present. Drop a table from both and every
+  // check above still passes: export succeeds, verification says ok, restore
+  // reports success, and every follow-up is gone with nothing said.
+  // The archive has to be self-describing at recovery time, on a machine that
+  // may not have this repository, so the inventory check belongs in the file.
+  it("rejects an archive missing a table the inventory requires", () => {
+    const a = archive();
+    delete a.manifest.tables.tags;
+    delete a.tables.tags;
+    const result = verifyManifest(a);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join(" ")).toMatch(/tags.*inventory/i);
+  });
+
+  it("rejects an archive carrying a table the inventory does not know", () => {
+    const a = archive();
+    a.manifest.tables.mystery = { count: 0, checksum: checksum([]) };
+    a.tables.mystery = [];
+    expect(verifyManifest(a).ok).toBe(false);
+  });
+
+  it("rejects an archive written by a future format version", () => {
+    const a = archive();
+    a.manifest.format_version = 99;
+    expect(verifyManifest(a).ok).toBe(false);
+  });
 });
 ```
 
@@ -560,6 +674,7 @@ Expected: FAIL, "Cannot find module ./manifest.mjs".
 // scripts/lib/manifest.mjs
 import { createHash } from "node:crypto";
 import { BACKED_UP, EXCLUDED } from "./inventory.mjs";
+
 
 /**
  * Canonical JSON for one row: keys sorted, so a digest depends on content
@@ -597,9 +712,33 @@ export function buildManifest({ tables, schemaVersion, appVersion, exportedAt })
   };
 }
 
+export const FORMAT_VERSION = 1;
+
 export function verifyManifest(archive) {
   const problems = [];
   const { manifest, tables } = archive;
+
+  if (manifest.format_version !== FORMAT_VERSION) {
+    problems.push(
+      `format_version is ${manifest.format_version}, this tool understands ${FORMAT_VERSION}`
+    );
+  }
+
+  // Checked against the inventory, not against the manifest's own list. A
+  // manifest derived from the payload cannot notice that the payload is short
+  // a table, which is the failure that loses data in total silence.
+  const present = new Set(Object.keys(manifest.tables));
+  for (const name of BACKED_UP) {
+    if (!present.has(name)) {
+      problems.push(`${name}: required by the inventory, absent from this archive`);
+    }
+  }
+  for (const name of present) {
+    if (!BACKED_UP.includes(name)) {
+      problems.push(`${name}: present in the archive but not in the inventory`);
+    }
+  }
+
   for (const [name, expected] of Object.entries(manifest.tables)) {
     const rows = tables[name];
     if (rows === undefined) {
@@ -650,6 +789,7 @@ The one module that touches the outside world. Everything above it stays testabl
 - Consumes: nothing from earlier tasks.
 - Produces:
   - `parseExecuteJson(stdout: string): object[]` - pulls the row array out of whatever `wrangler d1 execute --json` prints.
+  - `readRaw(sql: string, { database, remote, run }): Promise<object[]>` - runs SQL this codebase composed. Never caller input.
   - `readTable(name: string, { database, remote, run }): Promise<object[]>`
   - `runWrangler(args: string[]): Promise<string>` - the default runner, spawning the real binary.
 
@@ -706,6 +846,14 @@ describe("parseExecuteJson", () => {
   // corrupt database rather than a chatty CLI.
   it("ignores anything printed before the JSON", () => {
     const noisy = `Proxying to remote database\n Executed 1 command\n${WRANGLER_OUTPUT}`;
+    expect(parseExecuteJson(noisy)).toHaveLength(2);
+  });
+
+  // The noise above contains no brackets, so it passes even against a naive
+  // indexOf("["). This one does not. wrangler prints exactly this banner when
+  // a newer version exists, and the day it does, backups stop.
+  it("ignores a bracketed warning banner before the JSON", () => {
+    const noisy = `[WARNING] Wrangler is out of date, please update\n${WRANGLER_OUTPUT}`;
     expect(parseExecuteJson(noisy)).toHaveLength(2);
   });
 
@@ -767,7 +915,13 @@ const SAFE_TABLE = /^[a-z_][a-z0-9_]*$/;
  * and parse that.
  */
 export function parseExecuteJson(stdout) {
-  const start = stdout.indexOf("[");
+  // Match the payload's shape, not the first bracket. `indexOf("[")` finds the
+  // one in a "[WARNING] Wrangler is out of date" banner and then fails to
+  // parse the whole stream. `--json` sets wrangler's log level to error for
+  // the run, so the stream should be clean, but a backup that stops working
+  // the day wrangler prints a banner is not worth the two saved characters.
+  const match = stdout.match(/\[\s*\{/);
+  const start = match ? match.index : -1;
   if (start === -1) {
     throw new Error(`no JSON found in wrangler output: ${stdout.slice(0, 200)}`);
   }
@@ -794,13 +948,18 @@ export async function runWrangler(args) {
   return stdout;
 }
 
+/** Runs SQL this codebase composed itself. Never pass caller input here. */
+export async function readRaw(sql, { database, remote = true, run = runWrangler }) {
+  const args = ["d1", "execute", database, "--json", "--command", sql];
+  if (remote) args.splice(3, 0, "--remote");
+  return parseExecuteJson(await run(args));
+}
+
 export async function readTable(name, { database, remote = true, run = runWrangler }) {
   if (!SAFE_TABLE.test(name)) {
     throw new Error(`refusing to read a table name that is not a plain identifier: ${name}`);
   }
-  const args = ["d1", "execute", database, "--json", "--command", `SELECT * FROM ${name}`];
-  if (remote) args.splice(3, 0, "--remote");
-  return parseExecuteJson(await run(args));
+  return readRaw(`SELECT * FROM ${name}`, { database, remote, run });
 }
 ```
 
@@ -845,16 +1004,26 @@ import { verifyManifest } from "./lib/manifest.mjs";
 const runner = () =>
   vi.fn(async (args) => {
     const sql = args[args.indexOf("--command") + 1];
+    if (sql.includes("UNION ALL")) {
+      const rows = BACKED_UP.map((t) => ({ t, n: t === "people" ? 1 : 0 }));
+      return JSON.stringify([{ success: true, meta: {}, results: rows }]);
+    }
     const table = sql.replace("SELECT * FROM ", "");
     const rows = table === "people" ? [{ id: "p_1", full_name: "Ada" }] : [];
     return JSON.stringify([{ success: true, meta: {}, results: rows }]);
   });
 
 describe("exportArchive", () => {
+  // Asserting the call count alone would pass if the same table were read
+  // eleven times. Assert the actual set of tables.
   it("reads every table in the inventory, once each", async () => {
     const run = runner();
     await exportArchive({ database: "junco-prm", run, now: () => new Date("2026-08-27T12:00:00Z") });
-    expect(run).toHaveBeenCalledTimes(BACKED_UP.length);
+    const selected = run.mock.calls
+      .map((c) => c[0][c[0].indexOf("--command") + 1])
+      .filter((sql) => sql.startsWith("SELECT * FROM "))
+      .map((sql) => sql.replace("SELECT * FROM ", ""));
+    expect([...selected].sort()).toEqual([...BACKED_UP].sort());
   });
 
   it("produces an archive that verifies against its own manifest", async () => {
@@ -864,6 +1033,26 @@ describe("exportArchive", () => {
       now: () => new Date("2026-08-27T12:00:00Z"),
     });
     expect(verifyManifest(archive)).toEqual({ ok: true, problems: [] });
+  });
+
+  // The failure this exists to catch: a query that silently returns fewer
+  // rows than the table holds. Without the independent count, every check in
+  // this plan endorses the short archive, because they all derive from it.
+  it("aborts when a table read returns fewer rows than the database reports", async () => {
+    const run = vi.fn(async (args) => {
+      const sql = args[args.indexOf("--command") + 1];
+      if (sql.includes("UNION ALL")) {
+        // The count query: people really holds 2 rows.
+        const rows = BACKED_UP.map((t) => ({ t, n: t === "people" ? 2 : 0 }));
+        return JSON.stringify([{ success: true, meta: {}, results: rows }]);
+      }
+      const table = sql.replace("SELECT * FROM ", "");
+      const rows = table === "people" ? [{ id: "p_1", full_name: "Ada" }] : [];
+      return JSON.stringify([{ success: true, meta: {}, results: rows }]);
+    });
+    await expect(
+      exportArchive({ database: "junco-prm", run, now: () => new Date() })
+    ).rejects.toThrow(/people.*read 1.*reports 2/);
   });
 
   // The failure that matters: one table read fails, and the archive is
@@ -891,9 +1080,10 @@ Expected: FAIL, "Cannot find module ./export.mjs".
 ```javascript
 // scripts/export.mjs
 import { execFile } from "node:child_process";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, readFile, rename, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
-import { readTable, runWrangler } from "./lib/d1.mjs";
+import { pathToFileURL } from "node:url";
+import { readRaw, readTable, runWrangler } from "./lib/d1.mjs";
 import { BACKED_UP } from "./lib/inventory.mjs";
 import { buildManifest } from "./lib/manifest.mjs";
 
@@ -912,6 +1102,22 @@ export async function exportArchive({ database, run = runWrangler, now = () => n
     process.stdout.write(`  ${name}: ${tables[name].length} rows\n`);
   }
 
+  // Ask the database how many rows there should have been, rather than
+  // trusting the read that produced them. Without this the whole verification
+  // chain is circular: the manifest counts what the export returned, and the
+  // drill compares the restore against the manifest, so a query that silently
+  // returned a short result is endorsed at every stage. A stray LIMIT would
+  // pass every unit test in this plan.
+  const counts = await countRows({ database, run });
+  for (const name of BACKED_UP) {
+    if (counts[name] !== tables[name].length) {
+      throw new Error(
+        `${name}: read ${tables[name].length} rows but the database reports ${counts[name]}. ` +
+          `Aborting rather than writing a short archive.`
+      );
+    }
+  }
+
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const migrations = BACKED_UP.length > 0 ? await latestMigration() : null;
 
@@ -926,6 +1132,18 @@ export async function exportArchive({ database, run = runWrangler, now = () => n
   };
 }
 
+/**
+ * One statement, one round trip, counting every backed-up table. Independent
+ * of the queries that produced the archive, which is the entire point.
+ */
+export async function countRows({ database, run = runWrangler }) {
+  const sql = BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(
+    " UNION ALL "
+  );
+  const rows = await readRaw(sql, { database, run });
+  return Object.fromEntries(rows.map((r) => [r.t, Number(r.n)]));
+}
+
 async function latestMigration() {
   const { readdir } = await import("node:fs/promises");
   const files = (await readdir(new URL("../migrations", import.meta.url))).filter((f) =>
@@ -936,27 +1154,38 @@ async function latestMigration() {
 
 async function main() {
   const database = process.env.JUNCO_D1_DATABASE ?? "junco-prm";
-  const stamp = new Date().toISOString().slice(0, 10);
+  // Minute precision, not date. A date-only name plus `bzip2 -f` means the
+  // second export of the day silently destroys the first, which is the one
+  // that might have been taken before the thing that went wrong.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 16);
   const jsonPath = `junco-backup-${stamp}.json`;
+  const finalPath = `${jsonPath}.bz2`;
 
   process.stdout.write(`Exporting ${database}\n`);
   const archive = await exportArchive({ database });
 
-  // Write to a temporary name and rename, so an interrupted export never
-  // leaves a half-written file sitting under the name of a real backup.
-  // Mode 0600: this file holds every contact and note in the database.
-  await writeFile(`${jsonPath}.partial`, JSON.stringify(archive, null, 2), { mode: 0o600 });
-  await rename(`${jsonPath}.partial`, jsonPath);
-
-  await execFileAsync("bzip2", ["-f", jsonPath]);
-  await execFileAsync("bzip2", ["-t", `${jsonPath}.bz2`]);
+  // Nothing is ever written under the final name until it has been compressed
+  // AND integrity-checked. The earlier version renamed the JSON into place and
+  // then compressed it there, so an interrupted bzip2 left a truncated file
+  // under the name of a trusted backup.
+  // Mode 0600 with flag "wx": this holds every contact and note in the
+  // database, and an existing file must never be silently reused.
+  const tmpJson = `${jsonPath}.partial`;
+  await writeFile(tmpJson, JSON.stringify(archive, null, 2), { mode: 0o600, flag: "wx" });
+  await execFileAsync("bzip2", ["-f", tmpJson]);
+  await execFileAsync("bzip2", ["-t", `${tmpJson}.bz2`]);
+  await chmod(`${tmpJson}.bz2`, 0o600);
+  await rename(`${tmpJson}.bz2`, finalPath);
 
   const total = Object.values(archive.tables).reduce((n, rows) => n + rows.length, 0);
-  process.stdout.write(`\nWrote ${jsonPath}.bz2, ${total} rows, integrity verified.\n`);
-  process.stdout.write(`Restore drill: npm run restore -- ${jsonPath}.bz2 <disposable-db>\n`);
+  process.stdout.write(`\nWrote ${finalPath}, ${total} rows, counts confirmed against the database, integrity verified.\n`);
+  process.stdout.write(`Restore drill: npm run restore -- ${finalPath} <disposable-db>\n`);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL rather than string concatenation. The naive form happens to
+// work for this repository's path, and breaks for any path containing a space
+// or a character that percent-encodes, by silently doing nothing at all.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     process.stderr.write(`\nExport failed: ${error.message}\n`);
     if (error.cause) process.stderr.write(`Caused by: ${error.cause.message}\n`);
@@ -1082,7 +1311,11 @@ Expected: FAIL, "Cannot find module ./restore.mjs".
 // scripts/restore.mjs
 import { execFile } from "node:child_process";
 import { readFile, writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
+import { readRaw } from "./lib/d1.mjs";
 import { BACKED_UP } from "./lib/inventory.mjs";
 import { verifyManifest } from "./lib/manifest.mjs";
 
@@ -1091,6 +1324,10 @@ const execFileAsync = promisify(execFile);
 function literal(value) {
   if (value === null || value === undefined) return "NULL";
   if (typeof value === "number") return String(value);
+  // SQLite has no boolean type and this schema stores none, so this branch
+  // should never fire. It exists because if it ever does, the alternative is
+  // quoting `true` into an INTEGER column, which SQLite casts to 0 in silence.
+  if (typeof value === "boolean") return value ? "1" : "0";
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
@@ -1138,24 +1375,74 @@ async function main() {
   process.stdout.write(`Archive verified. Exported ${archive.manifest.exported_at}\n`);
   process.stdout.write(`Schema at export: ${archive.manifest.schema_version}\n`);
 
+  // Refuse a target that already holds data. Without this, a typo turns
+  // `npm run restore -- backup.bz2 junco-prm` into a merge against the live
+  // database: ids that do not collide simply insert, and the operator has
+  // duplicated their PRM while being told the restore succeeded.
   process.stdout.write(`Applying migrations to ${database}\n`);
-  await execFileAsync("npx", ["wrangler", "d1", "migrations", "apply", database, "--remote"]);
+  await execFileAsync("npx", [
+    "wrangler", "d1", "migrations", "apply", database, "--remote",
+  ]);
 
-  const sqlPath = `restore-${Date.now()}.sql`;
-  await writeFile(sqlPath, insertStatements(archive.tables), { mode: 0o600 });
+  const existing = await readRaw(
+    BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(" UNION ALL "),
+    { database }
+  );
+  const occupied = existing.filter((r) => Number(r.n) > 0);
+  if (occupied.length > 0 && !process.argv.includes("--force")) {
+    process.stderr.write(
+      `Refusing to restore into ${database}: it already holds data.\n` +
+        occupied.map((r) => `  ${r.t}: ${r.n} rows`).join("\n") +
+        `\n\nRestore targets an empty database. Pass --force only if you have` +
+        ` decided to merge into this one.\n`
+    );
+    process.exit(1);
+  }
+
+  // Written to the system temp directory, not the repository root. The old
+  // path put every note and contact in the database into a plaintext file
+  // beside the source, where nothing gitignored it.
+  const sqlPath = join(tmpdir(), `junco-restore-${Date.now()}.sql`);
+  await writeFile(sqlPath, insertStatements(archive.tables), { mode: 0o600, flag: "wx" });
   try {
     process.stdout.write(`Loading rows into ${database}\n`);
-    await execFileAsync("npx", ["wrangler", "d1", "execute", database, "--remote", "--file", sqlPath], {
-      maxBuffer: 60 * 1024 * 1024,
-    });
+    // --yes matters. Remote --file warns that the database will be unavailable
+    // and prompts when stdout is a TTY. Declining returns null and exits 0, so
+    // without this the script prints "Restore complete" over a database that
+    // received nothing at all.
+    await execFileAsync(
+      "npx",
+      ["wrangler", "d1", "execute", database, "--remote", "--yes", "--file", sqlPath],
+      { maxBuffer: 60 * 1024 * 1024 }
+    );
   } finally {
     await unlink(sqlPath);
   }
 
-  process.stdout.write("\nRestore complete. Verify with the checks in docs/BACKUP.md.\n");
+  // Never claim success on the strength of an exit code. Count what landed.
+  const after = await readRaw(
+    BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(" UNION ALL "),
+    { database }
+  );
+  const actual = Object.fromEntries(after.map((r) => [r.t, Number(r.n)]));
+  const wrong = BACKED_UP.filter(
+    (t) => actual[t] !== (archive.manifest.tables[t]?.count ?? 0)
+  );
+  if (wrong.length > 0) {
+    process.stderr.write(
+      `Restore did NOT complete. Row counts do not match the archive:\n` +
+        wrong
+          .map((t) => `  ${t}: ${actual[t]} in database, ${archive.manifest.tables[t]?.count} in archive`)
+          .join("\n") + "\n"
+    );
+    process.exit(1);
+  }
+
+  process.stdout.write("\nRestore complete, row counts match the archive.\n");
+  process.stdout.write("Now verify search with the FTS checks in docs/BACKUP.md.\n");
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
     process.stderr.write(`\nRestore failed: ${error.message}\n`);
     process.exit(1);
@@ -1201,13 +1488,37 @@ git commit -m "feat: restore an archive into a database, rebuilding FTS by reins
 - Consumes: `npm run export` and `npm run restore`.
 - Produces: a recorded, dated result proving the round trip works, or a recorded failure that becomes the next task.
 
-- [ ] **Step 1: Create a disposable database**
+- [ ] **Step 1: Create a disposable database AND put it in the config**
 
 ```bash
 npx wrangler d1 create junco-restore-drill
 ```
 
-Record the id. This database is deleted in Step 6.
+Record the id it prints.
+
+**The second half is not optional and the restore cannot run without it.**
+`wrangler d1 execute` resolves a database by name against the API, but
+`wrangler d1 migrations apply` does not: it reads `d1_databases` out of
+`wrangler.jsonc` only, because it needs `migrations_dir` from that entry.
+Pointing it at a database that is not in the config fails with
+"Couldn't find a D1 DB with the name or binding ... in your wrangler.jsonc
+file", every time.
+
+Add a second entry to the `d1_databases` array in your live `wrangler.jsonc`,
+using the id from above:
+
+```jsonc
+{
+  // Temporary. Added for a restore drill, removed in Step 6.
+  "binding": "RESTORE_DRILL",
+  "database_name": "junco-restore-drill",
+  "database_id": "PASTE_THE_ID_FROM_ABOVE",
+  "migrations_dir": "migrations"
+}
+```
+
+`wrangler.jsonc` is gitignored, so this change is local and is not committed.
+Do not add the real id to `wrangler.example.jsonc`.
 
 - [ ] **Step 2: Take a fresh export**
 
@@ -1225,21 +1536,42 @@ npm run restore -- junco-backup-$(date +%F).json.bz2 junco-restore-drill
 
 Expected: verification passes, migrations apply, rows load, no error.
 
-- [ ] **Step 4: Compare row counts**
+- [ ] **Step 4: Compare the restored database against the LIVE one**
+
+The comparison must be against the source, not against the archive. Comparing
+a restore to the manifest that was built from that same export is circular:
+if the export read short, both sides agree and both are wrong.
+
+Run the identical statement against both databases. All eleven tables, not a
+subset; the earlier version of this step omitted `tags`, `roster_sources`, and
+`import_runs` while claiming every count matched.
 
 ```bash
-npx wrangler d1 execute junco-restore-drill --remote --json --command \
-  "SELECT 'people' t, COUNT(*) n FROM people
-   UNION ALL SELECT 'encounters', COUNT(*) FROM encounters
-   UNION ALL SELECT 'followups', COUNT(*) FROM followups
-   UNION ALL SELECT 'roster_entries', COUNT(*) FROM roster_entries
-   UNION ALL SELECT 'person_sources', COUNT(*) FROM person_sources
-   UNION ALL SELECT 'person_contacts', COUNT(*) FROM person_contacts
-   UNION ALL SELECT 'person_links', COUNT(*) FROM person_links
-   UNION ALL SELECT 'person_tags', COUNT(*) FROM person_tags"
+COUNTS="SELECT 'people' t, COUNT(*) n FROM people
+ UNION ALL SELECT 'tags', COUNT(*) FROM tags
+ UNION ALL SELECT 'person_contacts', COUNT(*) FROM person_contacts
+ UNION ALL SELECT 'person_links', COUNT(*) FROM person_links
+ UNION ALL SELECT 'person_tags', COUNT(*) FROM person_tags
+ UNION ALL SELECT 'encounters', COUNT(*) FROM encounters
+ UNION ALL SELECT 'followups', COUNT(*) FROM followups
+ UNION ALL SELECT 'roster_sources', COUNT(*) FROM roster_sources
+ UNION ALL SELECT 'import_runs', COUNT(*) FROM import_runs
+ UNION ALL SELECT 'roster_entries', COUNT(*) FROM roster_entries
+ UNION ALL SELECT 'person_sources', COUNT(*) FROM person_sources
+ ORDER BY t"
+
+npx wrangler d1 execute junco-prm --remote --json --command "$COUNTS" > /tmp/live-counts.json
+npx wrangler d1 execute junco-restore-drill --remote --json --command "$COUNTS" > /tmp/drill-counts.json
+diff <(python3 -c "import json,sys;print(json.load(open('/tmp/live-counts.json'))[0]['results'])") \
+     <(python3 -c "import json,sys;print(json.load(open('/tmp/drill-counts.json'))[0]['results'])")
 ```
 
-Expected: every count matches what Step 2 printed.
+Expected: `diff` prints nothing. Any output is a discrepancy and the drill has
+failed; record which table and stop rather than proceeding to Step 5.
+
+Note the live counts may legitimately have moved if a write landed between the
+export and now. If they differ, re-run the export and the drill back to back
+rather than explaining the difference away.
 
 - [ ] **Step 5: Prove the FTS indexes rebuilt**
 
@@ -1247,27 +1579,48 @@ This is the step the whole design rests on, and the one most likely to fail. The
 
 ```bash
 npx wrangler d1 execute junco-restore-drill --remote --json --command \
-  "SELECT COUNT(*) AS indexed FROM people_fts"
+  "SELECT 'people_fts' t, COUNT(*) n FROM people_fts
+   UNION ALL SELECT 'encounters_fts', COUNT(*) FROM encounters_fts"
 ```
 
-Expected: equal to the `people` count from Step 4.
+Expected: `people_fts` equals the `people` count and `encounters_fts` equals
+the `encounters` count, both from Step 4. Check both; an earlier version of
+this step checked only `people_fts` and left the second index unverified.
 
 Then prove search actually works rather than that a count is plausible:
 
 ```bash
 npx wrangler d1 execute junco-restore-drill --remote --json --command \
-  "SELECT full_name FROM people WHERE id IN (SELECT record_id FROM people_fts WHERE people_fts MATCH 'heaney')"
+  "SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM people_fts f WHERE people_fts MATCH 'heaney')"
 ```
 
 Expected: Rory Heaney.
 
+**The column is `id`, not `record_id`.** `migrations/0004_search.sql` declares
+`people_fts USING fts5(id UNINDEXED, full_name, ...)`, and `src/tools/search.ts`
+queries it as `SELECT f.id AS id`. An earlier version of this step used
+`record_id` and would have failed with "no such column", in the one step whose
+failure this plan tells you to read as evidence that the triggers did not fire.
+
 **If the FTS tables are empty**, the triggers did not fire on the bulk insert. Record that finding, and the fix belongs in `restore.mjs`: after loading rows, delete and reinsert into the FTS tables directly from the source tables. Do not paper over it in the runbook.
 
-- [ ] **Step 6: Delete the disposable database**
+- [ ] **Step 6: Delete the disposable database and remove its config entry**
 
 ```bash
 npx wrangler d1 delete junco-restore-drill
 ```
+
+Then remove the `RESTORE_DRILL` block from `wrangler.jsonc`. A config entry
+pointing at a database that no longer exists will fail the next deploy in a
+way that looks unrelated to this drill.
+
+Confirm the live config is back to one database:
+
+```bash
+grep -c "database_name" wrangler.jsonc
+```
+
+Expected: `1`.
 
 - [ ] **Step 7: Record the drill in both documents**
 
@@ -1315,6 +1668,39 @@ Re-run the round trip into a disposable database after any migration. An
 export format that has not been restored since the schema changed is
 untested again. The last drill and its result are recorded in
 docs/MEASUREMENTS.md.
+
+The drill needs its disposable database added to `wrangler.jsonc` first.
+`wrangler d1 migrations apply` reads `d1_databases` from the config and does
+not fall back to the API the way `d1 execute` does. Remove the entry when the
+drill is finished.
+
+### What the archive does not contain, and what account loss also needs
+
+The archive holds D1 rows. Standing the instance back up after losing the
+Cloudflare account needs more than that, and none of it is in the file:
+
+- **The Worker itself.** Redeploy from this repository.
+- **The KV namespace.** It holds OAuth grants. It is not backed up, and it
+  does not need to be: re-adding the connector mints a new grant.
+- **The three secrets.** `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and
+  `COOKIE_ENCRYPTION_KEY`, set with `wrangler secret put`. Keep them in a
+  password manager, not here.
+- **The GitHub OAuth App**, and its callback URL, which changes with the new
+  Worker URL.
+- **`wrangler.jsonc`**, which is gitignored and holds the resource ids. New
+  resources mean new ids, so this is recreated from the template rather than
+  restored.
+
+The three operational tables are excluded by design, so after a restore an
+in-flight retry may re-execute a write rather than replaying its recorded
+result. That is the correct trade for a recovery and it is worth knowing.
+
+### Where the files go
+
+An archive stored inside the Cloudflare account it exists to survive is not a
+backup. Keep them somewhere else, and write down where in this section once
+that is decided, because a runbook that does not name the location is a
+runbook that fails at the moment it is needed.
 ```
 
 - [ ] **Step 8: Commit**
