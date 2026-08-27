@@ -448,9 +448,10 @@ database.
 - `people_fts`: 50 rows, matching the `people` count.
 - `encounters_fts`: 25 rows, matching the `encounters` count.
 - `SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM
-  people_fts f WHERE people_fts MATCH 'heaney')` returned `Rory Heaney`, the
-  expected row. The FTS triggers fired during the bulk insert; the indexes
-  are not just populated, they answer a real query correctly.
+  people_fts f WHERE people_fts MATCH '<search term>')` returned the expected
+  row, a real contact's full name. The FTS triggers fired during the bulk
+  insert; the indexes are not just populated, they answer a real query
+  correctly.
 
 **Nothing surprising.** Every step matched the brief on the first attempt:
 the `wrangler.jsonc` config entry was required and sufficient for

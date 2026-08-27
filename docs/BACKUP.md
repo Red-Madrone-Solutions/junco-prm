@@ -84,11 +84,47 @@ stored inside the account it exists to survive is not a backup.
 
 ### Restoring
 
-    npm run restore -- junco-backup-YYYY-MM-DD.json.bz2 <target-database>
+    npm run restore -- junco-backup-YYYY-MM-DDTHH-MM.json.bz2 <target-database>
 
 It verifies the archive against its own manifest before writing anything,
 applies migrations, then loads rows in dependency order. FTS indexes are
 repopulated by the triggers as rows are inserted.
+
+**If the archive predates a migration.** Restore compares the archive's
+recorded schema version against the newest migration file in this
+repository. If the archive is older, verification will fail because the
+current table inventory expects a table the archive does not have, and the
+restore output says so along with the schema versions involved. The remedy:
+check out the commit whose `migrations/` directory matches the archive's
+schema version, restore there, then apply the later migrations to bring the
+database up to date. There is no flag to skip this check.
+
+**If a restore is interrupted with SIGINT (Ctrl-C) during the load step**,
+the plaintext restore SQL is left behind in the OS temp directory as
+`junco-restore-<timestamp>.sql`, mode 0600. It is not cleaned up automatically
+in that case. Find and remove it by hand before considering the interrupted
+attempt closed.
+
+### Verifying search after a restore
+
+`npm run restore` repopulates the FTS indexes by reinserting `people` and
+`encounters`, which fires the existing triggers. Confirm both indexes came
+back before trusting the restored database:
+
+    npx wrangler d1 execute <database> --remote --command "SELECT COUNT(*) FROM people_fts"
+    npx wrangler d1 execute <database> --remote --command "SELECT COUNT(*) FROM people"
+
+    npx wrangler d1 execute <database> --remote --command "SELECT COUNT(*) FROM encounters_fts"
+    npx wrangler d1 execute <database> --remote --command "SELECT COUNT(*) FROM encounters"
+
+Each pair should match. Then confirm the index answers a real query, not just
+that it is populated:
+
+    npx wrangler d1 execute <database> --remote --command "SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM people_fts f WHERE people_fts MATCH '<search term>')"
+
+Use a search term you know is in the restored data, and check the row it
+returns is the one you expect. The join column is `id`, both on `people_fts`
+and on `people`, not `record_id`.
 
 ### The drill
 
