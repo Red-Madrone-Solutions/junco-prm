@@ -180,7 +180,7 @@ This was predicted. Plan 1 deferred runtime validation of the registry's input s
 
 **Request 9 as filed.** Searching the roster returns a `roster_next_cursor`. Passing that cursor back with the same query returns the identical rows and the identical cursor token, so the page never advances. Filed as a bug, priority medium. The reporter's reasoning: with 798 entries and a text match that also hits job titles, a search for a first name returns mostly irrelevant rows, so the real candidates sit past the cutoff and cannot be reached.
 
-**Roster pagination is correct**, proven against the live instance on 2026-08-27. Passing the token back as `roster_cursor` advanced from `Anne Watson, Anthony Tran, Arjun Valapparambil Sunilkumar` to `Brittany Celata, Camille Roubik, Carrie Smaha`, in correct keyset order with a fresh cursor.
+**Roster pagination is correct**, proven against the live instance on 2026-08-27. Passing the token back as `roster_cursor` advanced from the first three entries alphabetically to the next three, with no overlap and a fresh cursor, which is correct keyset behaviour. The names are omitted because this file is published and the roster holds real people; the run is recorded in full where it is not.
 
 The reproduction passed `cursor`. `search_people` has no such parameter. The argument was unrecognized, dropped, and the query restarted, producing exactly the reported symptom.
 

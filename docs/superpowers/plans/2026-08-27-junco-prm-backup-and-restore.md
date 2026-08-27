@@ -1747,10 +1747,10 @@ Then prove search actually works rather than that a count is plausible:
 
 ```bash
 npx wrangler d1 execute junco-restore-drill --remote --json --command \
-  "SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM people_fts f WHERE people_fts MATCH 'heaney')"
+  "SELECT p.full_name FROM people p WHERE p.id IN (SELECT f.id FROM people_fts f WHERE people_fts MATCH '<a surname you know is in your data>')"
 ```
 
-Expected: Rory Heaney.
+Expected: that person, returned by name. Pick the search term from your own records at the time you run this; it is not written down here because this file is published and the roster holds real people.
 
 **The column is `id`, not `record_id`.** `migrations/0004_search.sql` declares
 `people_fts USING fts5(id UNINDEXED, full_name, ...)`, and `src/tools/search.ts`

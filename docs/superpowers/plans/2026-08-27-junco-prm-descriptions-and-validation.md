@@ -38,9 +38,9 @@ The deciding argument is the failure mode the hand-written version carried: a sc
 
 A reviewer warned that unknown property names would be echoed into retained logs. `logToolCall` in `src/log.ts` accepts `requestId`, `tool`, `durationMs`, `outcome`, and `code`, and never a message. Refusal text reaches the model in the tool result and does not reach the log.
 
-## Known gaps at this boundary, not fixed by this plan
+## Known gaps at this boundary
 
-Found on 2026-08-27 while executing plan 1, at the same transport boundary this plan touches. Recorded here so whoever executes plan 2 sees it and does not have to rediscover it, and so nobody mistakes it for something plan 2 introduced.
+Both were found on 2026-08-27 while executing plan 1, at the same transport boundary this plan touches, and both were fixed the same day outside this plan. They are kept here rather than deleted because an executor working at this boundary should know what changed under them and why, and because the second one describes a failure mode worth recognising again.
 
 ### `GET /mcp` returns 200 and causes an infinite client reconnect loop
 
@@ -54,7 +54,9 @@ Found on 2026-08-27 while executing plan 1, at the same transport boundary this 
 
 **The fix.** Answer `GET /mcp` with **405 Method Not Allowed** rather than letting the SDK open a stream this server will not hold. A 405 tells the client no SSE stream exists and clients stop retrying; a 200 followed by an immediate close reads as a failure worth retrying. The SDK already has a 405 path at `webStandardStreamableHttp.js:451`, so this is about routing the GET there rather than writing new behaviour.
 
-**Why it is not a task in this plan.** This plan's scope is tool descriptions and argument validation. The fix belongs to whoever owns the transport, it needs its own test proving a `GET` returns 405 and that a `POST` still works, and it should not ride along inside a change to refusal semantics. It is listed here rather than in the deferred set because it is live, continuous, and currently the largest operational problem the project has.
+**FIXED on 2026-08-27, outside this plan.** Commit `3100663`, deployed as version `f762e299`, merged to `main`. `src/mcp/transport.ts` now returns 405 with an `allow: POST` header for a `GET`, placed after the ownership check so a stranger still gets 403, and before the server is built so a `GET` costs nothing else. Four tests; removing the guard turns exactly two red. Verified stopped against the live Worker: 196 requests in 45 seconds before, zero after, confirmed with a positive control so the measurement was not silence from a broken capture.
+
+It stayed out of this plan's task list on purpose. This plan's scope is tool descriptions and argument validation, and a transport fix should not ride along inside a change to refusal semantics. It is recorded here because an executor reading this plan is working at the same boundary and should know what changed under them.
 
 ### A KV quota error escapes as an unhandled exception and a Cloudflare error page
 
@@ -73,7 +75,13 @@ This project fails closed deliberately everywhere else, and keeps a closed set o
 
 The throw is inside `workers-oauth-provider`, so the fix is a boundary that catches it rather than a change to the library. The 405 guard shipped the same day removes the traffic that caused this particular exhaustion; it does not close the handling gap. Any future exhaustion, of KV or anything else, lands identically.
 
-Worth deciding rather than inheriting: whether an over-quota instance should answer 503 with a body naming the exhausted resource and the reset time, in the same shape `src/config.ts` already uses when a variable is missing. That precedent exists and is argued well in the spec. This is the same category of failure and should probably look the same to a caller.
+**FIXED on 2026-08-27, outside this plan.** Commit on `fix-kv-quota-503`, deployed as version `557b28b9`, merged to `main`. `src/quota.ts` recognises a spent daily allowance and `src/index.ts` translates it at the boundary into a 503 carrying the reason, `resets_at`, a `Retry-After`, and a next step, in the same shape `config.ts` uses for a missing variable.
+
+The match is deliberately narrow, on "limit exceeded for the day" rather than on "limit", so a size cap or a rate limit still rethrows and reaches Cloudflare as a genuine fault. Reporting a real defect as "come back tomorrow" is the worst possible advice for something that will still be broken tomorrow, and a test asserts that distinction.
+
+Twelve tests, three mutations. The one worth recording: the first draft passed with the catch deleted from `index.ts`, which would have let the entire fix be removed silently. The fixture now drives the real fetch handler, and it needed a three-part colon-separated bearer token, because the provider only reads KV when the token matches its internal shape and any other token returns 401 before the binding is touched.
+
+Verified against the live outage rather than a simulation: the exhausted instance answered 503 with `resets_at` and a `Retry-After` of 3263 seconds, the real time to that day's reset.
 
 **Related, and separate.** The connector was registered as a user-level MCP server in `~/.claude.json`, so every Claude Code session on the machine, in any project, ran this loop. It was moved to project scope on 2026-08-27. That reduces how many sessions trigger it. It does not fix the loop.
 
