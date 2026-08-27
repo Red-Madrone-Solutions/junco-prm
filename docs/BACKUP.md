@@ -10,16 +10,32 @@ Two layers, covering different failures. Reach for the right one.
 ## Time Travel
 
 D1 keeps point-in-time history automatically. Retention is 7 days on the
-free plan and 30 days on paid. Nothing needs to be set up and nothing
-needs to be remembered in advance.
+free plan and 30 days on paid. The retention itself is automatic and needs
+no setup, but recording a bookmark before a risky change is still a habit
+worth keeping: it is not a prerequisite for Time Travel to work, but it is
+what makes a restore fast instead of a search.
 
 Check what is available:
 
     npx wrangler d1 time-travel info junco-prm
 
-Restore to a point in time:
+This prints a bookmark, for example:
 
-    npx wrangler d1 time-travel restore junco-prm --timestamp <ISO timestamp>
+    ⚠️ The current bookmark is '0000002d-00000000-000050d4-b7c899f681622bb0df214f940a12aa39'
+
+Restore to that bookmark:
+
+    npx wrangler d1 time-travel restore junco-prm --bookmark=<bookmark>
+
+`time-travel restore` also accepts `--timestamp`, a Unix (seconds from
+epoch) or RFC3339 timestamp, if you know the point in time you want but
+did not capture a bookmark for it:
+
+    npx wrangler d1 time-travel restore junco-prm --timestamp <timestamp>
+
+Prefer `--bookmark` when one was captured, since it names an exact point
+with no ambiguity. Use `--timestamp` only when no bookmark was recorded for
+the moment you need.
 
 **Restore is destructive and happens in place.** It replaces the current
 database. There is no undo beyond restoring forward to a later bookmark,
