@@ -89,8 +89,23 @@ export function consentPage(options: {
       "set-cookie": options.setCookie,
       // This page names a redirect URI and carries a transaction handle.
       // Nothing should be able to frame it or load anything into it.
+      //
+      // `form-action` NAMES GITHUB, and it has to. Chrome enforces this
+      // directive ACROSS REDIRECTS rather than only on the initial
+      // submission: the form posts to /authorize/approve, which is
+      // same-origin and allowed, that endpoint answers 302 to
+      // github.com/login/oauth/authorize, and Chrome then checks the redirect
+      // target against this directive too. With `'self'` alone it refuses to
+      // follow, the Worker logs a clean 302, and the browser silently stays on
+      // this page - a failure that looks like success from the server side,
+      // and which cost the first working consent flow on 2026-08-26.
+      //
+      // The origin is listed rather than the full path because CSP source
+      // expressions match on origin; naming it at all is what keeps this from
+      // being a blanket `form-action *`.
       "content-security-policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+        "default-src 'none'; style-src 'unsafe-inline'; " +
+        "form-action 'self' https://github.com; frame-ancestors 'none'",
       "referrer-policy": "no-referrer",
       "x-frame-options": "DENY",
     },

@@ -137,6 +137,41 @@ describe("GET /authorize, through the dispatch chain", () => {
   });
 });
 
+describe("the consent page's Content-Security-Policy", () => {
+  it("PERMITS THE REDIRECT TO GITHUB that approving is supposed to produce", async () => {
+    // OBSERVED IN A BROWSER ON 2026-08-26, and invisible to every other test
+    // in this file.
+    //
+    // Chrome enforces `form-action` ACROSS REDIRECTS, not only on the initial
+    // submission. The form posts to /authorize/approve, which is same-origin
+    // and allowed; that endpoint answers 302 to github.com; and Chrome then
+    // checks the redirect target against `form-action` and refuses to follow
+    // it. The Worker logs a clean 302 and the browser silently stays on the
+    // consent page, so the server-side view of this failure looks like success.
+    //
+    // This assertion cannot prove the browser behaviour - no test running in
+    // workerd can. What it can do is fail if the GitHub origin is ever dropped
+    // from the directive again, which is the change that would reintroduce it.
+    const clientId = await registerClient("Claude");
+    const response = await SELF.fetch(
+      `${WORKER_ORIGIN}/authorize?response_type=code&client_id=${clientId}` +
+        `&redirect_uri=${encodeURIComponent("https://claude.ai/api/mcp/auth_callback")}` +
+        `&code_challenge=abc&code_challenge_method=S256&state=xyz`,
+      { redirect: "manual" }
+    );
+
+    expect(response.status).toBe(200);
+    const csp = response.headers.get("content-security-policy")!;
+    const formAction = csp
+      .split(";")
+      .map((d) => d.trim())
+      .find((d) => d.startsWith("form-action"))!;
+
+    expect(formAction).toContain("'self'");
+    expect(formAction).toContain("https://github.com");
+  });
+});
+
 describe("POST /authorize/approve, through the dispatch chain", () => {
   it("redirects to GitHub and opens a browser-bound transaction", async () => {
     const clientId = await registerClient("Claude");
