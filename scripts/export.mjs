@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { readRaw, readTable, runWrangler } from "./lib/d1.mjs";
 import { BACKED_UP } from "./lib/inventory.mjs";
 import { buildManifest } from "./lib/manifest.mjs";
+import { insertStatements } from "./lib/sql.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,6 +38,10 @@ export async function exportArchive({ database, run = runWrangler, now = () => n
       );
     }
   }
+
+  // Discarded on success; this exists only to make insertStatements throw here,
+  // at export time, rather than during a restore. See MAX_STATEMENT_BYTES.
+  insertStatements(tables);
 
   const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const migrations = BACKED_UP.length > 0 ? await latestMigration() : null;
@@ -83,6 +88,66 @@ async function latestMigration() {
   return files.sort().at(-1) ?? null;
 }
 
+/**
+ * Nothing is ever written under `finalPath` until it has been compressed AND
+ * integrity-checked. The earlier version renamed the JSON into place and then
+ * compressed it there, so an interrupted bzip2 left a truncated file under
+ * the name of a trusted backup.
+ *
+ * `compress` and `verify` are injected, the way `readTable` injects `run`, so
+ * the ordering guarantee is observable in a test without shelling out to
+ * bzip2.
+ */
+export async function writeArchiveFile({
+  archive,
+  jsonPath,
+  finalPath,
+  writeFile: writeFileFn = writeFile,
+  compress,
+  verify,
+  chmod: chmodFn = chmod,
+  rename: renameFn = rename,
+  existsSync: existsSyncFn = existsSync,
+  unlink: unlinkFn = unlink,
+}) {
+  // Mode 0600 with flag "wx": this holds every contact and note in the
+  // database, and an existing file must never be silently reused.
+  const tmpJson = `${jsonPath}.partial`;
+  try {
+    await writeFileFn(tmpJson, JSON.stringify(archive, null, 2), { mode: 0o600, flag: "wx" });
+  } catch (cause) {
+    if (cause.code === "EEXIST") {
+      throw new Error(
+        `${tmpJson} already exists, left over from a previous attempt. It holds plaintext ` +
+          `contact data; remove it, then re-run.`,
+        { cause }
+      );
+    }
+    throw cause;
+  }
+
+  try {
+    await compress({ path: tmpJson });
+    await verify({ path: `${tmpJson}.bz2` });
+  } catch (cause) {
+    // A failure here would otherwise leave a plaintext .partial holding every
+    // contact and note in the database, and a same-minute retry would then
+    // fail EEXIST with no explanation of why or what to remove.
+    await unlinkFn(tmpJson).catch(() => {});
+    await unlinkFn(`${tmpJson}.bz2`).catch(() => {});
+    throw cause;
+  }
+
+  await chmodFn(`${tmpJson}.bz2`, 0o600);
+  // Refuse to replace an existing archive. Minutes make a collision unlikely
+  // rather than impossible, and the archive being overwritten may be the one
+  // taken before whatever went wrong.
+  if (existsSyncFn(finalPath)) {
+    throw new Error(`${finalPath} already exists. Refusing to overwrite an existing archive.`);
+  }
+  await renameFn(`${tmpJson}.bz2`, finalPath);
+}
+
 async function main() {
   const database = process.env.JUNCO_D1_DATABASE ?? "junco-prm";
   // Minute precision, not date. A date-only name plus `bzip2 -f` means the
@@ -95,24 +160,13 @@ async function main() {
   process.stdout.write(`Exporting ${database}\n`);
   const archive = await exportArchive({ database });
 
-  // Nothing is ever written under the final name until it has been compressed
-  // AND integrity-checked. The earlier version renamed the JSON into place and
-  // then compressed it there, so an interrupted bzip2 left a truncated file
-  // under the name of a trusted backup.
-  // Mode 0600 with flag "wx": this holds every contact and note in the
-  // database, and an existing file must never be silently reused.
-  const tmpJson = `${jsonPath}.partial`;
-  await writeFile(tmpJson, JSON.stringify(archive, null, 2), { mode: 0o600, flag: "wx" });
-  await execFileAsync("bzip2", ["-f", tmpJson]);
-  await execFileAsync("bzip2", ["-t", `${tmpJson}.bz2`]);
-  await chmod(`${tmpJson}.bz2`, 0o600);
-  // Refuse to replace an existing archive. Minutes make a collision unlikely
-  // rather than impossible, and the archive being overwritten may be the one
-  // taken before whatever went wrong.
-  if (existsSync(finalPath)) {
-    throw new Error(`${finalPath} already exists. Refusing to overwrite an existing archive.`);
-  }
-  await rename(`${tmpJson}.bz2`, finalPath);
+  await writeArchiveFile({
+    archive,
+    jsonPath,
+    finalPath,
+    compress: ({ path }) => execFileAsync("bzip2", ["-f", path]),
+    verify: ({ path }) => execFileAsync("bzip2", ["-t", path]),
+  });
 
   const total = Object.values(archive.tables).reduce((n, rows) => n + rows.length, 0);
   process.stdout.write(`\nWrote ${finalPath}, ${total} rows, counts confirmed against the database, integrity verified.\n`);
