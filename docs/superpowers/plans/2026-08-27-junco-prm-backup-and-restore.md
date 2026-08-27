@@ -1030,7 +1030,9 @@ export async function readTable(name, { database, remote = true, run = runWrangl
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `npx vitest run --project scripts scripts/lib/d1.test.mjs`
-Expected: PASS, 7 tests.
+Expected: PASS, 8 tests.
+
+**Redact before recording.** `docs/MEASUREMENTS.md` is committed to a public repository, and a `SELECT` against `people` returns live contact rows. Record the JSON envelope and replace the row content with placeholders.
 
 - [ ] **Step 6: Confirm the silence test is not blind**
 
