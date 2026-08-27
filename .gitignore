@@ -13,3 +13,9 @@ README.md
 
 # Multi-agent review transcripts. Working records, not published artifacts.
 agents/
+
+# Backup archives. These hold every contact and note in the database.
+junco-backup-*.json
+junco-backup-*.json.bz2
+junco-backup-*.json.partial
+junco-backup-*.json.partial.bz2
