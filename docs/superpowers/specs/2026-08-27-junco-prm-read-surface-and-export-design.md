@@ -12,9 +12,38 @@ The tool surface grows from 28 to 31. One migration is required, and it adds ind
 
 ## Origin
 
-Every item here comes from one of four notes written while using Junco against real data, plus two findings made while reading the code to plan this work. Nothing in this spec was invented from the tool list.
+Every item here comes from one of five notes written while using Junco against real data, plus two findings made while reading the code to plan this work. Nothing in this spec was invented from the tool list.
 
-The four notes are a batch of seven numbered requests, a rename request, a request to return `external_row_key`, and a record of three undocumented behaviours. Two further requests, numbered 8 and 9, arrived on 2026-08-27. The requests are referenced by their numbers below so the notes and this spec can be read against each other.
+**This section is the index. Nothing below requires reading the source notes.** Each request is restated here in full enough form to be judged on its own, and every reference later in the document repeats its substance rather than only its number.
+
+### Where every request lands
+
+Fifteen distinct asks. Numbers 1 to 9 are the author's own numbering and are preserved. Unnumbered items are given a letter here so they can be referred to.
+
+| Ref | What it asks for | Lands in |
+|---|---|---|
+| 1 | Optional `include` for tags, links, and contacts on the record listing tool | P3 |
+| 2 | An `updated_after` filter, so "what changed" does not mean pulling everything | P3 |
+| 3 | Batch writes for encounters, links, and contacts | Deferred |
+| 4 | `merge_people`, because nothing can remedy two records for one human | Deferred |
+| 5 | Multi-person encounters, one record with several attendees | Deferred |
+| 6 | Exact tag filtering, and a `list_tags` call returning the vocabulary | P3 |
+| 7 | Structured roster filtering by role and promotion state, with no text query | P3 |
+| A | `get_summary`, counts by scope in one call | Deferred |
+| 8 | Edit an existing follow-up's note and due date | P4 |
+| 9 | Reported as: roster search pagination returns the same page forever | P2, reframed |
+| R | Rename `export_data`, whose name and description contradict each other | P3 |
+| K | Return `external_row_key`, so a roster row can be matched to its entry | P3 |
+| D1 | Document that `promote_roster_entry` stores the roster email as a contact | P1 |
+| D2 | Document the `k:` / `e:` / `h:` discriminator on `external_row_key` | P1 |
+| D3 | Document that `import_roster` returns counts rather than entry ids | P1 |
+
+Two further items came from reading the code rather than from a note, and neither was filed by anyone:
+
+| Ref | What was found | Lands in |
+|---|---|---|
+| C1 | No backup exists, and none ever has | P0 |
+| C2 | Tool arguments are never validated, on any tool | P2 |
 
 ## Goals
 
@@ -106,9 +135,11 @@ The consequence is worse than a missing feature. A caller that misnames a parame
 
 This was predicted. Plan 1 deferred runtime validation of the registry's input schemas to plan 2, and plan 2 did not implement it.
 
-### What it is not
+### Request 9, and why it is not what it says
 
-Request 9 filed this as a roster pagination bug: a cursor that returns the identical page and the identical token. **Pagination is correct**, proven against the live instance on 2026-08-27. Passing the token back as `roster_cursor` advanced from `Anne Watson, Anthony Tran, Arjun Valapparambil Sunilkumar` to `Brittany Celata, Camille Roubik, Carrie Smaha`, in correct keyset order with a fresh cursor.
+**Request 9 as filed.** Searching the roster returns a `roster_next_cursor`. Passing that cursor back with the same query returns the identical rows and the identical cursor token, so the page never advances. Filed as a bug rather than a feature, priority medium. The reporter's reasoning: with 798 entries and a text match that also hits job titles, a search for a first name returns mostly irrelevant rows, so the real candidates sit past the cutoff and cannot be reached. The first screen of any roster search is the only screen.
+
+**Pagination is correct**, proven against the live instance on 2026-08-27. Passing the token back as `roster_cursor` advanced from `Anne Watson, Anthony Tran, Arjun Valapparambil Sunilkumar` to `Brittany Celata, Camille Roubik, Carrie Smaha`, in correct keyset order with a fresh cursor.
 
 The reproduction passed `cursor`. `search_people` has no such parameter, because it pages two independent arrays and names them `people_cursor` and `roster_cursor`. The argument was unrecognized, dropped, and the query restarted, producing exactly the reported symptom.
 
@@ -262,13 +293,13 @@ Two specific guards:
 
 ## Deferred, and why
 
-**Batch writes for encounters, links, and contacts (request 3).** Changes the input shape of three shipped tools rather than adding to them, and raises questions this spec does not need to answer: all-or-nothing versus partial success, and how one idempotency key covers many items. A conference arriving as a burst is the canonical case and it deserves its own design.
+**Batch writes (request 3), which asks that `log_encounter`, `add_link`, and `add_contact` each accept an array as well as a single record, returning per-item results so a partial failure is legible.** The case for it: a conference debrief produced eleven separate `log_encounter` calls, and one person alone carried five links. Changes the input shape of three shipped tools rather than adding to them, and raises questions this spec does not need to answer: all-or-nothing versus partial success, and how one idempotency key covers many items. A conference arriving as a burst is the canonical case and it deserves its own design.
 
-**`merge_people` (request 4).** Needs a tombstone or a `merged_into` column so a merged id stays resolvable, which is the first durable schema change in this body of work. It also needs a preview-then-confirm shape matching `purge_roster_source`.
+**`merge_people` (request 4), which asks for a preview-then-confirm merge moving encounters, follow-ups, contacts, links, tags, and provenance from one person record onto another.** The case for it: promotion previews duplicates and so prevents them at promotion time, but once two person records exist the only remedy is `delete_person`, which is permanent and discards whatever the losing record carried. Needs a tombstone or a `merged_into` column so a merged id stays resolvable, which is the first durable schema change in this body of work. It also needs a preview-then-confirm shape matching `purge_roster_source`.
 
-**Multi-person encounters (request 5).** `encounters.person_id` is `NOT NULL` with a direct foreign key, verified in migration 0005. Supporting several attendees means a join table and rebuilding the `encounters` table on a live D1 holding real records. That is the highest-risk change in the whole set and it does not belong beside index additions.
+**Multi-person encounters (request 5), which asks that one encounter record carry several attendees rather than being split into one record per person.** The case for it: two people met together at the same event produce two encounters with overlapping summaries, so the story is complete in neither and editing it later means editing it twice. `encounters.person_id` is `NOT NULL` with a direct foreign key, verified in migration 0005. Supporting several attendees means a join table and rebuilding the `encounters` table on a live D1 holding real records. That is the highest-risk change in the whole set and it does not belong beside index additions.
 
-**`get_summary` (appendix).** The note itself observes that `include` and `updated_after` landing may remove the need. Revisit after P3 has been in use.
+**`get_summary` (ref A), which asks for counts by scope, the most recent encounter date, and the open follow-up count in a single call.** The case for it: reporting "42 people, 11 encounters, 2 open follow-ups" required pulling every full record across three calls and still missed tags and links. The request itself observes that `include` and `updated_after` landing may remove the need. Revisit after P3 has been in use.
 
 ## Open questions
 
