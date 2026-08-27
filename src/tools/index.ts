@@ -216,7 +216,12 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
     define(
       "get_roster_entry",
       "Read one staged roster row: the imported fields, where it came from, whether the " +
-        "latest import still lists it, and whether it has already been promoted to a person.",
+        "latest import still lists it, and whether it has already been promoted to a person." +
+        " Provenance records carry external_row_key with a tier prefix showing how identity was " +
+        "derived: 'k:' plus the source's own row id when the import supplied one, else 'e:' plus " +
+        "the normalized email, else 'h:' plus a hash of name and organization. Stability follows " +
+        "the tier: a k: key is as stable as the source id, an e: key changes if the email " +
+        "changes, an h: key changes if the name or organization changes.",
       READ,
       obj({ roster_entry_id: id("re", "Roster entry") }, ["roster_entry_id"]),
       getRosterEntry
@@ -470,7 +475,10 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       "Import one chunk of an attendee or speaker roster. Send parsed row objects, not raw " +
         "CSV text. The first call declares expected_total and carries the first chunk; every " +
         "later call carries run_id, the offset it continues from, and only its own rows. Loop " +
-        "until remaining is zero, then call finalize_import.",
+        "until remaining is zero, then call finalize_import." +
+        " This returns counts, not entry ids, and no call maps a source row to the re_ id it " +
+        "created. Plan an import knowing that, rather than discovering it after the rows are " +
+        "staged.",
       WRITE_IDEMPOTENT,
       obj(
         {
@@ -507,7 +515,11 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       "promote_roster_entry",
       "Turn a staged roster row into a person you have actually engaged with, keeping its " +
         "provenance. Call it with only roster_entry_id to see duplicate candidates without " +
-        "writing anything, then call it again with link_to_person_id or create_new: true.",
+        "writing anything, then call it again with link_to_person_id or create_new: true." +
+        " If the roster row carries an email, this call stores it as a person contact. That " +
+        "differs from create_person, whose email is used for duplicate detection only and is not " +
+        "stored. Calling add_contact afterwards with the same address is a no-op rather than a " +
+        "duplicate, because contacts are unique per person, type, and normalized value.",
       WRITE_IDEMPOTENT,
       obj(
         {
