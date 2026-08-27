@@ -47,7 +47,7 @@ a temporary name. Filenames carry minutes, because a date-only name plus
 
 **The restore had no target guard.** `npm run restore -- backup.bz2 junco-prm`
 would have merged the archive into production. It now refuses a non-empty
-target without `--force`.
+target at all. (Round two removed the `--force` escape hatch this originally carried; see below.)
 
 **A declined prompt read as success.** Remote `--file` warns and prompts on a
 TTY; declining returns null and exits 0, and the script printed "Restore
