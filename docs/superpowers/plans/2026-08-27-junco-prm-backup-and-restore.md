@@ -352,6 +352,7 @@ export default defineConfig({
           setupFiles: ["./tests/apply-migrations.ts"],
           isolate: false,
           maxWorkers: 1,
+          sequence: { groupOrder: 0 },
         },
       },
       {
@@ -362,6 +363,11 @@ export default defineConfig({
           name: "scripts",
           environment: "node",
           include: ["scripts/**/*.test.mjs"],
+          // Two projects with different maxWorkers must also declare different
+          // group orders, or vitest 4.1.11 refuses to run and reports zero
+          // tests. Found by running Step 6; it does not appear in --help or in
+          // the type definitions, only when both projects execute together.
+          sequence: { groupOrder: 1 },
         },
       },
     ],
