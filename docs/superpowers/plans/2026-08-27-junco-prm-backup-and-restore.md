@@ -599,10 +599,17 @@ An archive nobody can verify is a file, not a backup. The manifest is what makes
 ```javascript
 // scripts/lib/manifest.test.mjs
 import { describe, expect, it } from "vitest";
+import { BACKED_UP } from "./inventory.mjs";
 import { buildManifest, checksum, verifyManifest } from "./manifest.mjs";
 
+// Every table in BACKED_UP, not just the two under test. verifyManifest
+// checks the manifest's table set against the inventory, so a fixture
+// carrying a subset is itself an incomplete archive and is correctly
+// refused. Found during execution, when the two-table version failed
+// "accepts an untampered archive" with nine missing-table problems.
 const archive = (overrides = {}) => {
-  const tables = { people: [{ id: "p_1", full_name: "Ada" }], tags: [] };
+  const tables = Object.fromEntries(BACKED_UP.map((t) => [t, []]));
+  tables.people = [{ id: "p_1", full_name: "Ada" }];
   return {
     manifest: buildManifest({
       tables,
@@ -818,7 +825,7 @@ export function verifyManifest(archive) {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `npx vitest run --project scripts scripts/lib/manifest.test.mjs`
-Expected: PASS, 11 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Confirm the checksum test is not blind**
 
