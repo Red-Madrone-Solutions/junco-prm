@@ -54,12 +54,24 @@ export function logAuthFailure(fields: {
   /** Null when the request carried no resolvable identity at all. */
   presentedUserId: string | null;
   reason: "no_token" | "invalid_token" | "not_owner" | "no_props";
+  /**
+   * WHY the refusal happened, when the reason code alone cannot say.
+   *
+   * A refusal that cannot be diagnosed from its own log line sends the
+   * operator to guesswork, which is what happened on the first real consent
+   * attempt: the flow refused with `invalid_token` and the line carried
+   * nothing about which of the two checks had fired or what it had actually
+   * seen. Protocol facts only - header names and origins. Never PRM content,
+   * never a token, never a cookie value.
+   */
+  detail?: Record<string, string | null>;
 }): void {
   emit({
     event: "auth_failure",
     request_id: fields.requestId,
     presented_user_id: fields.presentedUserId,
     reason: fields.reason,
+    ...(fields.detail ? { detail: fields.detail } : {}),
   });
 }
 

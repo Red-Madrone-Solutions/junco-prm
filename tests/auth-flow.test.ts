@@ -204,6 +204,61 @@ describe("POST /authorize/approve, through the dispatch chain", () => {
     expect(response.headers.get("location")).toBeNull();
   });
 
+  it("ACCEPTS an approval whose Origin is the literal string null", async () => {
+    // OBSERVED ON THE FIRST REAL CONSENT ATTEMPT, 2026-08-26, in a browser.
+    //
+    // The consent page sent `Referrer-Policy: no-referrer`, and under that
+    // policy a browser serializes the Origin of a top-level form POST as the
+    // literal string "null". `headers.get("origin")` therefore returns "null",
+    // a present-and-mismatched value, and the approval was refused with
+    // `sec-fetch-site: same-origin` sitting right beside it in the same log
+    // line - the browser confirming the POST came from our own page.
+    //
+    // Every existing test here sets `origin: WORKER_ORIGIN` by hand, so the
+    // whole suite passed while the real flow could not complete once.
+    //
+    // "null" is the browser DECLINING TO STATE an origin, which carries the
+    // same evidentiary weight as omitting the header: it is not evidence of a
+    // cross-origin submission. Sec-Fetch-Site is the signal that distinguishes
+    // those, and the consent cookie is what carries the property when neither
+    // header is present at all.
+    const clientId = await registerClient("Claude");
+    const { handle, cookie } = await startConsent(clientId);
+
+    const response = await approve({
+      handle,
+      cookie,
+      origin: "null",
+      secFetchSite: "same-origin",
+    });
+
+    expect(response.status).toBe(302);
+    expect(new URL(response.headers.get("location")!).host).toBe("github.com");
+  });
+
+  it("REFUSES an Origin of null when Sec-Fetch-Site says cross-site", async () => {
+    // THE GUARD ON THE TEST ABOVE. A sandboxed cross-origin frame also sends
+    // `Origin: null`, so accepting that string must not become accepting the
+    // submission. Sec-Fetch-Site is the header a page cannot forge, and it is
+    // what separates the two cases.
+    //
+    // This passes before the fix as well as after. It exists to fail if the
+    // fix is written as "ignore Origin entirely" rather than "treat a withheld
+    // Origin as unstated".
+    const clientId = await registerClient("Claude");
+    const { handle, cookie } = await startConsent(clientId);
+
+    const response = await approve({
+      handle,
+      cookie,
+      origin: "null",
+      secFetchSite: "cross-site",
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("location")).toBeNull();
+  });
+
   it("REFUSES an approval whose Origin is not this Worker", async () => {
     const clientId = await registerClient("Claude");
     const { handle, cookie } = await startConsent(clientId);

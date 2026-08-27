@@ -198,7 +198,20 @@ function githubHandler(config: Config): FetchHandler {
         // attacker who scraped a handle out of an /authorize response they
         // issued themselves could have the owner's browser submit it.
         if (!isSameOriginForm(request, url.origin)) {
-          logAuthFailure({ requestId, presentedUserId: null, reason: "invalid_token" });
+          // The browser is not told which check fired - that would help an
+          // attacker tune a forgery. The operator is, because a refusal nobody
+          // can diagnose is a refusal that gets disabled rather than fixed.
+          logAuthFailure({
+            requestId,
+            presentedUserId: null,
+            reason: "invalid_token",
+            detail: {
+              check: "same_origin_form",
+              sec_fetch_site: request.headers.get("sec-fetch-site"),
+              origin: request.headers.get("origin"),
+              expected_origin: url.origin,
+            },
+          });
           return new Response("this approval did not come from this site", { status: 400 });
         }
 
@@ -331,8 +344,23 @@ function isSameOriginForm(request: Request, origin: string): boolean {
   const site = request.headers.get("sec-fetch-site");
   if (site !== null && site !== "same-origin") return false;
 
+  // `Origin: null` is the browser DECLINING TO STATE an origin, not stating a
+  // wrong one, and the two must not be conflated. This cost a real consent
+  // flow on 2026-08-26: the consent page sends `Referrer-Policy: no-referrer`
+  // - deliberately, so the handle-bearing /authorize URL never reaches GitHub
+  // as a Referer - and under that policy a browser serializes the Origin of a
+  // top-level form POST as the literal string "null". `headers.get` returns
+  // the STRING "null", which is not JS null, so the check above read it as
+  // present-and-mismatched and refused our own form.
+  //
+  // Treating it as unstated is safe because it is not the header carrying the
+  // weight here. A sandboxed cross-origin frame sends `Origin: null` too, and
+  // it is `Sec-Fetch-Site` - which a page cannot forge - that separates that
+  // case from this one, with the consent cookie underneath both.
   const declaredOrigin = request.headers.get("origin");
-  if (declaredOrigin !== null && declaredOrigin !== origin) return false;
+  if (declaredOrigin !== null && declaredOrigin !== "null" && declaredOrigin !== origin) {
+    return false;
+  }
 
   return true;
 }
