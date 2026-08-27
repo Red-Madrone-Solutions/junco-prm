@@ -14,6 +14,30 @@
 
 **Tool count: 28 becomes 32.**
 
+## Revised 2026-08-27 after a four-agent code review
+
+Eleven defects, each verified against the repository before being accepted. Two would have stopped the plan compiling and two were design flaws rather than slips.
+
+**Task 1 could not compile.** `createFollowup` returns `{ followup, person }`, not a `Followup` (`src/tools/followups.ts:61`), and every test destructured it wrongly. `Followup` also has no `updated_at` field (`src/types.ts`), although migration 0005 declares the column, because `loadFollowup` never selects it. Task 1 now adds it to the shape before testing it, and uses the project's date validator instead of a regex that accepts `2026-99-99`.
+
+**`include` returned relations for the wrong people, deterministically.** Tasks 7 and 8 add `updated_after` and `tags` to the page query; the first draft never said to add them to the relation subquery. Person A sorts first without `speaker`, person B second with `speaker` and a contact, `tags:["speaker"] include:["contacts"] limit:1` returns B with `contacts: []`. Not a race. Wrong every time. The page predicate is now built once and shared, and Tasks 7 and 8 each end by confirming it was used.
+
+**The `updated_after` watermark lost records.** Exclusivity on a timestamp alone drops the remainder when more rows share an instant than fit a page, and misses records updated behind the cursor mid-drain. The keyset is now `(updated_at, id)`. `Date.parse` is also too permissive, accepting `2026-08-27` and `08/27/2026`, so input is validated against `isIsoInstant` first.
+
+**Task 2 mutated on a failed removal.** A `DELETE` matching zero rows is not an error and does not abort a batch, so batching the timestamp bump with it meant removing a nonexistent contact bumped `updated_at` and then threw `not_found`. Removals now confirm the child row first. And a no-op is not a change: `add_contact` is `ON CONFLICT DO NOTHING`, so re-adding the same address must leave the timestamp alone.
+
+**One task was already done.** `get_roster_entry` returns `external_row_key` at `roster_admin.ts:89` and `:127`. The first draft listed it as work, and its test would have passed the moment it was written.
+
+**Four test defects.** `remove_link` was named in a test that only called `remove_contact`. The `updated_after` test named encounters and follow-ups and exercised only encounters. Three `list_roster_entries` assertions used `.every()` without asserting non-empty, so returning zero rows passed. And nothing combined `include` with `tags`, `updated_after`, and a cursor, which is precisely where the design failed.
+
+**Two contract slips.** `list_tags` declared `cursor` and `limit` in its interface and registered neither. And `idx_roster_entries_role` leads with `roster_source_id`, so it cannot serve the role-only call the tool permits; that is now stated rather than implied.
+
+### Still open, and named rather than resolved
+
+The spec requires `person_name` inline on encounters and follow-ups. Task 7 Step 4 raises it as a decision because adding it to the shared `COLUMNS` changes five tools' response shapes at once and makes stored idempotency records replay the old shape. It is still a decision, not an implementation, and the spec lists it as an open question. A reviewer is right that this plan does not deliver that spec line.
+
+`promote_roster_entry` writes `person_sources`, which `get_person` returns, without moving `people.updated_at`. Task 2 covers the six relation writers and not this one. Whether provenance counts as "something about this person changed" is a real question and it is left open here rather than answered in passing.
+
 ## Global Constraints
 
 - **No em dashes or en dashes anywhere**, in code, comments, docs, or commit messages. Plain hyphens only.
@@ -65,25 +89,31 @@ Follow-ups can be created, completed, and cancelled, but not changed. Cancelling
 
 - [ ] **Step 1: Write the failing tests**
 
+**Two facts the first draft of these tests got wrong, both verified:**
+`createFollowup` returns `Promise<{ followup: Followup; person: PersonDetail }>`, not a
+`Followup` (`src/tools/followups.ts:61`). And `Followup` has no `updated_at` field
+(`src/types.ts`), even though the column exists in migration 0005, because
+`loadFollowup` never selects it. Step 3 adds it.
+
 ```typescript
 // in tests/followups.test.ts, matching the file's existing harness
 describe("updateFollowup", () => {
   it("changes the note and leaves the due date alone", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "first" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "first" });
     const updated = await updateFollowup(ctx, { followup_id: fu.id, note: "first, and the LinkedIn message" });
     expect(updated.note).toBe("first, and the LinkedIn message");
     expect(updated.due_on).toBe("2026-09-09");
   });
 
   it("changes the due date and leaves the note alone", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "keep me" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "keep me" });
     const updated = await updateFollowup(ctx, { followup_id: fu.id, due_on: "2026-10-01" });
     expect(updated.due_on).toBe("2026-10-01");
     expect(updated.note).toBe("keep me");
   });
 
   it("clears the note when null is sent, which is different from omitting it", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "temporary" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "temporary" });
     const updated = await updateFollowup(ctx, { followup_id: fu.id, note: null });
     expect(updated.note).toBeNull();
   });
@@ -91,21 +121,30 @@ describe("updateFollowup", () => {
   // Without this a caller can spend a write, an idempotency key, and a round
   // trip to change nothing, and be told it worked.
   it("refuses a call that supplies neither field", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
     await expect(updateFollowup(ctx, { followup_id: fu.id })).rejects.toMatchObject({
       code: "invalid_input",
     });
   });
 
   it("refuses a due date that is not YYYY-MM-DD", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
     await expect(
       updateFollowup(ctx, { followup_id: fu.id, due_on: "next Tuesday" })
     ).rejects.toMatchObject({ code: "invalid_input" });
   });
 
+  // A YYYY-MM-DD regex accepts 2026-99-99. The project already has a date
+  // contract; use it rather than inventing a weaker one.
+  it("refuses a well-shaped but impossible date", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    await expect(
+      updateFollowup(ctx, { followup_id: fu.id, due_on: "2026-99-99" })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
   it("refuses to edit a completed follow-up", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
     await completeFollowup(ctx, { followup_id: fu.id });
     await expect(
       updateFollowup(ctx, { followup_id: fu.id, note: "too late" })
@@ -113,7 +152,7 @@ describe("updateFollowup", () => {
   });
 
   it("refuses to edit a cancelled follow-up", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
     await cancelFollowup(ctx, { followup_id: fu.id });
     await expect(
       updateFollowup(ctx, { followup_id: fu.id, note: "too late" })
@@ -127,9 +166,10 @@ describe("updateFollowup", () => {
   });
 
   it("moves updated_at", async () => {
-    const fu = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
     clock.advance(60_000);
     const updated = await updateFollowup(ctx, { followup_id: fu.id, note: "later" });
+    // Requires Step 3's addition of updated_at to the Followup shape.
     expect(updated.updated_at).not.toBe(fu.updated_at);
   });
 });
@@ -145,6 +185,15 @@ Expected: FAIL, `updateFollowup` is not exported.
 - [ ] **Step 3: Implement it**
 
 Add to `src/tools/followups.ts`, following `closeFollowup`'s shape exactly:
+
+**First, add `updated_at` to the follow-up shape.** Add `created_at: string` and
+`updated_at: string` to the `Followup` interface in `src/types.ts`, and add both
+columns to `loadFollowup`'s select list and to every other statement that builds
+a `Followup`. Without this the timestamp is written and never readable, and the
+last test above cannot compile.
+
+Use the project's existing date validator rather than a regex. Find it with
+`grep -rn "requireLocalDate\|YYYY-MM-DD" src/` and call that.
 
 ```typescript
 export interface UpdateFollowupInput {
@@ -178,9 +227,9 @@ export async function updateFollowup(
           "call it again with the field you mean to change"
         );
       }
-      if (setsDue && !/^\d{4}-\d{2}-\d{2}$/.test(input.due_on as string)) {
-        throw new ToolError("invalid_input", "due_on must be YYYY-MM-DD");
-      }
+      // The project's own date contract, not a regex. A regex accepts
+      // 2026-99-99, and createFollowup already refuses that.
+      if (setsDue) requireLocalDate(input.due_on as string, "due_on");
 
       const sets: string[] = [];
       const binds: (string | null)[] = [];
@@ -304,7 +353,7 @@ describe("relation writes and people.updated_at", () => {
     });
   }
 
-  it("remove_contact and remove_link move it too", async () => {
+  it("remove_contact moves it", async () => {
     const person = await createPerson(ctx, { full_name: "Grace Hopper" });
     const withContact = await addContact(ctx, {
       person_id: person.id,
@@ -315,6 +364,43 @@ describe("relation writes and people.updated_at", () => {
     clock.advance(60_000);
     await removeContact(ctx, { person_id: person.id, contact_id: withContact.contacts[0].id });
     expect(await readUpdatedAt(person.id)).not.toBe(before);
+  });
+
+  // The first draft claimed to cover removeLink here and only called
+  // removeContact, leaving one of the six writers entirely unguarded.
+  it("remove_link moves it", async () => {
+    const person = await createPerson(ctx, { full_name: "Grace Hopper" });
+    const withLink = await addLink(ctx, {
+      person_id: person.id,
+      link_type: "website",
+      url: "https://g.test",
+    });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await removeLink(ctx, { person_id: person.id, link_id: withLink.links[0].id });
+    expect(await readUpdatedAt(person.id)).not.toBe(before);
+  });
+
+  // THE FAILURE PATH. A batch commits before the changes check runs, so a
+  // removal matching nothing must not have mutated the person first.
+  it("does not move updated_at when a removal matches nothing", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await expect(
+      removeContact(ctx, { person_id: person.id, contact_id: "pc_does-not-exist" })
+    ).rejects.toMatchObject({ code: "not_found" });
+    expect(await readUpdatedAt(person.id)).toBe(before);
+  });
+
+  // A no-op is not a change. add_contact is ON CONFLICT DO NOTHING.
+  it("does not move updated_at when a write is a no-op", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await addContact(ctx, { person_id: person.id, contact_type: "email", value: "a@b.test" });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await addContact(ctx, { person_id: person.id, contact_type: "email", value: "a@b.test" });
+    expect(await readUpdatedAt(person.id)).toBe(before);
   });
 });
 ```
@@ -330,7 +416,21 @@ Expected: FAIL on every case, because `updated_at` is unchanged.
 
 - [ ] **Step 3: Add the bump to all six writers**
 
-In each of `addContact`, `addLink`, `addTags`, `removeContact`, `removeLink`, and `removeTags`, include this statement in the same `db.batch` as the child write:
+**Removals need a guard the additions do not.** A `DELETE` matching zero rows is not a SQL error, so it does not abort a batch. Putting the bump in the same batch as `DELETE FROM person_contacts WHERE id = ? AND person_id = ?` means a caller removing a contact that does not exist mutates the person's `updated_at` and then gets `not_found`. Throwing afterwards does not roll the batch back.
+
+So for `removeContact` and `removeLink`, confirm the child row exists first, then run the batch:
+
+```typescript
+  const existing = await ctx.db
+    .prepare("SELECT id FROM person_contacts WHERE id = ? AND person_id = ?")
+    .bind(contactId, personId)
+    .first<{ id: string }>();
+  if (!existing) throw new ToolError("not_found", `no contact ${contactId} on person ${personId}`);
+```
+
+**Decide what a no-op means and write it down.** Adding a contact the person already holds is `ON CONFLICT DO NOTHING`, and re-adding an existing tag or removing an absent one changes nothing either. An unconditional bump reports those as changes. `updated_at` means "something about this person changed", so a no-op must not move it. Where a writer can no-op, check `result.meta.changes` on the child statement and skip the bump when it is zero, which makes the bump a second statement rather than a batched one on those paths. Say in the commit message which writers take which shape.
+
+In each of `addContact`, `addLink`, `addTags`, `removeContact`, `removeLink`, and `removeTags`, include this statement in the same `db.batch` as the child write, subject to the two rules above:
 
 ```typescript
         ctx.db
@@ -400,8 +500,12 @@ CREATE INDEX idx_followups_updated ON followups(updated_at);
 -- PRIMARY KEY (person_id, tag_id), which cannot serve that direction.
 CREATE INDEX idx_person_tags_tag ON person_tags(tag_id, person_id);
 
--- list_roster_entries(role: ...). Always scoped to a source in practice, so
--- the source column leads.
+-- list_roster_entries(role: ...).
+--
+-- Leading with roster_source_id means this index CANNOT serve a role-only
+-- query, and source_key is optional on that tool. Two columns in this order
+-- because the realistic call names a source. If role-only listing turns out to
+-- matter, it needs its own index on (role), not a reordering of this one.
 CREATE INDEX idx_roster_entries_role ON roster_entries(roster_source_id, role);
 
 -- Deliberately absent: anything for list_roster_entries(promoted: ...).
@@ -514,9 +618,13 @@ Cut the `scope === "roster" || scope === "all"` branch from `src/tools/search.ts
 
 Then remove `scope` from `searchPeople` entirely, along with the roster arrays and the two prefixed cursor names, and rename its cursor to `cursor` and `next_cursor`.
 
-- [ ] **Step 4: Return `external_row_key` from `get_roster_entry` too**
+- [ ] **Step 4: Confirm `get_roster_entry` already returns `external_row_key`**
 
-In `src/tools/roster_admin.ts`, add `external_row_key` to the selected columns and the returned shape of `getRosterEntry`.
+```bash
+grep -n "external_row_key" src/tools/roster_admin.ts
+```
+
+**It already does**, in the returned interface at line 89 and in the SQL at line 127. The first draft listed adding it as work, and a test for it would have passed the moment it was written, which is exactly the shape of the seventeen tests this project has shipped that guarded nothing. Confirm and move on.
 
 - [ ] **Step 5: Register the new tool and update the old one**
 
@@ -727,6 +835,27 @@ describe("list_records include", () => {
       listRecords(ctx, { scope: "encounters", include: ["tags"] })
     ).rejects.toMatchObject({ code: "invalid_input" });
   });
+
+  // THE COMBINATION THE DESIGN FAILS ON, and which nothing else here covers.
+  // If the relation subquery does not carry the tag filter, the page and the
+  // relations select different people and B comes back with no contacts.
+  it("attaches relations to the right people when a filter narrows the page", async () => {
+    const a = await createPerson(ctx, { full_name: "AAA First" });
+    const b = await createPerson(ctx, { full_name: "BBB Second" });
+    await addTags(ctx, { person_id: b.id, tags: ["speaker"] });
+    await addContact(ctx, { person_id: b.id, contact_type: "email", value: "b@t.test" });
+    await addContact(ctx, { person_id: a.id, contact_type: "email", value: "a@t.test" });
+
+    const result = await listRecords(ctx, {
+      scope: "people",
+      tags: ["speaker"],
+      include: ["contacts"],
+      limit: 1,
+    });
+    expect(result.records).toHaveLength(1);
+    expect(result.records[0].id).toBe(b.id);
+    expect(result.records[0].contacts).toHaveLength(1);
+  });
 });
 ```
 
@@ -736,6 +865,16 @@ Run: `npx vitest run tests/export.test.ts`
 Expected: FAIL, `include` is not a parameter.
 
 - [ ] **Step 3: Implement, binding no id list**
+
+**Build the page predicate once and share it.** This is the part the first draft got wrong. Tasks 7 and 8 add `updated_after` and `tags` to the page query; if they are not also added to the relation subquery, the two select different people, deterministically and silently:
+
+> Person A sorts first and has no `speaker` tag. Person B sorts second, has `speaker`, and has a contact. Call `list_records(scope: "people", tags: ["speaker"], include: ["contacts"], limit: 1)`. The page returns B. The relation subquery, missing the tag filter, selects A. B comes back with `contacts: []`.
+
+That is not a race condition. It is wrong every time.
+
+So write one function returning `{ sql, binds }` for the page selection, and have the page query and every relation query consume it. A filter added later then cannot reach one and miss the other. Tasks 7 and 8 each end with a step confirming the shared predicate was used.
+
+**A residual risk this does not remove:** the page and its relations are separate round trips, so a write landing between them can shift the window. For a single-user PRM read interactively that is acceptable, and it is the same trade plan 1 records for its table-by-table export. It is written down rather than glossed. If it stops being acceptable, the fix is `db.batch`, which D1 executes together.
 
 ```typescript
 const INCLUDE_MAX_LIMIT = 100;
@@ -912,6 +1051,60 @@ describe("updated_after", () => {
 
 **Use a mutable clock throughout this describe block.** A frozen instant makes the boundary tests meaningless.
 
+**Three more tests, and none is optional.** Both reviewers found that exclusivity on a timestamp alone loses records. Two failures the first draft did not survive:
+
+> 101 records share timestamp T and the page size is 100. Advancing the watermark to T after page one permanently drops record 101.
+
+> A record is updated behind the id cursor while pages are being drained. Its new timestamp equals one already passed, so it is never returned.
+
+```typescript
+  it("returns every record when more than one page shares a timestamp", async () => {
+    // The clock does not advance, so all five share an instant.
+    const made = [];
+    for (let i = 0; i < 5; i++) made.push(await createPerson(ctx, { full_name: `P${i}` }));
+    const watermark = new Date(clock.now().getTime() - 1000).toISOString();
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page++) {
+      const r = await listRecords(ctx, { scope: "people", updated_after: watermark, limit: 2, cursor });
+      r.records.forEach((x) => seen.add(x.id));
+      if (!r.next_cursor) break;
+      cursor = r.next_cursor;
+    }
+    expect(seen.size).toBe(made.length);
+  });
+
+  it("does not return the same record twice across pages", async () => {
+    for (let i = 0; i < 4; i++) await createPerson(ctx, { full_name: `Q${i}` });
+    const watermark = new Date(clock.now().getTime() - 1000).toISOString();
+    const first = await listRecords(ctx, { scope: "people", updated_after: watermark, limit: 2 });
+    const second = await listRecords(ctx, {
+      scope: "people", updated_after: watermark, limit: 2, cursor: first.next_cursor,
+    });
+    const ids = [...first.records, ...second.records].map((r) => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  // Date.parse accepts "2026-08-27", "08/27/2026", and "1". The project has an
+  // ISO-instant contract; use it rather than accepting whatever parses.
+  it("refuses a date with no time, which Date.parse would otherwise accept", async () => {
+    await expect(
+      listRecords(ctx, { scope: "people", updated_after: "2026-08-27" })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  // The first draft's test was named for encounters and follow-ups and
+  // exercised only encounters, leaving the follow-up path unguarded.
+  it("applies to follow-ups", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const watermark = clock.now().toISOString();
+    clock.advance(60_000);
+    await createFollowup(ctx, { person_id: person.id, due_on: "2026-09-09" });
+    const result = await listRecords(ctx, { scope: "followups", updated_after: watermark });
+    expect(result.records).toHaveLength(1);
+  });
+```
+
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `npx vitest run tests/export.test.ts`
@@ -926,6 +1119,17 @@ Expected: FAIL, `updated_after` is not a parameter.
  * against caller input: `isIsoInstant` accepts a timestamp with no
  * milliseconds, and "Z" sorts above ".", so a truncated watermark silently
  * excludes every record written in that same second.
+ *
+ * THE KEYSET IS (updated_at, id), NOT updated_at ALONE. Exclusivity on a
+ * timestamp by itself loses records: if more rows share an instant than fit in
+ * a page, advancing the watermark past that instant drops the remainder
+ * permanently. The comparison is
+ *   WHERE (updated_at > ?) OR (updated_at = ? AND id > ?)
+ * which excludes exactly the last row returned rather than every row sharing
+ * its timestamp, and the cursor carries both halves.
+ *
+ * Validate against isIsoInstant before canonicalizing. Date.parse alone
+ * accepts "2026-08-27", "08/27/2026", and "1".
  *
  * Exclusive, which is what a watermark loop wants: a caller records the
  * newest updated_at it saw and passes it back, and must not be handed the
@@ -1058,10 +1262,14 @@ describe("listTags", () => {
 // src/tools/list_tags.ts
 import type { ToolContext } from "../context";
 
-export interface ListTagsInput {
-  cursor?: string;
-  limit?: number;
-}
+/**
+ * No cursor and no limit, deliberately. A personal relationship manager's tag
+ * vocabulary is tens of entries, and this tool exists to show all of it so
+ * near-duplicates are visible at a glance. An earlier draft declared cursor
+ * and limit here and registered neither, which is a contract the tool did not
+ * honour.
+ */
+export interface ListTagsInput {}
 
 export async function listTags(ctx: ToolContext, input: ListTagsInput) {
   // LEFT JOIN, not INNER: a tag nobody carries is exactly what makes this
@@ -1133,19 +1341,24 @@ describe("listRosterEntries", () => {
 
   // The blocked task this tool exists for: promote all speakers, without
   // knowing their names in advance.
+  // .every() on an empty array is true, so a filter returning nothing passes.
+  // Assert non-empty first, every time.
   it("filters by role", async () => {
     const result = await listRosterEntries(ctx, { role: "speaker" });
+    expect(result.roster_entries.length).toBeGreaterThan(0);
     expect(result.roster_entries.every((e) => e.role === "speaker")).toBe(true);
   });
 
   // The natural working queue, and currently unaskable.
   it("filters to entries not yet promoted", async () => {
     const result = await listRosterEntries(ctx, { promoted: false, limit: 5 });
+    expect(result.roster_entries.length).toBeGreaterThan(0);
     expect(result.roster_entries.every((e) => e.promoted_person_id === null)).toBe(true);
   });
 
   it("filters to entries already promoted", async () => {
     const result = await listRosterEntries(ctx, { promoted: true, limit: 5 });
+    expect(result.roster_entries.length).toBeGreaterThan(0);
     expect(result.roster_entries.every((e) => e.promoted_person_id !== null)).toBe(true);
   });
 

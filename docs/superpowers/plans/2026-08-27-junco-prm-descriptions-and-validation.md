@@ -4,22 +4,49 @@
 
 **Goal:** Make three tool descriptions match what their tools actually do, and make every tool refuse an argument it does not understand instead of silently ignoring it.
 
-**Architecture:** No schema change and no new tools. Three descriptions are corrected in the registry. Then a hand-written validator walks each tool's existing `JsonSchema` and is called once, at the transport boundary in `src/mcp/server.ts`, before any handler runs. The validator is written rather than imported because Ajv compiles with `new Function`, which workerd forbids, and because the schema vocabulary actually in use is six keywords.
+**Architecture:** No schema change and no new tools. Three descriptions are corrected in the registry. Then every `tools/call` is validated against the tool's existing `JsonSchema` at the transport boundary in `src/mcp/server.ts`, before any handler runs, using `@cfworker/json-schema` through the validator provider the MCP SDK already ships for edge runtimes. Two adaptations: `pattern` is stripped before validation so `assertId` keeps owning the `invalid_id` contract, and refusal messages are generated from the schema rather than from the library's error text.
 
-**Tech Stack:** TypeScript, Cloudflare Workers, `@modelcontextprotocol/sdk` 1.30.0, vitest 4.1.11 with `@cloudflare/vitest-pool-workers`.
+**Tech Stack:** TypeScript, Cloudflare Workers, `@modelcontextprotocol/sdk` 1.30.0, `@cfworker/json-schema` ^4.1.1, vitest 4.1.11 with `@cloudflare/vitest-pool-workers`.
 
 **Spec:** `docs/superpowers/specs/2026-08-27-junco-prm-read-surface-and-export-design.md` (phases P2 and P3)
 
 **This is plan 2 of 3.** Plan 1 (`2026-08-27-junco-prm-backup-and-restore.md`) builds the backup and must be executed first: this plan changes refusal behaviour on a live instance that currently has no backup. Plan 3 covers the read surface and `update_followup`.
 
+## Revised 2026-08-27 after a four-agent code review
+
+Nine defects, each verified against the repository before being accepted. Two would have broken working behaviour on a live instance.
+
+**The validator is no longer hand-written.** The first draft walked the six JSON Schema keywords this registry uses, on the grounds that Ajv compiles with `new Function`, which workerd forbids. That premise was right and the conclusion was wrong: the MCP SDK ships `CfWorkerJsonSchemaValidator` at `@modelcontextprotocol/sdk/validation/cfworker`, backed by `@cfworker/json-schema`, which validates without code generation precisely for edge runtimes. A reviewer found it in `node_modules`.
+
+The deciding argument is the failure mode the hand-written version carried: a schema keyword it did not recognize was **silently ignored**, which recreates the exact defect this plan exists to fix, one level up. Bundle headroom is not a concern; the Worker is 182 KiB gzipped today.
+
+**Enforcing `pattern` would have broken the error design.** `tests/mcp.test.ts:140` is named "maps an id of the wrong kind to invalid_id, not to a crash" and passes `person_id: "re_1"`. Any validator enforcing `^p_` returns `invalid_input` instead, collapsing a distinction `src/ids.ts` exists to make. Three of four reviewers found this. `pattern` is now stripped before validation and `assertId` keeps the contract.
+
+**The audit had three verdicts and needed four.** Nullability drift is real and already present: `label`, `location`, `event`, and `note` are declared `str` while their handler interfaces accept `null`. Switching validation on without fixing those refuses calls that work today. `log_encounter.occurred_on` is additionally a second `export_data`-shaped case, declared required and defaulted by the handler.
+
+**The audit method could not find any of that.** A grep for `input\.[a-z_]*` misses destructuring, misses nullability entirely, and loses tool context. Task 2 now reads the exported input interfaces.
+
+**Task 4's harness did not exist.** `callTool` was invented, and `rpc` at `tests/mcp.test.ts:24` is a private function that cannot be imported. It is extracted to a shared helper first.
+
+**Two of the "reproducing" tests already pass.** `search.ts:198` validates query type and `export.ts:83` validates the scope enum, both throwing `invalid_input` from inside the handler. Only the unknown-argument case reproduces the defect. The red-phase expectations are corrected.
+
+**The idempotency assertion guarded nothing.** It claimed to prove a refused write consumes no key while sending no `idempotency_key` at all. It now sends one and spies on the handler.
+
+**Rollback pointed at the wrong version.** Task 7 recorded the newly deployed id and called it the rollback target. That is the candidate being rolled back from.
+
+### One review finding rejected, with evidence
+
+A reviewer warned that unknown property names would be echoed into retained logs. `logToolCall` in `src/log.ts` accepts `requestId`, `tool`, `durationMs`, `outcome`, and `code`, and never a message. Refusal text reaches the model in the tool result and does not reach the log.
+
 ## Global Constraints
 
 - **No em dashes or en dashes anywhere**, in code, comments, docs, or commit messages. Plain hyphens only.
 - **No `console` calls anywhere in `src/`** except `src/log.ts`. A repository-wide test enforces this and it is a security property, not style.
-- **The seven error codes are a closed set**: `invalid_input`, `invalid_id`, `not_found`, `conflict`, `confirmation_required`, `confirmation_invalid`, `limit_exceeded`. Adding an eighth is a spec change. Validation failures are `invalid_input`.
-- **No personal data in error messages.** A refusal names parameters and types. It never echoes a value, because refusals are logged and logs are retained.
-- **Plan 1 must have been executed**, with an archive taken and a restore drilled, before Task 7 deploys.
-- **Take a Time Travel bookmark before the deploy in Task 7**, per `docs/BACKUP.md`.
+- **The seven error codes are a closed set**: `invalid_input`, `invalid_id`, `not_found`, `conflict`, `confirmation_required`, `confirmation_invalid`, `limit_exceeded`. Adding an eighth is a spec change. Validation failures are `invalid_input`; malformed ids stay `invalid_id` and stay with `assertId`.
+- **No personal data in error messages.** A refusal names parameters and types, never a value.
+- **Plan 1 must have been executed**, with an archive taken and a restore drilled, before Task 8 deploys.
+- **Take a Time Travel bookmark before the deploy**, per `docs/BACKUP.md`.
+- **One new runtime dependency only**: `@cfworker/json-schema`. Nothing else is added.
 
 ---
 
@@ -27,79 +54,86 @@
 
 **Created:**
 
-- `src/validate.ts` - the validator. One exported function, walking `JsonSchema`. No dependencies.
-- `tests/validate.test.ts` - unit tests for the walker.
-- `tests/validation-boundary.test.ts` - proves refusal happens at the transport boundary and that no handler runs.
-- `docs/SCHEMA-AUDIT.md` - the schema-versus-handler compatibility table for all 28 tools.
+- `src/validate.ts` - the boundary validator: strips `pattern`, delegates the verdict, writes the message.
+- `tests/validate.test.ts` - unit tests for the validator.
+- `tests/helpers/rpc.ts` - the `tools/call` harness, extracted from `tests/mcp.test.ts` so more than one file can use it.
+- `tests/validation-boundary.test.ts` - proves refusal happens at the boundary and no handler runs.
+- `docs/SCHEMA-AUDIT.md` - the schema-versus-handler table for all 28 tools.
 
 **Modified:**
 
-- `src/tools/index.ts` - three descriptions, and whatever the audit finds.
+- `src/tools/index.ts` - three descriptions, plus the drift the audit finds.
 - `src/mcp/server.ts` - one call, before `tool.run`.
+- `tests/mcp.test.ts` - imports the extracted `rpc` instead of defining it.
+- `package.json` - one dependency.
 
 ---
 
 ### Task 1: Three descriptions that currently misdescribe real behaviour
 
-Documentation only. No behaviour change, no schema change, no test change. This is separable from everything else in the plan and could ship alone.
+Documentation only. No behaviour change, no schema change. Separable from everything else here.
 
 **Files:**
 - Modify: `src/tools/index.ts`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: nothing other tasks depend on.
+- Consumes: nothing. Produces: nothing other tasks depend on.
 
-- [ ] **Step 1: Correct `promote_roster_entry`**
+- [ ] **Step 1: Read each description before changing it**
 
-Find the `define("promote_roster_entry", ...)` call. Its description currently says only that it turns a staged roster row into a person, keeping provenance. Replace the description string with:
+```bash
+grep -n -A3 'define(\n*\s*"promote_roster_entry"' src/tools/index.ts
+grep -n -A4 '"get_roster_entry"' src/tools/index.ts
+grep -n -A6 '"import_roster"' src/tools/index.ts
+```
+
+**Extend these descriptions; do not replace them.** The first draft of this plan supplied whole replacement strings, which would have deleted existing sentences that are still true. Add the new sentences to what is there.
+
+- [ ] **Step 2: `promote_roster_entry` stores the roster row's email as a contact**
+
+Append to its description:
 
 ```typescript
-      "Turn a staged roster row into a person you have actually engaged with, keeping its provenance. " +
-        "If the roster row carries an email, it is stored as a person contact by this call. " +
-        "That differs from create_person, whose email is used for duplicate detection only and is " +
-        "not stored; calling add_contact afterwards with the same address is a no-op rather than a " +
+        " If the roster row carries an email, this call stores it as a person contact. That " +
+        "differs from create_person, whose email is used for duplicate detection only and is not " +
+        "stored. Calling add_contact afterwards with the same address is a no-op rather than a " +
         "duplicate, because contacts are unique per person, type, and normalized value.",
 ```
 
-The behaviour is real and was confirmed by promoting a person whose roster row carried an address and reading the result back: the person already held it as a contact with no `add_contact` call made. The control case, a roster row with no email, returned empty contacts. The no-op claim is `src/tools/attributes.ts:45`, `ON CONFLICT (person_id, contact_type, normalized_value) DO NOTHING`.
+Confirmed by promoting a person whose roster row carried an address and reading the result back; the control case, a roster row with no email, returned empty contacts. The no-op claim is `src/tools/attributes.ts:45`, `ON CONFLICT (person_id, contact_type, normalized_value) DO NOTHING`.
 
-- [ ] **Step 2: Document the `external_row_key` discriminator**
+- [ ] **Step 3: Document the `external_row_key` discriminator**
 
-`src/normalize.ts:130` builds the key in three tiers. Nothing tells a caller this, so anyone joining Junco's provenance back to their own source data does a string comparison against `650` when the stored value is `k:650`, gets no match, and gets no explanation.
-
-Find the `define("get_roster_entry", ...)` call and extend its description:
+Append to `get_roster_entry`'s description:
 
 ```typescript
-      "Read one staged roster entry by its re_ id, including the fields as imported. " +
-        "Provenance records carry external_row_key with a one-character tier prefix showing how " +
-        "identity was derived: 'k:' plus the source's own row id when the import supplied one, " +
-        "else 'e:' plus the normalized email, else 'h:' plus a hash of name and organization. " +
-        "Stability follows the tier: a k: key is as stable as the source id, an e: key changes if " +
-        "the email changes, and an h: key changes if the name or organization changes.",
+        " Provenance records carry external_row_key with a tier prefix showing how identity was " +
+        "derived: 'k:' plus the source's own row id when the import supplied one, else 'e:' plus " +
+        "the normalized email, else 'h:' plus a hash of name and organization. Stability follows " +
+        "the tier: a k: key is as stable as the source id, an e: key changes if the email " +
+        "changes, an h: key changes if the name or organization changes.",
 ```
 
-- [ ] **Step 3: Say what `import_roster` returning counts costs the caller**
+Built at `src/normalize.ts:130`.
 
-Find the `define("import_roster", ...)` call and append to its description:
+- [ ] **Step 4: Say what `import_roster` returning counts costs the caller**
+
+Append to its description:
 
 ```typescript
-        " This returns counts, not entry ids, and there is no call that maps a source row to the " +
-        "re_ id it created. Promotion therefore requires finding each entry separately. Plan a " +
-        "roster import knowing that, rather than discovering it after the rows are staged.",
+        " This returns counts, not entry ids, and no call maps a source row to the re_ id it " +
+        "created. Plan an import knowing that, rather than discovering it after the rows are " +
+        "staged.",
 ```
 
-**Note for whoever executes plan 3:** that sentence is deleted there, when `external_row_key` becomes readable from the roster read tools. It is written now because it is true now, and it is flagged here so a later reader does not find a stale warning and trust it.
+**Note for plan 3:** that sentence is deleted there, when the roster read tools return `external_row_key`. Flagged so a later reader does not find a stale warning and trust it.
 
-- [ ] **Step 4: Confirm nothing else changed**
+- [ ] **Step 5: Confirm nothing else changed**
 
-Run: `npm test`
-Expected: PASS, unchanged count. Descriptions are strings; if a test fails, a test was asserting on description text and that assertion needs to move to the new wording deliberately rather than by reflex.
+Run: `npm test` and `npm run typecheck`
+Expected: PASS, unchanged count. If a test fails, it was asserting on description text; move that assertion deliberately.
 
-Run: `npm run typecheck`
-Expected: clean.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/tools/index.ts
@@ -110,57 +144,69 @@ git commit -m "docs: correct three tool descriptions that misdescribed real beha
 
 ### Task 2: The schema-versus-handler audit
 
-**Validation must not be switched on before this exists.** These schemas have never controlled runtime behaviour, so any place where a handler reads something the schema does not declare, or the schema requires something the handler defaults, becomes a production failure the moment the validator runs. One such case is already known; the point of this task is to find the rest before they find you.
+**Validation must not be switched on before this exists.** These schemas have never controlled runtime behaviour, so every disagreement between a declared schema and its handler becomes a production failure the moment the validator runs.
 
 **Files:**
 - Create: `docs/SCHEMA-AUDIT.md`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `docs/SCHEMA-AUDIT.md`, and a list of drift items that Task 3 fixes.
+- Produces: `docs/SCHEMA-AUDIT.md` and a drift list Task 3 fixes.
 
-- [ ] **Step 1: List every property each handler actually reads**
+- [ ] **Step 1: Read the input interfaces, not just the property accesses**
+
+The first draft used `grep -rn "input\.[a-z_]*"` alone. That misses destructuring (`const { person_id } = input`), misses properties read by helpers, and cannot see nullability at all. Start from the declared interfaces instead:
 
 ```bash
-grep -rn "input\.[a-z_]*" src/tools/*.ts | sed 's/.*input\.\([a-z_]*\).*/\1/' | sort -u
+grep -rn -A12 "^export interface .*Input" src/tools/*.ts
 ```
 
-Then, per tool, list what its `define(...)` call declares. The registry is `src/tools/index.ts`.
+Then, per tool, compare that interface against the `obj({...})` in its `define(...)` call.
 
-- [ ] **Step 2: Write the table**
+- [ ] **Step 2: Write the table with four verdicts**
 
-Create `docs/SCHEMA-AUDIT.md` with one row per tool, 28 rows:
+Create `docs/SCHEMA-AUDIT.md`:
 
 ```markdown
 # Schema versus handler audit
 
 Run 2026-08-27, before argument validation was switched on. These schemas had
-never controlled runtime behaviour, so every disagreement between a declared
-schema and its handler was latent until validation made it real.
+never controlled runtime behaviour, so every disagreement below was latent
+until validation made it real.
 
-| Tool | Reads but does not declare | Declares required, handler defaults | Verdict |
-|---|---|---|---|
-| search_people | | | clean |
-| ... | | | |
+| Tool | Verdict | Detail |
+|---|---|---|
+| search_people | clean | |
 ```
 
-For each tool record one of three verdicts:
+Four verdicts, not three. The fourth is the one the first draft missed:
 
-- **clean** - every property the handler reads is declared, and every declared `required` really is required by the handler.
-- **reads undeclared** - the handler reads `input.x` and the schema has no `x`. After validation, callers can never send it. Decide whether to declare it or delete the read.
-- **required but defaulted** - the schema marks a property required while the handler supplies a default. After validation, a call omitting it starts failing.
+- **clean** - every property the handler reads is declared, every `required` really is required, and declared types match what the handler accepts.
+- **reads undeclared** - the handler reads a property the schema does not declare. After validation, callers can never send it.
+- **required but defaulted** - the schema marks a property required while the handler supplies a default. After validation, omitting it starts failing.
+- **nullability mismatch** - the schema declares `str` (string only) while the handler's interface accepts `string | null`. **After validation, sending `null` starts failing.** This is the category that refuses calls which work today.
 
-- [ ] **Step 3: Record the one already known**
+- [ ] **Step 3: Record the five already known**
 
-`export_data` declares `required: ["scope"]` at `src/tools/index.ts:239`. `exportData` reads `input.scope ?? "people"` at `src/tools/export.ts:79`. Under validation, `export_data({})` starts failing. Both cannot be right.
+These were found during review and must appear in the table:
 
-The verdict to record, for Task 3 to act on: **the handler is right and the schema is wrong.** A default that has existed since the tool shipped is the behaviour callers have; making the argument mandatory now is a breaking change dressed up as a fix.
+| Tool | Verdict | Detail |
+|---|---|---|
+| `export_data` | required but defaulted | `required: ["scope"]` at `index.ts:239`, handler reads `input.scope ?? "people"` at `export.ts:79` |
+| `log_encounter` | required but defaulted | `occurred_on` required in the schema, `resolveOccurredOn` defaults it at `encounters.ts:69` |
+| `add_contact` | nullability mismatch | `label: str(...)` at `index.ts:315`, interface accepts `string \| null` |
+| `log_encounter` | nullability mismatch | `location` and `event` declared `str`, interface accepts null |
+| `create_followup` | nullability mismatch | `note` declared `str`, interface accepts null |
 
-- [ ] **Step 4: Check `import_roster`'s row items specifically**
+**The verdict for every "required but defaulted" case is that the handler is right.** A default that has existed since the tool shipped is the behaviour callers have; making the argument mandatory now is a breaking change dressed as a fix.
 
-`import_roster` declares its rows as an array of objects. Confirm what the item schema actually constrains, and whether the handler reads row properties the item schema does not name. This one matters more than the others because roster rows are caller-supplied bulk data, and a validator that rejects unknown nested keys could refuse an import that works today.
+**The verdict for every nullability mismatch is that the handler is right too.** The interface accepting null is deliberate: null is how a caller clears a field.
 
-Record the finding. **Task 5 does not validate nested object properties**, and this step is where that decision is justified or overturned.
+- [ ] **Step 4: Check `import_roster`'s row items**
+
+Roster rows are caller-supplied bulk data. Confirm what the item schema constrains and whether handlers read row properties it does not name.
+
+**This decides whether validation may reject unknown nested properties.** Record the finding; Task 5's design turns on it.
 
 - [ ] **Step 5: Commit**
 
@@ -174,179 +220,250 @@ git commit -m "docs: audit every tool schema against its handler before enforcin
 ### Task 3: Fix the drift the audit found
 
 **Files:**
-- Modify: `src/tools/index.ts`
-- Modify: `tests/export.test.ts` (or wherever `export_data`'s tests live)
+- Modify: `src/tools/index.ts`, and the tests that pin the behaviour being kept.
 
 **Interfaces:**
-- Consumes: `docs/SCHEMA-AUDIT.md` from Task 2.
+- Consumes: `docs/SCHEMA-AUDIT.md`.
 - Produces: a registry whose schemas can be enforced without breaking existing callers.
 
-- [ ] **Step 1: Write a test pinning the behaviour you are keeping**
+- [ ] **Step 1: Pin the behaviours you are keeping, before changing any schema**
 
 ```typescript
-// in the existing export_data test file
-it("defaults scope to people when it is omitted", async () => {
-  // Pinned deliberately before validation is switched on. The schema declared
-  // scope required while the handler defaulted it; the handler's behaviour is
-  // what callers have, so the schema is what changes. Without this test,
-  // Task 6 could "fix" the drift in the other direction and break a caller.
-  const result = await exportData(ctx, {} as never);
-  expect(result.scope).toBe("people");
+// tests/schema-drift.test.ts
+// Written before the schemas change, so a later "fix" in the wrong direction
+// is caught. Each of these is a call that works today and must keep working.
+import { describe, expect, it } from "vitest";
+
+describe("behaviours the schemas must be made to agree with", () => {
+  it("export_data defaults scope to people when omitted", async () => {
+    const result = await listOrExport(ctx, {} as never);
+    expect(result.scope).toBe("people");
+  });
+
+  it("log_encounter defaults occurred_on to today when omitted", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const result = await logEncounter(ctx, { person_id: person.id, summary: "met" } as never);
+    expect(result.occurred_on).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it("add_contact accepts a null label", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await expect(
+      addContact(ctx, { person_id: person.id, contact_type: "email", value: "a@b.test", label: null })
+    ).resolves.toBeTruthy();
+  });
+
+  it("log_encounter accepts null location and event", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await expect(
+      logEncounter(ctx, { person_id: person.id, occurred_on: "2026-08-27", summary: "x", location: null, event: null })
+    ).resolves.toBeTruthy();
+  });
+
+  it("create_followup accepts a null note", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await expect(
+      createFollowup(ctx, { person_id: person.id, due_on: "2026-09-09", note: null })
+    ).resolves.toBeTruthy();
+  });
 });
 ```
 
-Adapt the context construction and the assertion to match the surrounding file's conventions; do not invent a new test harness.
+Adapt the context construction to the surrounding files' conventions. Note `createFollowup` returns `{ followup, person }`, not a follow-up.
 
-- [ ] **Step 2: Run it**
+- [ ] **Step 2: Run them**
 
-Run: `npx vitest run tests/export.test.ts`
-Expected: PASS. The handler already behaves this way; this test records that it must keep doing so.
+Run: `npx vitest run tests/schema-drift.test.ts`
+Expected: PASS. The handlers already behave this way; these tests record that they must keep doing so.
 
-- [ ] **Step 3: Make the schema agree with the handler**
+- [ ] **Step 3: Make the schemas agree with the handlers**
 
-In `src/tools/index.ts`, find the `define("export_data", ...)` call and change its `obj(...)` third argument from `["scope"]` to `[]`.
+In `src/tools/index.ts`:
 
-- [ ] **Step 4: Apply every other fix the audit found**
+- `export_data`: change the `obj(...)` required array from `["scope"]` to `[]`.
+- `log_encounter`: remove `occurred_on` from its required array.
+- `add_contact`: `label: str(...)` becomes `label: nullableStr(...)`.
+- `log_encounter`: `location` and `event` become `nullableStr(...)`.
+- `create_followup`: `note` becomes `nullableStr(...)`.
 
-Work the table. For each **reads undeclared** row, either declare the property or delete the read, and say in the commit message which and why. For each remaining **required but defaulted** row, apply the same rule as `export_data`: the handler's behaviour is what callers have.
+Then apply every other row the audit produced, by the same two rules: the handler is right about defaults, and the handler is right about nullability. If the audit found nothing else, say so explicitly in the commit message rather than leaving it silent.
 
-If the audit found nothing else, say so explicitly in the commit message rather than leaving it silent.
+- [ ] **Step 4: Run and commit**
 
-- [ ] **Step 5: Run the suite**
-
-Run: `npm test`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
+Run: `npm test` and `npm run typecheck`. Expected: PASS.
 
 ```bash
-git add src/tools/index.ts tests/
+git add src/tools/index.ts tests/schema-drift.test.ts
 git commit -m "fix: align tool schemas with their handlers before enforcing them"
 ```
 
 ---
 
-### Task 4: A failing test at the transport boundary
+### Task 4: Extract the `tools/call` harness
 
-**This test must call through `buildServer`, not through a tool function.** The defect lives in the layer above the handlers: arguments are dropped between the MCP request and the handler. A test that calls `searchPeople` directly cannot see it, and would be the eighteenth test in this project that passes while guarding nothing.
+Small, and it unblocks Task 5. `rpc` is a private function at `tests/mcp.test.ts:24`, so no second file can issue a `tools/call` without duplicating it.
+
+**Files:**
+- Create: `tests/helpers/rpc.ts`
+- Modify: `tests/mcp.test.ts`
+
+**Interfaces:**
+- Produces: `rpc(method: string, params: unknown, props?: unknown)` and a `callTool(name: string, args: unknown)` convenience wrapper returning the parsed tool payload.
+
+- [ ] **Step 1: Move it**
+
+Cut `rpc` from `tests/mcp.test.ts` into `tests/helpers/rpc.ts` unchanged, export it, and import it back in `tests/mcp.test.ts`. Add alongside it:
+
+```typescript
+/**
+ * Issues a tools/call and returns the parsed payload plus whether the result
+ * was an error. Every boundary test uses this rather than reaching into a
+ * tool function, because the defect these tests exist for lives above the
+ * handlers.
+ */
+export async function callTool(name: string, args: unknown) {
+  const { body } = await rpc("tools/call", { name, arguments: args });
+  const result = body.result as { content: { text: string }[]; isError?: boolean };
+  return { isError: result.isError === true, payload: JSON.parse(result.content[0]!.text) };
+}
+```
+
+- [ ] **Step 2: Confirm nothing broke**
+
+Run: `npm test`
+Expected: PASS, unchanged count. This is a pure move.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/helpers/rpc.ts tests/mcp.test.ts
+git commit -m "test: extract the tools/call harness so more than one file can use it"
+```
+
+---
+
+### Task 5: A failing test at the transport boundary
 
 **Files:**
 - Create: `tests/validation-boundary.test.ts`
 
 **Interfaces:**
-- Consumes: `buildServer` from `src/mcp/server.ts`, and whatever harness the existing `tests/mcp.test.ts` uses to issue `tools/call` requests.
-- Produces: the failing test Task 6 makes pass.
+- Consumes: `callTool` from `tests/helpers/rpc.ts`.
+- Produces: the failing test Task 7 makes pass.
 
-- [ ] **Step 1: Read how the existing transport tests issue a call**
-
-```bash
-sed -n '1,60p' tests/mcp.test.ts
-```
-
-Reuse that harness exactly. Do not build a second way of issuing a `tools/call`.
-
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 1: Write the tests, with honest expectations about which fail today**
 
 ```typescript
 // tests/validation-boundary.test.ts
 //
-// Every test here goes through the MCP tools/call boundary on purpose. The
-// defect being fixed is that unknown arguments reach the handler and are
-// ignored by property access, which is invisible to any test that calls a
-// tool function directly.
-import { describe, expect, it } from "vitest";
-// Import the same helpers tests/mcp.test.ts uses to build a server and call a
-// tool. Match its imports rather than inventing new ones.
+// Every test goes through the MCP tools/call boundary on purpose. The defect
+// being fixed is that unknown arguments reach the handler and are ignored by
+// property access, which is invisible to any test calling a tool directly.
+import { describe, expect, it, vi } from "vitest";
+import { callTool } from "./helpers/rpc";
+import { TOOLS } from "../src/tools/index";
 
-describe("argument validation at the transport boundary", () => {
+describe("the defect: unknown arguments are dropped", () => {
   // THE REPORTED BUG. A caller passed `cursor` to search_people, which declares
   // people_cursor and roster_cursor and no cursor. The argument was dropped,
   // the query restarted, and the identical page and identical token came back.
-  // It was filed as a pagination defect. Pagination was correct.
+  // Filed as a pagination defect. Pagination was correct.
   it("refuses an unknown argument instead of ignoring it", async () => {
-    const result = await callTool("search_people", { query: "Mark", cursor: "eyJraW5kIjoi" });
-    expect(result.isError).toBe(true);
-    const body = JSON.parse(result.content[0].text);
-    expect(body.error.code).toBe("invalid_input");
-    // The reader is a model deciding what to do next, so the refusal has to
-    // name the parameter that was wrong.
-    expect(body.error.reason).toContain("cursor");
+    const { isError, payload } = await callTool("search_people", {
+      query: "Mark",
+      cursor: "eyJraW5kIjoi",
+    });
+    expect(isError).toBe(true);
+    expect(payload.error.code).toBe("invalid_input");
+    expect(payload.error.reason).toContain("cursor");
   });
 
   it("names what it would have accepted", async () => {
-    const result = await callTool("search_people", { query: "Mark", cursor: "x" });
-    const body = JSON.parse(result.content[0].text);
-    expect(body.error.reason).toMatch(/people_cursor|roster_cursor/);
+    const { payload } = await callTool("search_people", { query: "Mark", cursor: "x" });
+    expect(payload.error.reason).toMatch(/people_cursor|roster_cursor/);
   });
 
-  it("refuses a required argument that is missing", async () => {
-    const result = await callTool("get_person", {});
-    const body = JSON.parse(result.content[0].text);
-    expect(body.error.code).toBe("invalid_input");
-    expect(body.error.reason).toContain("person_id");
-  });
-
-  it("refuses an argument of the wrong type", async () => {
-    const result = await callTool("search_people", { query: 42 });
-    const body = JSON.parse(result.content[0].text);
-    expect(body.error.code).toBe("invalid_input");
-  });
-
-  it("refuses a value outside a declared enum", async () => {
-    const result = await callTool("export_data", { scope: "toString" });
-    const body = JSON.parse(result.content[0].text);
-    expect(body.error.code).toBe("invalid_input");
-  });
-
-  // The most important negative in the file. A refused write must not have
-  // written, and must not have consumed an idempotency key, or a retry with a
-  // corrected argument replays a claim that never produced a result.
-  it("writes nothing when it refuses a write", async () => {
+  it("refuses an unknown argument on a write without writing", async () => {
+    const spy = vi.spyOn(TOOLS.create_person, "run");
     const before = await countPeople();
-    const result = await callTool("create_person", {
+    const { isError } = await callTool("create_person", {
       full_name: "Ada Lovelace",
+      idempotency_key: "boundary-test-1",
       nonsense_field: "x",
     });
-    expect(result.isError).toBe(true);
+    expect(isError).toBe(true);
+    // The handler must not run at all. Counting rows alone would pass even if
+    // the handler ran and happened to fail after claiming a key.
+    expect(spy).not.toHaveBeenCalled();
     expect(await countPeople()).toBe(before);
-    const claims = await countIdempotencyKeys();
-    expect(claims).toBe(0);
+    // And the key must be reclaimable. A claim recorded for a call that never
+    // produced a result is a key that can never replay.
+    expect(await idempotencyKeyExists("boundary-test-1")).toBe(false);
+    spy.mockRestore();
+  });
+});
+
+describe("refusals that already work, and must keep working", () => {
+  // These pass BEFORE the validator exists, because the handlers validate
+  // internally: search.ts:198 for query type, export.ts:83 for the scope enum.
+  // They are here as regression guards, not as reproductions of the defect.
+  it("refuses a wrong-typed query", async () => {
+    const { payload } = await callTool("search_people", { query: 42 });
+    expect(payload.error.code).toBe("invalid_input");
   });
 
-  // Guards against a validator so strict it refuses ordinary calls. Without
-  // this, "refuse everything" passes every test above.
-  it("still accepts a valid call", async () => {
-    const result = await callTool("search_people", { query: "nobody-by-this-name" });
-    expect(result.isError).toBeFalsy();
+  it("refuses a scope outside the enum", async () => {
+    const { payload } = await callTool("export_data", { scope: "toString" });
+    expect(payload.error.code).toBe("invalid_input");
   });
 
-  it("still accepts a valid call that omits every optional argument", async () => {
-    const result = await callTool("export_data", {});
-    expect(result.isError).toBeFalsy();
+  // THE CONTRACT THE VALIDATOR MUST NOT BREAK. src/ids.ts distinguishes a
+  // malformed id from a bad argument, and tests/mcp.test.ts:140 depends on it.
+  // A validator enforcing the ^p_ pattern would return invalid_input here.
+  it("still reports invalid_id for an id of the wrong kind", async () => {
+    const { payload } = await callTool("log_encounter", {
+      person_id: "re_1",
+      occurred_on: "2026-08-20",
+      summary: "x",
+    });
+    expect(payload.error.code).toBe("invalid_id");
+  });
+});
+
+describe("calls that must keep succeeding", () => {
+  // Without these, "refuse everything" passes every negative test above.
+  it("accepts a valid call", async () => {
+    const { isError } = await callTool("search_people", { query: "nobody-by-this-name" });
+    expect(isError).toBe(false);
   });
 
-  // null is a value, not an absence. nullableStr declares type ["string","null"],
-  // so a caller clearing a field must be able to send null.
-  it("accepts null for a property declared nullable", async () => {
+  it("accepts a valid call that omits every optional argument", async () => {
+    const { isError } = await callTool("export_data", {});
+    expect(isError).toBe(false);
+  });
+
+  it("accepts null for a property the handler treats as nullable", async () => {
     const created = await callTool("create_person", { full_name: "Grace Hopper" });
-    const id = JSON.parse(created.content[0].text).id;
-    const result = await callTool("update_person", { person_id: id, job_title: null });
-    expect(result.isError).toBeFalsy();
+    const { isError } = await callTool("update_person", {
+      person_id: created.payload.id,
+      job_title: null,
+    });
+    expect(isError).toBe(false);
   });
 });
 ```
 
-Write `countPeople` and `countIdempotencyKeys` as small helpers over the test D1 binding, in the style the existing tests use.
+Write `countPeople` and `idempotencyKeyExists` as small helpers over the test D1 binding, in the style the existing tests use.
 
-- [ ] **Step 3: Run and confirm the shape of the failure**
+- [ ] **Step 2: Run and confirm which fail**
 
 Run: `npx vitest run tests/validation-boundary.test.ts`
 
-Expected: the "refuses" tests FAIL, and they fail by **succeeding** rather than by throwing. `search_people` with a bogus `cursor` returns a normal result. That is the defect, reproduced.
+Expected: the three tests in **"the defect"** FAIL, and they fail by **succeeding** rather than throwing.
 
-Expected: the "still accepts" tests PASS already. If any of them fails now, stop: something other than validation is wrong and this plan is not the fix.
+Expected: everything in **"refusals that already work"** and **"calls that must keep succeeding"** PASSES already. **If any of those fails now, stop** - something other than validation is wrong and this plan is not the fix.
 
-- [ ] **Step 4: Commit the failing test**
+- [ ] **Step 3: Commit the failing test**
 
 ```bash
 git add tests/validation-boundary.test.ts
@@ -355,17 +472,33 @@ git commit -m "test: reproduce arguments being silently dropped at the MCP bound
 
 ---
 
-### Task 5: The validator
+### Task 6: The validator
 
 **Files:**
-- Create: `src/validate.ts`
-- Create: `tests/validate.test.ts`
+- Create: `src/validate.ts`, `tests/validate.test.ts`
+- Modify: `package.json`
 
 **Interfaces:**
-- Consumes: `JsonSchema` from `src/tools/schema.ts`, `ToolError` from `src/errors.ts`.
-- Produces: `validateInput(toolName: string, schema: JsonSchema, input: unknown): void`, which returns nothing on success and throws `ToolError("invalid_input", ...)` on failure.
+- Consumes: `JsonSchema` from `src/tools/schema.ts`, `ToolError` from `src/errors.ts`, `CfWorkerJsonSchemaValidator` from `@modelcontextprotocol/sdk/validation/cfworker`.
+- Produces: `validateInput(toolName: string, schema: JsonSchema, input: unknown): void`, returning nothing on success and throwing `ToolError("invalid_input", ...)` on failure.
 
-- [ ] **Step 1: Write the failing unit tests**
+- [ ] **Step 1: Add the dependency and confirm it loads under workerd**
+
+```bash
+npm install --save @cfworker/json-schema@^4.1.1
+```
+
+It is an optional peer dependency of the SDK, declared in its `package.json` as `"@cfworker/json-schema": "^4.1.1"` with `optional: true`. The export path is `@modelcontextprotocol/sdk/validation/cfworker`.
+
+Then confirm it survives the Workers bundle, because a library that uses `eval` or `new Function` fails only at runtime:
+
+```bash
+npx wrangler deploy --dry-run --outdir /tmp/junco-bundle-check
+```
+
+Expected: success, and a gzip size still well under the limit. It was 182 KiB before this dependency. **If the dry run fails, stop and record why**; the fallback is a hand-written walker over the six keywords `src/tools/schema.ts` emits, plus a registry test that no schema uses a seventh.
+
+- [ ] **Step 2: Write the failing tests**
 
 ```typescript
 // tests/validate.test.ts
@@ -421,12 +554,6 @@ describe("validateInput", () => {
     expect(msg).toContain("person_id");
   });
 
-  it("names every unknown property, not just the first", () => {
-    const msg = reason(() => validateInput("t", schema, { person_id: "p_1", a: 1, b: 2 }));
-    expect(msg).toContain("a");
-    expect(msg).toContain("b");
-  });
-
   it("refuses a missing required property", () => {
     expect(reason(() => validateInput("t", schema, {}))).toContain("person_id");
   });
@@ -449,10 +576,6 @@ describe("validateInput", () => {
     );
   });
 
-  it("refuses a string that does not match a declared pattern", () => {
-    expect(reason(() => validateInput("t", schema, { person_id: "re_1" }))).toContain("p_");
-  });
-
   it("refuses a non-array where an array is declared", () => {
     reason(() => validateInput("t", schema, { person_id: "p_1", tags: "speaker" }));
   });
@@ -461,20 +584,28 @@ describe("validateInput", () => {
     reason(() => validateInput("t", schema, { person_id: "p_1", tags: [1] }));
   });
 
-  // null is a value. nullableStr declares ["string","null"], and a caller
-  // clearing a field sends null deliberately.
   it("accepts null only where null is declared", () => {
     expect(() => validateInput("t", schema, { person_id: "p_1", notes: null })).not.toThrow();
     reason(() => validateInput("t", schema, { person_id: "p_1", query: null }));
   });
 
-  // undefined is JSON's absence. Treating it as a present-and-wrong value would
-  // refuse `{person_id: "p_1", query: undefined}`, which serializes to a call
-  // with no query at all.
+  // THE ONE THAT PROTECTS THE ERROR DESIGN. `id()` puts a ^p_ pattern in the
+  // schema, and src/ids.ts reports a wrong-kind id as invalid_id. If this
+  // validator enforced the pattern, that id would become invalid_input and
+  // tests/mcp.test.ts:140 would break along with the distinction it guards.
+  it("does not enforce id patterns, leaving them to assertId", () => {
+    expect(() => validateInput("t", schema, { person_id: "re_1" })).not.toThrow();
+  });
+
+  it("still refuses an id that is not a string at all", () => {
+    reason(() => validateInput("t", schema, { person_id: 7 }));
+  });
+
+  // undefined is JSON's absence. Refusing it would reject
+  // {person_id: "p_1", query: undefined}, which serializes to a call with no
+  // query at all.
   it("treats an explicitly undefined property as absent", () => {
-    expect(() =>
-      validateInput("t", schema, { person_id: "p_1", query: undefined })
-    ).not.toThrow();
+    expect(() => validateInput("t", schema, { person_id: "p_1", query: undefined })).not.toThrow();
   });
 
   it("refuses input that is not an object", () => {
@@ -483,79 +614,129 @@ describe("validateInput", () => {
     reason(() => validateInput("t", schema, null));
   });
 
-  // Refusals are logged, and logs are retained. A message carrying a note or a
-  // name would put personal data into retained storage.
+  it("reports every problem at once rather than the first", () => {
+    const msg = reason(() => validateInput("t", schema, { a: 1, b: 2 }));
+    expect(msg).toContain("a");
+    expect(msg).toContain("b");
+    expect(msg).toContain("person_id");
+  });
+
   it("never echoes a value into the message", () => {
     const msg = reason(() =>
       validateInput("t", schema, { person_id: "p_1", query: 42, secret_note: "Ada's address" })
     );
     expect(msg).not.toContain("Ada");
-    expect(msg).not.toContain("42");
   });
 
   it("names the tool so a refusal is greppable", () => {
     expect(reason(() => validateInput("get_person", schema, {}))).toContain("get_person");
   });
 });
+
+// Guards the seam between this project's schema helpers and the library.
+// A helper added later that emits a keyword the stripper does not know about
+// would otherwise be enforced silently, including a new pattern.
+describe("every registered schema is safe to hand to the validator", () => {
+  it("declares no keyword outside the supported set", async () => {
+    const { TOOLS } = await import("../src/tools/index");
+    const SUPPORTED = new Set([
+      "type", "description", "enum", "pattern", "items", "properties", "required",
+      "additionalProperties",
+    ]);
+    for (const tool of Object.values(TOOLS)) {
+      for (const spec of Object.values(tool.inputSchema.properties)) {
+        for (const keyword of Object.keys(spec as object)) {
+          expect(SUPPORTED.has(keyword), `${tool.name} uses ${keyword}`).toBe(true);
+        }
+      }
+    }
+  });
+});
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 3: Run to verify it fails**
 
 Run: `npx vitest run tests/validate.test.ts`
 Expected: FAIL, cannot resolve `../src/validate`.
 
-- [ ] **Step 3: Write the validator**
+- [ ] **Step 4: Write the validator**
 
 ```typescript
 // src/validate.ts
+import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { ToolError } from "./errors";
 import type { JsonSchema } from "./tools/schema";
 
 /**
- * The subset of JSON Schema this registry actually uses. Six keywords, all
- * produced by the helpers in tools/schema.ts. Anything else in a schema is
- * ignored rather than half-enforced, because a validator that pretends to
- * understand a keyword is worse than one that does not.
+ * Real JSON Schema, not a reimplementation of the parts we happen to use.
+ *
+ * An earlier draft walked the six keywords `src/tools/schema.ts` emits. Its
+ * failure mode was that a keyword it did not recognize was silently ignored,
+ * which is the same defect this module exists to fix, one level up. This
+ * library validates without code generation, which is why it works under
+ * workerd where Ajv's `new Function` does not.
+ *
+ * `shortcircuit: false` so a caller is told everything that is wrong in one
+ * refusal rather than discovering problems one round trip at a time.
  */
-interface PropertySchema {
-  type?: string | string[];
-  enum?: string[];
-  pattern?: string;
-  items?: { type?: string };
+const provider = new CfWorkerJsonSchemaValidator({ shortcircuit: false });
+const validators = new Map<string, ReturnType<typeof provider.getValidator>>();
+
+/**
+ * `pattern` is REMOVED before validation, and that is deliberate.
+ *
+ * `id("p", "Person")` puts `^p_` in the schema so an agent reading tools/list
+ * sees the prefix. Enforcing it here would turn `person_id: "re_1"` into
+ * `invalid_input`, when `src/ids.ts` reports it as `invalid_id` with a next
+ * step naming promote_roster_entry. That distinction is the error design, it
+ * is asserted by tests/mcp.test.ts, and the boundary must not flatten it.
+ *
+ * Type is still enforced, so a non-string id is still refused here.
+ */
+function withoutPatterns(schema: JsonSchema): JsonSchema {
+  const properties: Record<string, unknown> = {};
+  for (const [key, spec] of Object.entries(schema.properties)) {
+    if (spec !== null && typeof spec === "object" && "pattern" in spec) {
+      const { pattern, ...rest } = spec as Record<string, unknown>;
+      properties[key] = rest;
+    } else {
+      properties[key] = spec;
+    }
+  }
+  return { ...schema, properties };
 }
 
-function matchesType(declared: string, value: unknown): boolean {
-  switch (declared) {
-    case "null":
-      return value === null;
-    case "array":
-      return Array.isArray(value);
-    case "object":
-      return value !== null && typeof value === "object" && !Array.isArray(value);
-    case "integer":
-      return typeof value === "number" && Number.isInteger(value);
-    case "number":
-      return typeof value === "number";
-    default:
-      // string, boolean. null is excluded here because typeof null is "object"
-      // and would otherwise satisfy nothing, but Array.isArray guards arrays.
-      return value !== null && !Array.isArray(value) && typeof value === declared;
+function validatorFor(toolName: string, schema: JsonSchema) {
+  let validator = validators.get(toolName);
+  if (!validator) {
+    validator = provider.getValidator(withoutPatterns(schema) as never);
+    validators.set(toolName, validator);
   }
+  return validator;
 }
 
 /**
- * Throws ToolError("invalid_input") describing every problem at once, or
- * returns. Never mutates `input`: no coercion and no default injection, so a
- * handler still sees exactly what the caller sent.
+ * Turns one library error into a sentence a model can act on.
  *
- * Only top-level properties are checked. Nested object properties are not,
- * deliberately: `import_roster` accepts caller-supplied roster rows whose
- * shape is intentionally permissive, and recursively rejecting unknown keys
- * there would refuse imports that work today. See docs/SCHEMA-AUDIT.md.
- *
- * Messages name parameters and types and never a value. Refusals are logged
- * and logs are retained.
+ * The library reports `/limit: must be integer`. What a caller needs is the
+ * property name and what the schema would have accepted, so the message is
+ * built from the schema rather than passed through. It never contains a value:
+ * refusals reach the model, and echoing a note or a name into one is how
+ * personal data ends up somewhere nobody expected.
  */
+function describe(schema: JsonSchema, location: string): string {
+  const key = location.replace(/^\//, "").split("/")[0];
+  if (!key) return "arguments must be an object";
+  const spec = schema.properties[key] as { type?: string | string[]; enum?: string[] } | undefined;
+  if (!spec) {
+    const declared = Object.keys(schema.properties).slice().sort().join(", ");
+    return `unknown argument ${key}; accepted arguments are ${declared}`;
+  }
+  if (spec.enum) return `${key} must be one of ${spec.enum.join(", ")}`;
+  const types = Array.isArray(spec.type) ? spec.type.join(" or ") : spec.type;
+  return `${key} must be ${types ?? "of the declared type"}`;
+}
+
 export function validateInput(toolName: string, schema: JsonSchema, input: unknown): void {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new ToolError(
@@ -565,98 +746,67 @@ export function validateInput(toolName: string, schema: JsonSchema, input: unkno
     );
   }
 
-  const value = input as Record<string, unknown>;
-  const declared = Object.keys(schema.properties);
-  const problems: string[] = [];
-
   // undefined is absence, not a wrong value. JSON cannot express it, but a
   // client building arguments in JavaScript can, and `{query: undefined}`
   // means a call with no query.
-  const present = declared.length >= 0 ? Object.keys(value).filter((k) => value[k] !== undefined) : [];
-
-  const unknown = present.filter((k) => !declared.includes(k));
-  if (unknown.length > 0) {
-    problems.push(
-      `unknown ${unknown.length === 1 ? "argument" : "arguments"} ${unknown.sort().join(", ")}; ` +
-        `${toolName} accepts ${declared.sort().join(", ")}`
-    );
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (value !== undefined) cleaned[key] = value;
   }
 
+  const result = validatorFor(toolName, schema)(cleaned);
+  if (result.valid) return;
+
+  const seen = new Set<string>();
+  for (const part of result.errorMessage.split("; ")) {
+    const location = part.split(":")[0] ?? "";
+    seen.add(describe(schema, location.trim()));
+  }
+  // Missing required properties are reported by the library against the object
+  // itself rather than against the property, so name them explicitly.
   for (const key of schema.required ?? []) {
-    if (!present.includes(key)) problems.push(`${key} is required`);
+    if (!(key in cleaned)) seen.add(`${key} is required`);
   }
 
-  for (const key of present) {
-    if (!declared.includes(key)) continue;
-    const spec = schema.properties[key] as PropertySchema;
-    const got = value[key];
-
-    if (spec.type !== undefined) {
-      const types = Array.isArray(spec.type) ? spec.type : [spec.type];
-      if (!types.some((t) => matchesType(t, got))) {
-        problems.push(`${key} must be ${types.join(" or ")}`);
-        continue;
-      }
-    }
-
-    if (spec.enum !== undefined && !spec.enum.includes(got as string)) {
-      problems.push(`${key} must be one of ${spec.enum.join(", ")}`);
-      continue;
-    }
-
-    if (spec.pattern !== undefined && typeof got === "string" && !new RegExp(spec.pattern).test(got)) {
-      problems.push(`${key} must match ${spec.pattern}`);
-      continue;
-    }
-
-    if (spec.items?.type !== undefined && Array.isArray(got)) {
-      const itemType = spec.items.type;
-      if (!got.every((item) => matchesType(itemType, item))) {
-        problems.push(`every item in ${key} must be ${itemType}`);
-      }
-    }
-  }
-
-  if (problems.length > 0) {
-    throw new ToolError(
-      "invalid_input",
-      `${toolName}: ${problems.join("; ")}`,
-      `call tools/list to see ${toolName}'s arguments`
-    );
-  }
+  throw new ToolError(
+    "invalid_input",
+    `${toolName}: ${[...seen].join("; ")}`,
+    `call tools/list to see ${toolName}'s arguments`
+  );
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+**Step 5 of this task is where the message shape gets corrected against reality.** The library's `errorMessage` is `instanceLocation: error` joined by `"; "`, per `cfworker-provider.js`. If the observed shape differs, fix `describe` and the split to match what it actually returns rather than what this plan predicts.
+
+- [ ] **Step 5: Run the tests and correct the parsing against real output**
 
 Run: `npx vitest run tests/validate.test.ts`
-Expected: PASS, 18 tests.
 
-- [ ] **Step 5: Confirm the strictness test is not blind**
+If messages are wrong, log one real `result.errorMessage` in a scratch test, read it, and adjust. Do not adjust the assertions to match a bad message.
 
-Replace the body of `validateInput` with a single `throw new ToolError("invalid_input", "no")`. Run again. Expected: the "accepts" tests FAIL. That proves those tests are the ones stopping a validator from refusing everything, which every negative test in the file would otherwise tolerate. Revert and confirm PASS.
+Expected when done: PASS, 19 tests.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Confirm the strictness test is not blind**
+
+Replace the body of `validateInput` with a single `throw new ToolError("invalid_input", "no")`. Run again. Expected: the "accepts" tests FAIL. That proves those tests are what stops a validator refusing everything. Revert and confirm PASS.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/validate.ts tests/validate.test.ts
-git commit -m "feat: add a JSON Schema validator for the vocabulary this registry uses"
+git add src/validate.ts tests/validate.test.ts package.json package-lock.json
+git commit -m "feat: validate tool arguments with a codegen-free JSON Schema validator"
 ```
 
 ---
 
-### Task 6: Enforce it at the boundary
+### Task 7: Enforce it at the boundary
 
 **Files:**
 - Modify: `src/mcp/server.ts`
 
-**Interfaces:**
-- Consumes: `validateInput` from `src/validate.ts`.
-- Produces: every `tools/call` validated before any handler runs.
-
 - [ ] **Step 1: Add the call**
 
-In `src/mcp/server.ts`, inside the `CallToolRequestSchema` handler, the code currently reads:
+`src/mcp/server.ts` currently reads:
 
 ```typescript
     const startedAt = Date.now();
@@ -677,31 +827,30 @@ Change it to:
       const result = await tool.run(ctx, args as never);
 ```
 
-Add the import at the top of the file, in the existing import block:
+Add to the existing import block:
 
 ```typescript
 import { validateInput } from "../validate";
 ```
 
-**It goes inside the existing `try`.** `validateInput` throws `ToolError`, and the `catch` below already turns a `ToolError` into a proper refusal with the right log line and the right error code. Putting it outside the try would produce an unhandled error and a 500 instead of a clean `invalid_input`.
+**It goes inside the existing `try`.** `validateInput` throws `ToolError`, and the `catch` below already turns that into a proper refusal with the right log line and code. Outside the try it would produce an unhandled error and a 500 instead of a clean `invalid_input`.
 
-- [ ] **Step 2: Run the boundary tests from Task 4**
+- [ ] **Step 2: Run the boundary tests**
 
 Run: `npx vitest run tests/validation-boundary.test.ts`
-Expected: PASS, all of them, including the two "still accepts" tests and the write-nothing test.
+Expected: PASS, all three groups, including "still reports invalid_id for an id of the wrong kind".
 
 - [ ] **Step 3: Run everything**
 
 Run: `npm test`
 
-Expected: PASS. **If tests fail here, read each one before changing it.** A failure means a test was calling a tool with an argument its schema does not declare, which is drift the audit missed. The fix is to correct the schema or the test deliberately, and to add the case to `docs/SCHEMA-AUDIT.md`. Do not loosen the validator to make a test pass.
+Expected: PASS. **If tests fail here, read each one before changing it.** A failure means a test calls a tool with an argument its schema does not declare, which is drift Task 2 missed. Correct the schema or the test deliberately and add the case to `docs/SCHEMA-AUDIT.md`. Do not loosen the validator to make a test pass.
 
-Run: `npm run typecheck`
-Expected: clean.
+Run: `npm run typecheck`. Expected: clean.
 
 - [ ] **Step 4: Confirm the enforcement is real**
 
-Comment out the `validateInput` line. Run `npx vitest run tests/validation-boundary.test.ts`. Expected: the refusal tests FAIL. Restore it and confirm PASS. This is the mutation that proves the boundary test is testing the boundary.
+Comment out the `validateInput` line and run the boundary tests. Expected: the "defect" group FAILS. Restore and confirm PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -712,33 +861,25 @@ git commit -m "fix: validate tool arguments at the MCP boundary instead of ignor
 
 ---
 
-### Task 7: Deploy, and find out what the client actually sends
+### Task 8: Deploy, and find out what the client actually sends
 
-The project's worst defects were found by running code, not reading it. Two of them were browser behaviours that 472 passing tests could not see. This task is the equivalent for validation.
-
-**Files:**
-- Modify: `docs/MEASUREMENTS.md`
-
-**Interfaces:**
-- Consumes: a deployed Worker.
-- Produces: a recorded result, and a rollback if the smoke pass fails.
-
-- [ ] **Step 1: Confirm plan 1 has been executed**
+- [ ] **Step 1: Confirm the preconditions**
 
 ```bash
 ls -t junco-backup-*.json.bz2 | head -1
 grep -c "restore drill" docs/MEASUREMENTS.md
-```
-
-Expected: an archive exists, and the drill is recorded. **If either is missing, stop and execute plan 1 first.** This deploy changes refusal behaviour on a live instance; the backup is the precondition, not a nicety.
-
-- [ ] **Step 2: Take a Time Travel bookmark**
-
-```bash
 npx wrangler d1 time-travel info junco-prm
 ```
 
-Record the bookmark in the commit message for this deploy, per `docs/BACKUP.md`.
+An archive must exist and the drill must be recorded, both from plan 1. Record the bookmark. **If either is missing, stop and execute plan 1 first.**
+
+- [ ] **Step 2: Capture the version you would roll back TO, before deploying**
+
+```bash
+npx wrangler deployments list | head -20
+```
+
+Record the **currently active** version id. The first draft of this plan recorded the newly deployed id and called it the rollback target, which is the version being rolled back from.
 
 - [ ] **Step 3: Deploy**
 
@@ -746,25 +887,23 @@ Record the bookmark in the commit message for this deploy, per `docs/BACKUP.md`.
 npm test && npm run typecheck && npx wrangler deploy
 ```
 
-Record the version id wrangler prints. That is what Step 6 rolls back to if needed.
-
 - [ ] **Step 4: The smoke pass**
 
-Through the real connector in Claude, not `curl`, call every read tool with the arguments actually in use, and each write tool against a throwaway person. All 28.
+Through the real connector in Claude, not `curl`. Read tools can be called freely. For writes, work through one throwaway person and one throwaway roster source so that `import_roster`, `finalize_import`, `promote_roster_entry`, and `purge_roster_source` are each exercised once; a single throwaway person does not reach them.
 
-**This is the only way to discover what the Claude client puts in `arguments`.** The schemas have declared `additionalProperties: false` since they were written and nothing has ever enforced it. If any client injects a field of its own, this deploy is the moment it surfaces, and it will surface as every call failing.
+**This is the only way to discover what the Claude client puts in `arguments`.** The schemas have declared `additionalProperties: false` since they were written and nothing has ever enforced it. If any client injects a field of its own, this deploy is when it surfaces, and it surfaces as every call failing.
 
 - [ ] **Step 5: Record the result**
 
-In `docs/MEASUREMENTS.md`, record the date, the deployed version id, that all 28 tools were exercised through the connector, and anything that refused unexpectedly. A clean pass is worth recording as plainly as a failure: it is the evidence that the client sends nothing extra.
+In `docs/MEASUREMENTS.md`: the date, the deployed version id, the previous version id, that all 28 tools were exercised through the connector, and anything that refused unexpectedly. A clean pass is worth recording as plainly as a failure.
 
 - [ ] **Step 6: If the smoke pass fails**
 
 ```bash
-npx wrangler rollback
+npx wrangler rollback <the-version-id-from-step-2>
 ```
 
-Then fix forward. A tool refusing a call the client legitimately makes is drift the audit missed, and it belongs in `docs/SCHEMA-AUDIT.md` with the schema corrected, not in the validator as an exception.
+Then fix forward. A tool refusing a call the client legitimately makes is drift the audit missed; it belongs in `docs/SCHEMA-AUDIT.md` with the schema corrected, not in the validator as an exception.
 
 - [ ] **Step 7: Commit**
 
@@ -777,12 +916,14 @@ git commit -m "docs: record the validation deploy and its live smoke pass"
 
 ## Self-Review
 
-**Spec coverage.** P2's three descriptions are Task 1. P3's requirements map as: the audit-first requirement is Task 2, the `export_data` drift resolution is Task 3, the reproducing test through the transport boundary is Task 4, the hand-written validator with the stated no-coercion and no-defaults rules is Task 5, enforcement before idempotency and database work is Task 6 Step 1, and the named rollback and live smoke pass are Task 7.
+**Spec coverage.** P2's three descriptions are Task 1. P3's requirements map as: the audit-first requirement is Task 2, drift resolution is Task 3, the reproducing test through the transport boundary is Tasks 4 and 5, the validator with no coercion and no default injection is Task 6, enforcement before idempotency and database work is Task 7 Step 1, and the named rollback and live smoke pass are Task 8.
 
-**One spec item deliberately narrowed.** The spec says unknown properties are "rejected at the top level". Task 5 implements exactly that and says why in a comment: `import_roster` takes caller-supplied roster rows, and recursive rejection could refuse imports that work today. Task 2 Step 4 is where that decision gets confirmed against the real schema rather than assumed.
+**Two spec items implemented differently from how the spec describes them, both deliberately.** The spec says the validator is hand-written over the vocabulary in use; it is now a codegen-free library, for the reason given in the revision note, and the spec should be amended to match. The spec says unknown properties are rejected "at the top level"; that remains true, and Task 2 Step 4 is where nested rejection is confirmed unsafe for `import_roster` rather than assumed.
 
-**Placeholder scan.** No TBD or TODO. Every code step carries runnable code. Task 2's table is left with one worked row and a stated three-verdict vocabulary because its content is the output of running the grep in Step 1, which is a procedure rather than a placeholder. Task 3 Step 4 is conditional on that output for the same reason and says what to do when the answer is "nothing else".
+**One spec requirement is deliberately not met.** The spec implies every declared constraint is enforced. `pattern` is not, because enforcing it would collapse `invalid_id` into `invalid_input`. That is recorded in the code, in a test, and here.
 
-**Type consistency.** `validateInput(toolName, schema, input)` is defined in Task 5 and called with exactly that signature in Task 6. `JsonSchema` and the `obj`/`str`/`id`/`enumOf`/`int`/`nullableStr`/`strArray` helpers are used as `src/tools/schema.ts` defines them. `ToolError(code, message, next)` matches `src/errors.ts`, where `next` is the third positional argument. The error body shape asserted in Task 4 (`body.error.code`, `body.error.reason`) must match what `toolErrorResult` actually serializes; Task 4 Step 1 reads the existing transport test first for this reason.
+**Placeholder scan.** No TBD or TODO. Task 2's table carries five worked rows and a stated four-verdict vocabulary; the rest is the output of Step 1, which is a procedure. Task 6 Step 5 tells the implementer to correct the message parsing against real library output rather than trusting this plan's prediction of it, which is a known-unknown with a method.
 
-**One risk carried deliberately.** Task 6 changes refusal behaviour for all 28 tools on an instance in daily use. Task 7 Step 1 gates it on plan 1 having run, Step 2 takes a bookmark, and Step 6 names the rollback command. That is the mitigation; the risk does not go away.
+**Type consistency.** `validateInput(toolName, schema, input)` is defined in Task 6 and called with that signature in Task 7. `callTool(name, args)` returning `{isError, payload}` is defined in Task 4 and used in Task 5. `createFollowup` is referred to as returning `{ followup, person }` in Task 3, matching `src/tools/followups.ts`. `ToolError(code, message, next)` matches `src/errors.ts`.
+
+**Two risks carried deliberately.** Task 7 changes refusal behaviour for 28 tools on an instance in daily use, mitigated by Task 8's gate, bookmark, and named rollback. And Task 6 adds a runtime dependency to a project that has been careful about them, mitigated by Step 1's bundle check and by the fallback recorded there.
