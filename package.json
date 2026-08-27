@@ -9,7 +9,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "export": "node scripts/export.mjs"
+    "export": "node scripts/export.mjs",
+    "restore": "node scripts/restore.mjs"
   },
   "keywords": [],
   "author": "Matt Vanderpol <matt@redmadronesolutions.com>",
