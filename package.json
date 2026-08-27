@@ -1,7 +1,7 @@
 {
   "name": "junco-prm",
   "version": "1.0.0",
-  "description": "",
+  "description": "A single-user personal relationship manager exposed as an MCP server, self-hosted on Cloudflare Workers and D1.",
   "main": "index.js",
   "directories": {
     "doc": "docs"
@@ -11,8 +11,8 @@
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Matt Vanderpol <matt@redmadronesolutions.com>",
+  "license": "MIT",
   "type": "module",
   "private": true,
   "devDependencies": {
