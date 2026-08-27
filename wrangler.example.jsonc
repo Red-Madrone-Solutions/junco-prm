@@ -25,6 +25,15 @@
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
 
+  // Both are set explicitly to silence wrangler's "not in your Wrangler file,
+  // enabled by default" warnings, and because the defaults are not what this
+  // project wants. workers.dev IS the deployment, so it stays on. Preview URLs
+  // publish an extra hostname per version, which serves the same Worker and the
+  // same data behind the same auth, and which the GitHub OAuth callback can
+  // never match anyway. Extra surface, no benefit.
+  "workers_dev": true,
+  "preview_urls": false,
+
   // FILL IN `database_id` from the output of:  wrangler d1 create junco-prm
   //
   // `database_id` is the real identifier; `database_name` is a label. If the
@@ -51,6 +60,10 @@
   ],
 
   // FILL IN both. These are plain variables rather than secrets, deliberately.
+  //
+  // DO NOT add GITHUB_CLIENT_ID here. It is a secret (`wrangler secret put`),
+  // and a variable of the same name in this file SILENTLY REPLACES that secret
+  // on every deploy. Wrangler warns once and then does it.
   //
   // OWNER_GITHUB_USER_ID is your NUMERIC GitHub user id, not your username.
   // Resolve it with:  curl -s https://api.github.com/users/<username> | grep '"id"'
