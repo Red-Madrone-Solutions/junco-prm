@@ -1403,7 +1403,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import { readRaw } from "./lib/d1.mjs";
+import { countRows } from "./export.mjs";
 import { BACKED_UP } from "./lib/inventory.mjs";
 import { verifyManifest } from "./lib/manifest.mjs";
 
@@ -1493,17 +1493,20 @@ async function main() {
   // A brand-new D1 has no tables at all, so the count query errors. That error
   // is the signal for "fresh and safe", and it is the only error tolerated
   // here.
-  const countSql = BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(
-    " UNION ALL "
-  );
-  let existing = [];
+  // Reuse countRows from export.mjs rather than composing a UNION ALL here.
+  // D1 rejects a compound SELECT past 5 terms with SQLITE_ERROR 7500, found by
+  // executing Task 6 against the live database, and countRows already batches
+  // around it. Writing the join again here would duplicate the bug.
+  let existing = {};
   try {
-    existing = await readRaw(countSql, { database });
+    existing = await countRows({ database });
   } catch (error) {
     if (!/no such table/i.test(error.message)) throw error;
     process.stdout.write(`${database} has no Junco tables yet. Treating as empty.\n`);
   }
-  const occupied = existing.filter((r) => Number(r.n) > 0);
+  const occupied = Object.entries(existing)
+    .filter(([, n]) => Number(n) > 0)
+    .map(([t, n]) => ({ t, n }));
   if (occupied.length > 0) {
     process.stderr.write(
       `Refusing to restore into ${database}: it already holds data.\n` +
@@ -1543,11 +1546,7 @@ async function main() {
   }
 
   // Never claim success on the strength of an exit code. Count what landed.
-  const after = await readRaw(
-    BACKED_UP.map((t) => `SELECT '${t}' AS t, COUNT(*) AS n FROM ${t}`).join(" UNION ALL "),
-    { database }
-  );
-  const actual = Object.fromEntries(after.map((r) => [r.t, Number(r.n)]));
+  const actual = await countRows({ database });
   const wrong = BACKED_UP.filter(
     (t) => actual[t] !== (archive.manifest.tables[t]?.count ?? 0)
   );
@@ -1675,6 +1674,8 @@ if the export read short, both sides agree and both are wrong.
 Run the identical statement against both databases. All eleven tables, not a
 subset; the earlier version of this step omitted `tags`, `roster_sources`, and
 `import_runs` while claiming every count matched.
+
+**D1 rejects a compound SELECT past 5 terms** with `SQLITE_ERROR 7500`, found by executing Task 6. Run the comparison in three batches rather than one statement, or reuse the export's own `countRows`, which already batches. The single statement below will fail as written; split it.
 
 ```bash
 COUNTS="SELECT 'people' t, COUNT(*) n FROM people
