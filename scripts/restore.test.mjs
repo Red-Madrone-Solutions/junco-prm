@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { insertStatements, MAX_STATEMENT_BYTES } from "./restore.mjs";
+import { describe, expect, it, vi } from "vitest";
+import { checkTargetEmpty, insertStatements, MAX_STATEMENT_BYTES } from "./restore.mjs";
 
 describe("insertStatements", () => {
   it("emits an INSERT per row, in inventory order", () => {
@@ -52,5 +52,96 @@ describe("insertStatements", () => {
   it("allows a row comfortably under the ceiling", () => {
     const ok = { id: "re_2", raw_record: "x".repeat(1000) };
     expect(() => insertStatements({ roster_entries: [ok] })).not.toThrow();
+  });
+});
+
+// Fake `run` that answers each successive wrangler invocation with the next
+// entry in `responses`, in call order: first the sqlite_master count, then
+// one countRows batch per call only when the count is above zero.
+function fakeRun(responses) {
+  let call = 0;
+  return vi.fn(async () => {
+    const response = responses[call];
+    call += 1;
+    if (response === undefined) throw new Error("unexpected extra wrangler call");
+    return response;
+  });
+}
+
+const success = (results) => JSON.stringify([{ success: true, results }]);
+const failure = (error) => JSON.stringify([{ success: false, error }]);
+
+describe("checkTargetEmpty", () => {
+  it("treats a target with no Junco tables at all as empty", async () => {
+    const run = fakeRun([success([{ n: 0 }])]);
+    const status = await checkTargetEmpty({ database: "test-db", run });
+    expect(status).toEqual({ empty: true, occupied: [] });
+  });
+
+  it("treats a fully migrated target with zero rows everywhere as empty", async () => {
+    const run = fakeRun([
+      success([{ n: 11 }]),
+      success([
+        { t: "people", n: 0 },
+        { t: "tags", n: 0 },
+        { t: "person_contacts", n: 0 },
+        { t: "person_links", n: 0 },
+        { t: "person_tags", n: 0 },
+      ]),
+      success([
+        { t: "encounters", n: 0 },
+        { t: "followups", n: 0 },
+        { t: "roster_sources", n: 0 },
+        { t: "import_runs", n: 0 },
+        { t: "roster_entries", n: 0 },
+      ]),
+      success([{ t: "person_sources", n: 0 }]),
+    ]);
+    const status = await checkTargetEmpty({ database: "test-db", run });
+    expect(status.empty).toBe(true);
+  });
+
+  it("refuses a fully migrated target that already holds rows", async () => {
+    const run = fakeRun([
+      success([{ n: 11 }]),
+      success([
+        { t: "people", n: 3 },
+        { t: "tags", n: 0 },
+        { t: "person_contacts", n: 0 },
+        { t: "person_links", n: 0 },
+        { t: "person_tags", n: 0 },
+      ]),
+      success([
+        { t: "encounters", n: 0 },
+        { t: "followups", n: 0 },
+        { t: "roster_sources", n: 0 },
+        { t: "import_runs", n: 0 },
+        { t: "roster_entries", n: 0 },
+      ]),
+      success([{ t: "person_sources", n: 0 }]),
+    ]);
+    const status = await checkTargetEmpty({ database: "test-db", run });
+    expect(status.empty).toBe(false);
+    expect(status.occupied).toEqual([{ t: "people", n: 3 }]);
+  });
+
+  // The bug this guards against: some tables exist and already hold rows,
+  // and a later table was never created (a drill database left behind by a
+  // previous failed attempt is exactly this shape). The old guard read the
+  // resulting "no such table" as proof the whole target was empty. This must
+  // be refused, not treated as empty, so the error has to propagate.
+  it("propagates a countRows error rather than treating a partially migrated target as empty", async () => {
+    const run = fakeRun([
+      success([{ n: 5 }]),
+      success([
+        { t: "people", n: 3 },
+        { t: "tags", n: 0 },
+        { t: "person_contacts", n: 0 },
+        { t: "person_links", n: 0 },
+        { t: "person_tags", n: 0 },
+      ]),
+      failure("D1_ERROR: no such table: encounters: SQLITE_ERROR"),
+    ]);
+    await expect(checkTargetEmpty({ database: "test-db", run })).rejects.toThrow(/no such table/i);
   });
 });
