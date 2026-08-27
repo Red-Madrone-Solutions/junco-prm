@@ -3,6 +3,7 @@ import { ConfigError, configErrorResponse, loadConfig } from "./config";
 import { health } from "./health";
 import { logRequest, newRequestId } from "./log";
 import { mcpHandler } from "./mcp/transport";
+import { isDailyQuotaError, quotaErrorResponse } from "./quota";
 import { checkRateLimit, rateLimitedResponse } from "./ratelimit";
 
 export default {
@@ -66,7 +67,24 @@ export default {
       headers: new Headers([...request.headers, ["x-junco-request-id", requestId]]),
     });
 
+    // THE QUOTA FLOOR. Every binding this Worker touches lives behind this
+    // call, and Cloudflare's bindings throw when a daily allowance runs out.
+    // The throw happens inside workers-oauth-provider, on the KV read that
+    // validates every token, so without this catch the exception escapes the
+    // Worker and Cloudflare answers with its own "Error 1101: Worker threw
+    // exception, the site owner must fix the Worker script" page. That page is
+    // wrong in every part a reader would act on, and it hides the one fact
+    // that matters, which is that the allowance returns at midnight UTC.
+    //
+    // Only a daily allowance is translated. Anything else rethrows and keeps
+    // reaching Cloudflare as a genuine 1101, because a real fault reported as
+    // "try tomorrow" is worse than a real fault reported loudly.
     const provider = buildProvider(config, mcpHandler(config, requestId));
-    return finish(await provider.fetch(tagged, env, ctx));
+    try {
+      return finish(await provider.fetch(tagged, env, ctx));
+    } catch (e) {
+      if (isDailyQuotaError(e)) return finish(quotaErrorResponse(e, requestId, new Date()));
+      throw e;
+    }
   },
 };
