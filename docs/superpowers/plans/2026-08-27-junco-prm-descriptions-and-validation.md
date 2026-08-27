@@ -56,6 +56,25 @@ Found on 2026-08-27 while executing plan 1, at the same transport boundary this 
 
 **Why it is not a task in this plan.** This plan's scope is tool descriptions and argument validation. The fix belongs to whoever owns the transport, it needs its own test proving a `GET` returns 405 and that a `POST` still works, and it should not ride along inside a change to refusal semantics. It is listed here rather than in the deferred set because it is live, continuous, and currently the largest operational problem the project has.
 
+### A KV quota error escapes as an unhandled exception and a Cloudflare error page
+
+Observed live on 2026-08-27 at 22:05 UTC, once the account crossed its daily KV read ceiling:
+
+```
+"message": "KV get() limit exceeded for the day."
+"stack":   "at OAuthProviderImpl.handleApiRequest (index.js:10186:38)
+            at async OAuthProviderImpl.fetch (index.js:8988:24)"
+"outcome": "exception"
+```
+
+The caller received Cloudflare's `Error 1101: Worker threw exception`, HTTP 500, carrying a ray id and the sentence "the site owner must fix the Worker script."
+
+This project fails closed deliberately everywhere else, and keeps a closed set of seven error codes precisely so a client always receives something it can read and act on. A dependency being over quota is not in that set and is caught nowhere, so the single failure a free-plan deployment is most likely to meet is the one that produces a raw stack-trace page rather than anything this project wrote.
+
+The throw is inside `workers-oauth-provider`, so the fix is a boundary that catches it rather than a change to the library. The 405 guard shipped the same day removes the traffic that caused this particular exhaustion; it does not close the handling gap. Any future exhaustion, of KV or anything else, lands identically.
+
+Worth deciding rather than inheriting: whether an over-quota instance should answer 503 with a body naming the exhausted resource and the reset time, in the same shape `src/config.ts` already uses when a variable is missing. That precedent exists and is argued well in the spec. This is the same category of failure and should probably look the same to a caller.
+
 **Related, and separate.** The connector was registered as a user-level MCP server in `~/.claude.json`, so every Claude Code session on the machine, in any project, ran this loop. It was moved to project scope on 2026-08-27. That reduces how many sessions trigger it. It does not fix the loop.
 
 ## Global Constraints
