@@ -3,3 +3,7 @@ node_modules/
 .wrangler/
 dist/
 .DS_Store
+
+# Holds real Cloudflare resource ids for your own deployment.
+# Copy wrangler.example.jsonc to create it.
+wrangler.jsonc

@@ -1,0 +1,67 @@
+// TEMPLATE. Copy this to `wrangler.jsonc` and fill in the marked values:
+//
+//     cp wrangler.example.jsonc wrangler.jsonc
+//
+// `wrangler.jsonc` is gitignored on purpose. It ends up holding the ids of
+// real resources in your own Cloudflare account, and there is no reason for
+// those to reach a public repository. This file is the shape; that one is
+// your deployment.
+//
+// The two secrets are never written here or there. Both are set with
+// `wrangler secret put`, which prompts rather than taking the value as an
+// argument, so neither lands in shell history:
+//
+//     wrangler secret put GITHUB_CLIENT_ID       // from the GitHub OAuth App
+//     wrangler secret put GITHUB_CLIENT_SECRET   // from the GitHub OAuth App
+//     wrangler secret put COOKIE_ENCRYPTION_KEY  // openssl rand -hex 32
+//
+// The Worker refuses to serve anything but /health until all five values
+// below and above are present and valid. See src/config.ts.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "junco-prm",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // FILL IN `database_id` from the output of:  wrangler d1 create junco-prm
+  //
+  // `database_id` is the real identifier; `database_name` is a label. If the
+  // name is already taken in your account, create it under another name and
+  // change it in BOTH places it appears: `database_name` below, and the
+  // `wrangler d1 migrations apply <name> --remote` command in the runbook.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "junco-prm",
+      "database_id": "PASTE_D1_DATABASE_ID_HERE",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // FILL IN `id` from the output of:  wrangler kv namespace create OAUTH_KV
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "PASTE_KV_NAMESPACE_ID_HERE" }],
+
+  // No editing needed. 60/60s guards the OAuth and /health routes; 600/60s
+  // covers /mcp, where the owner's own tool traffic lives.
+  "ratelimits": [
+    { "name": "RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } },
+    { "name": "MCP_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } }
+  ],
+
+  // FILL IN both. These are plain variables rather than secrets, deliberately.
+  //
+  // OWNER_GITHUB_USER_ID is your NUMERIC GitHub user id, not your username.
+  // Resolve it with:  curl -s https://api.github.com/users/<username> | grep '"id"'
+  // It stays visible on purpose: when the instance refuses your own requests,
+  // the dashboard and the deploy output are where you check what it was set to.
+  //
+  // OWNER_TIMEZONE is an IANA zone, e.g. "America/Los_Angeles". A valid but
+  // WRONG zone passes every check and silently reports the wrong date on every
+  // tool call, so this is worth getting right rather than leaving as "UTC".
+  "vars": {
+    "OWNER_GITHUB_USER_ID": "PASTE_NUMERIC_GITHUB_USER_ID_HERE",
+    "OWNER_TIMEZONE": "PASTE_IANA_TIMEZONE_HERE"
+  }
+}
