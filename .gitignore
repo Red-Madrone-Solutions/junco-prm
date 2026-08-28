@@ -8,8 +8,6 @@ dist/
 # Copy wrangler.example.jsonc to create it.
 wrangler.jsonc
 
-# Draft, not ready to publish. Remove this line to track it.
-README.md
 
 # Multi-agent review transcripts. Working records, not published artifacts.
 agents/
