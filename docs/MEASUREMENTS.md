@@ -459,3 +459,59 @@ the `wrangler.jsonc` config entry was required and sufficient for
 limit, and the FTS reinsertion strategy in `restore.mjs` worked without a
 code change. The drill passed cleanly, was recorded, and both database and
 config entry were removed at the end.
+
+---
+
+## Run of 2026-08-27: argument validation deployed and exercised through a real client
+
+Plan 2's Task 8. Records what a live MCP client actually sends, which is the
+one thing the test suite cannot see: every test constructs its own arguments,
+so nothing in it could reveal a client injecting a field of its own.
+
+Deployed version `fbbc1e29-b09c-4247-8fa6-21558cabb85d`, rollback target
+`557b28b9-c8ea-44a9-b16d-f3896b41f690`, both recorded before deploying rather
+than after. A fresh archive was taken first: 1,074 rows, counts confirmed
+against the database.
+
+### The risk this run existed to settle
+
+Every tool schema has declared `additionalProperties: false` since it was
+written, and nothing enforced it until this deploy. If the Claude client added
+any field of its own to `arguments`, every call to that tool would have started
+failing the moment this shipped.
+
+**It does not.** A read-only call succeeded on the first attempt after the
+deploy, with validation live. That question is now answered by observation
+rather than by hope.
+
+### What was exercised
+
+| Call | Result |
+|---|---|
+| `list_roster_sources` | Succeeded. First probe after deploy |
+| `search_people` with `query` and `limit` | Succeeded |
+| `search_people` with `people_cursor` | Page advanced correctly, no overlap |
+| `create_person` with `idempotency_key` | Succeeded |
+| `add_contact` | Succeeded |
+| `log_encounter` omitting `occurred_on` | Succeeded, defaulted to 2026-08-27 |
+| `delete_person`, both phases | Confirmation returned, then deleted |
+
+The `log_encounter` result is worth keeping. `occurred_on` was `required` in
+its schema until Task 3 removed it, while the handler had always defaulted it.
+Omitting it now succeeds, and the date it chose was the owner's local date
+rather than the UTC one, which had already rolled over. Both the schema fix and
+`localDate`'s timezone handling survived the deploy.
+
+### One thing this run did NOT establish
+
+An attempt to send a null `label` to `add_contact` sent the string `"null"`
+instead, and the record came back holding that string. That is a defect in how
+the call was constructed, not in the tool. Nullability is covered by
+`tests/schema-drift.test.ts`, which asserts the stored value is null and was
+shown to fail when the handler coerces null to an empty string. The live path
+remains unexercised for that specific case.
+
+### Cleanup
+
+The throwaway person, its contact, and its encounter were deleted through
+`delete_person`'s two-phase confirmation. No smoke-test data remains.

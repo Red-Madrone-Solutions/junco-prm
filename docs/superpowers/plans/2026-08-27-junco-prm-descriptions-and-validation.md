@@ -289,8 +289,10 @@ describe("behaviours the schemas must be made to agree with", () => {
 
   it("log_encounter defaults occurred_on to today when omitted", async () => {
     const person = await createPerson(ctx, { full_name: "Ada" });
-    const result = await logEncounter(ctx, { person_id: person.id, summary: "met" } as never);
-    expect(result.occurred_on).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    // logEncounter returns { encounter, person }, not the encounter. Same
+    // shape as createFollowup below. Found by executing this task.
+    const { encounter } = await logEncounter(ctx, { person_id: person.id, summary: "met" } as never);
+    expect(encounter.occurred_on).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
 
   it("add_contact accepts a null label", async () => {
@@ -316,7 +318,7 @@ describe("behaviours the schemas must be made to agree with", () => {
 });
 ```
 
-Adapt the context construction to the surrounding files' conventions. Note `createFollowup` returns `{ followup, person }`, not a follow-up.
+Adapt the context construction to the surrounding files' conventions. Note that several write handlers return a wrapper rather than the record: `createFollowup` returns `{ followup, person }` and `logEncounter` returns `{ encounter, person }`. Check the return type of any handler you call here rather than assuming it hands back the thing it created.
 
 - [ ] **Step 2: Run them**
 
