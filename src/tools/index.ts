@@ -3,7 +3,13 @@ import { envelope } from "../context";
 import { addContact, addLink, addTags, removeContact, removeLink, removeTags } from "./attributes";
 import { deleteEncounter, listEncounters, logEncounter, updateEncounter } from "./encounters";
 import { exportData } from "./export";
-import { cancelFollowup, completeFollowup, createFollowup, listDue } from "./followups";
+import {
+  cancelFollowup,
+  completeFollowup,
+  createFollowup,
+  listDue,
+  updateFollowup,
+} from "./followups";
 import { finalizeImport, importRoster } from "./import";
 import {
   archivePerson,
@@ -469,6 +475,27 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       WRITE_IDEMPOTENT,
       obj({ followup_id: id("fu", "Follow-up") }, ["followup_id"], { idempotent: true }),
       cancelFollowup
+    ),
+    define(
+      "update_followup",
+      "Change an open follow-up's note or due date. Send note or due_on or both; " +
+        "send note as null to clear it. A completed or cancelled follow-up cannot be " +
+        "edited, because a closed follow-up is a record of what happened.",
+      // DESTRUCTIVE, not WRITE_IDEMPOTENT, for the same reason as update_person
+      // and update_encounter: it overwrites a note the user wrote and nothing
+      // retains the previous text. A client using these hints to decide what
+      // to run without asking would otherwise auto-approve destroying a note.
+      DESTRUCTIVE,
+      obj(
+        {
+          followup_id: id("fu", "Follow-up"),
+          note: nullableStr("Replaces the existing note. Null clears it."),
+          due_on: str("New due date, YYYY-MM-DD."),
+        },
+        ["followup_id"],
+        { idempotent: true }
+      ),
+      updateFollowup
     ),
     define(
       "import_roster",

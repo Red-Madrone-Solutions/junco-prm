@@ -18,7 +18,7 @@ export interface DueItem extends Followup {
 
 type FollowupRow = Omit<Followup, "record_kind">;
 
-const COLUMNS = "id, person_id, due_on, note, completed_at, cancelled_at";
+const COLUMNS = "id, person_id, due_on, note, completed_at, cancelled_at, created_at, updated_at";
 
 function requireLocalDate(value: unknown, field: string): string {
   if (!isLocalDate(value)) {
@@ -159,6 +159,85 @@ export function cancelFollowup(ctx: ToolContext, input: CloseFollowupInput): Pro
   return closeFollowup(ctx, input, "cancel_followup", "cancelled_at");
 }
 
+export interface UpdateFollowupInput {
+  followup_id: string;
+  note?: string | null;
+  due_on?: string;
+  idempotency_key?: string;
+}
+
+export async function updateFollowup(
+  ctx: ToolContext,
+  input: UpdateFollowupInput
+): Promise<Followup> {
+  const { idempotency_key, ...rest } = input;
+  return withIdempotency(
+    ctx,
+    "update_followup",
+    idempotency_key,
+    rest,
+    async () => {
+      const id = assertId("fu", input.followup_id);
+
+      // `note` may be explicitly null, which clears it, so presence is what
+      // matters rather than truthiness.
+      const setsNote = Object.prototype.hasOwnProperty.call(input, "note");
+      const setsDue = input.due_on !== undefined;
+      if (!setsNote && !setsDue) {
+        throw new ToolError(
+          "invalid_input",
+          "update_followup needs note, due_on, or both",
+          "call it again with the field you mean to change"
+        );
+      }
+      // The project's own date contract, not a regex. A regex accepts
+      // 2026-99-99, and createFollowup already refuses that.
+      if (setsDue) requireLocalDate(input.due_on as string, "due_on");
+
+      const sets: string[] = [];
+      const binds: (string | null)[] = [];
+      if (setsNote) {
+        sets.push("note = ?");
+        binds.push(input.note ?? null);
+      }
+      if (setsDue) {
+        sets.push("due_on = ?");
+        binds.push(input.due_on as string);
+      }
+      sets.push("updated_at = ?");
+      binds.push(nowIso(ctx.clock));
+
+      // Conditional on both closed columns in the same statement. A read then
+      // a write can race with a completion landing between them and would edit
+      // a closed record. Same guard closeFollowup uses, for the same reason.
+      const result = await ctx.db
+        .prepare(
+          `UPDATE followups SET ${sets.join(", ")}
+           WHERE id = ? AND completed_at IS NULL AND cancelled_at IS NULL`
+        )
+        .bind(...binds, id)
+        .run();
+
+      if (result.meta.changes === 0) {
+        const existing = await ctx.db
+          .prepare("SELECT id FROM followups WHERE id = ?")
+          .bind(id)
+          .first<{ id: string }>();
+        if (!existing) throw new ToolError("not_found", `no follow-up with id ${id}`);
+        throw new ToolError(
+          "conflict",
+          `follow-up ${id} is closed and cannot be edited`,
+          "a closed follow-up is a record of what happened; create a new one instead"
+        );
+      }
+
+      return loadFollowup(ctx, id);
+    },
+    undefined,
+    (followup) => followup.person_id
+  );
+}
+
 export interface ListDueInput {
   through?: string;
   limit?: number;
@@ -189,6 +268,7 @@ export async function listDue(
     .prepare(
       `SELECT f.id AS id, f.person_id AS person_id, f.due_on AS due_on, f.note AS note,
               f.completed_at AS completed_at, f.cancelled_at AS cancelled_at,
+              f.created_at AS created_at, f.updated_at AS updated_at,
               p.full_name AS person_name
        FROM followups f
        JOIN people p ON p.id = f.person_id

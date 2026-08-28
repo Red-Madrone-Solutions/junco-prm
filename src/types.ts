@@ -76,6 +76,8 @@ export interface Followup {
   note: string | null;
   completed_at: string | null;
   cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface PersonDetail extends Person {

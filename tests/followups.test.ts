@@ -8,6 +8,7 @@ import {
   completeFollowup,
   listDue,
   createFollowup,
+  updateFollowup,
 } from "../src/tools/followups";
 import { createPerson, getPerson } from "../src/tools/people";
 
@@ -152,6 +153,102 @@ describe("listDue", () => {
     } while (cursor !== undefined);
 
     expect(seen).toEqual(expected);
+  });
+});
+
+describe("updateFollowup", () => {
+  // A MUTABLE clock for this describe block only. The rest of this file pins
+  // one instant per test via `now`/beforeEach above, which cannot exercise a
+  // change to `updated_at` across elapsed time. A frozen clock has hidden
+  // three live defects in this project already (see
+  // tests/idempotency-retention.test.ts), so this block advances `now`
+  // directly rather than adding a second, weaker convention.
+  const clock = {
+    advance(ms: number) {
+      now = new Date(now.getTime() + ms);
+    },
+  };
+
+  let p: string;
+
+  beforeEach(async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    p = person.id;
+  });
+
+  it("changes the note and leaves the due date alone", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "first" });
+    const updated = await updateFollowup(ctx, { followup_id: fu.id, note: "first, and the LinkedIn message" });
+    expect(updated.note).toBe("first, and the LinkedIn message");
+    expect(updated.due_on).toBe("2026-09-09");
+  });
+
+  it("changes the due date and leaves the note alone", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "keep me" });
+    const updated = await updateFollowup(ctx, { followup_id: fu.id, due_on: "2026-10-01" });
+    expect(updated.due_on).toBe("2026-10-01");
+    expect(updated.note).toBe("keep me");
+  });
+
+  it("clears the note when null is sent, which is different from omitting it", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09", note: "temporary" });
+    const updated = await updateFollowup(ctx, { followup_id: fu.id, note: null });
+    expect(updated.note).toBeNull();
+  });
+
+  // Without this a caller can spend a write, an idempotency key, and a round
+  // trip to change nothing, and be told it worked.
+  it("refuses a call that supplies neither field", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    await expect(updateFollowup(ctx, { followup_id: fu.id })).rejects.toMatchObject({
+      code: "invalid_input",
+    });
+  });
+
+  it("refuses a due date that is not YYYY-MM-DD", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    await expect(
+      updateFollowup(ctx, { followup_id: fu.id, due_on: "next Tuesday" })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  // A YYYY-MM-DD regex accepts 2026-99-99. The project already has a date
+  // contract; use it rather than inventing a weaker one.
+  it("refuses a well-shaped but impossible date", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    await expect(
+      updateFollowup(ctx, { followup_id: fu.id, due_on: "2026-99-99" })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("refuses to edit a completed follow-up", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    await completeFollowup(ctx, { followup_id: fu.id });
+    await expect(
+      updateFollowup(ctx, { followup_id: fu.id, note: "too late" })
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("refuses to edit a cancelled follow-up", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    await cancelFollowup(ctx, { followup_id: fu.id });
+    await expect(
+      updateFollowup(ctx, { followup_id: fu.id, note: "too late" })
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("reports not_found for an id that does not exist", async () => {
+    await expect(
+      updateFollowup(ctx, { followup_id: "fu_00000000-0000-0000-0000-000000000000", note: "x" })
+    ).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("moves updated_at", async () => {
+    const { followup: fu } = await createFollowup(ctx, { person_id: p, due_on: "2026-09-09" });
+    clock.advance(60_000);
+    const updated = await updateFollowup(ctx, { followup_id: fu.id, note: "later" });
+    // Requires Step 3's addition of updated_at to the Followup shape.
+    expect(updated.updated_at).not.toBe(fu.updated_at);
   });
 });
 

@@ -12,9 +12,11 @@ const ctx: ToolContext = {
 };
 
 /**
- * All 28, sorted. The spec counts its own surface and so does this list: the
+ * All 29, sorted. The spec counts its own surface and so does this list: the
  * previous draft's registry had 26, carrying `set_tags` where the spec has
- * `add_tags` and `remove_tags`, and no `get_roster_entry` at all.
+ * `add_tags` and `remove_tags`, and no `get_roster_entry` at all. Task 1 of
+ * the read-surface plan added `update_followup`, bringing the count from 28
+ * to 29.
  */
 const EXPECTED = [
   "add_contact",
@@ -44,6 +46,7 @@ const EXPECTED = [
   "search_people",
   "unarchive_person",
   "update_encounter",
+  "update_followup",
   "update_person",
 ];
 
@@ -52,8 +55,8 @@ describe("tool registry", () => {
     expect(Object.keys(TOOLS).sort()).toEqual(EXPECTED);
   });
 
-  it("has 28 of them, which is the number the spec states", () => {
-    expect(Object.keys(TOOLS)).toHaveLength(28);
+  it("has 29 of them, after task 1's update_followup", () => {
+    expect(Object.keys(TOOLS)).toHaveLength(29);
   });
 
   it("carries no tool name the fifth spec revision renamed away", () => {
@@ -155,6 +158,7 @@ describe("tool registry", () => {
       "remove_link",
       "remove_tags",
       "update_encounter",
+      "update_followup",
       "update_person",
     ]);
   });

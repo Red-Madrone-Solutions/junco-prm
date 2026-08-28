@@ -3,7 +3,7 @@ import type { Followup } from "../types";
 
 export type { Followup } from "../types";
 
-const COLUMNS = "id, person_id, due_on, note, completed_at, cancelled_at";
+const COLUMNS = "id, person_id, due_on, note, completed_at, cancelled_at, created_at, updated_at";
 
 export function toFollowup(row: Omit<Followup, "record_kind">): Followup {
   return { record_kind: "followup", ...row };
