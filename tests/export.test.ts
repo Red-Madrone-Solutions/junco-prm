@@ -5,7 +5,7 @@ import { ToolError } from "../src/errors";
 import { addContact, addLink, addTags } from "../src/tools/attributes";
 import { logEncounter } from "../src/tools/encounters";
 import { listRecords } from "../src/tools/export";
-import { createFollowup } from "../src/tools/followups";
+import { createFollowup, listDue } from "../src/tools/followups";
 import { TOOLS } from "../src/tools/index";
 import { archivePerson, createPerson } from "../src/tools/people";
 import { encodeCursor } from "../src/paginate";
@@ -192,6 +192,43 @@ describe("listRecords", () => {
       throw new Error("expected a refusal");
     } catch (e) {
       expect((e as ToolError).code).toBe("invalid_id");
+    }
+  });
+
+  // list_due's cursor shape is {due_on, id}, and its id genuinely carries the
+  // "fu" prefix list_records({scope: "followups"}) expects - so the id-prefix
+  // check alone lets it through. Without a kind discriminator this pages
+  // id-order from an arbitrary point instead of being refused.
+  it("rejects a list_due cursor replayed into list_records({scope: \"followups\"})", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await createFollowup(ctx, { person_id: person.id, due_on: "2026-09-01" });
+    await createFollowup(ctx, { person_id: person.id, due_on: "2026-09-02" });
+    const due = await listDue(ctx, { through: "2026-09-02", limit: 1 });
+    expect(due.next_cursor).not.toBeNull();
+    try {
+      await listRecords(ctx, { scope: "followups", cursor: due.next_cursor ?? undefined });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("invalid_input");
+    }
+  });
+
+  // A delta cursor's keyset is (updated_at, id); replaying it into a plain
+  // (non-delta) call drops the updated_at half and silently pages id-order
+  // from wherever that id lands, skipping every record whose id sorts below
+  // it. The id prefix still matches its own scope, so only a kind
+  // discriminator catches this.
+  it("rejects a delta cursor replayed into list_records without updated_after", async () => {
+    await createPerson(ctx, { full_name: "P0" });
+    await createPerson(ctx, { full_name: "P1" });
+    const watermark = new Date(clock.now().getTime() - 1000).toISOString();
+    const delta = await listRecords(ctx, { scope: "people", updated_after: watermark, limit: 1 });
+    expect(delta.next_cursor).not.toBeNull();
+    try {
+      await listRecords(ctx, { scope: "people", cursor: delta.next_cursor ?? undefined });
+      throw new Error("expected a refusal");
+    } catch (e) {
+      expect((e as ToolError).code).toBe("invalid_input");
     }
   });
 });

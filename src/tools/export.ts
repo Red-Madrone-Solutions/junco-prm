@@ -331,6 +331,20 @@ async function loadRelations(
 }
 
 /**
+ * The `kind` this tool stamps into every cursor it issues, discriminating
+ * both scope and mode (plain vs. delta). Three other read tools mint cursors
+ * shaped exactly like this one's - `{id}` or `{updated_at, id}` - and without
+ * a kind discriminator their tokens decode cleanly here and pass every other
+ * check: a list_due cursor's `id` genuinely has the "fu" prefix
+ * list_records({scope: "followups"}) expects, and a delta cursor's `id`
+ * genuinely has the right prefix for its own scope too. Only the kind tells
+ * these apart from a token this tool actually issued for this exact call.
+ */
+function cursorKind(scope: ListScope, delta: boolean): string {
+  return delta ? `records:${scope}:delta` : `records:${scope}`;
+}
+
+/**
  * `decodeCursor` only guarantees the token decodes to a plain object - it does
  * not know this tool's keyset is a bare `id`, or `(updated_at, id)` once a
  * delta is in play. Without this check a cursor that decodes fine but carries
@@ -342,6 +356,13 @@ async function loadRelations(
  * cursor, so a cursor missing `updated_at` here means it was issued by a
  * plain (non-delta) page and is being replayed into the wrong mode, which is
  * refused the same way a foreign-scope cursor is.
+ *
+ * The id-prefix check (`assertId`) runs BEFORE the `kind` check on purpose:
+ * a cursor whose id belongs to a different scope's table is a different,
+ * older failure (`invalid_id`, exercised by the test above this function's
+ * call site) than a cursor whose id is table-correct but was issued by a
+ * different tool or mode (`invalid_input`, the kind mismatch below). Checking
+ * kind first would mask the id-prefix failure behind the more general one.
  */
 function decodeListCursor(
   scope: ListScope,
@@ -350,7 +371,7 @@ function decodeListCursor(
 ): { id: string; updated_at?: string } | null {
   const decoded = decodeCursor(cursor);
   if (decoded === null) return null;
-  const { id, updated_at } = decoded as { id?: string; updated_at?: string };
+  const { id, updated_at, kind } = decoded as { id?: string; updated_at?: string; kind?: string };
   if (typeof id !== "string" || (requireUpdatedAt && typeof updated_at !== "string")) {
     throw new ToolError(
       "invalid_input",
@@ -358,7 +379,15 @@ function decodeListCursor(
       "call list_records again without a cursor to start from the first page"
     );
   }
-  return { id: assertId(ID_PREFIX[scope], id), updated_at };
+  const validatedId = assertId(ID_PREFIX[scope], id);
+  if (kind !== cursorKind(scope, requireUpdatedAt)) {
+    throw new ToolError(
+      "invalid_input",
+      "cursor is not a token this tool issued for this scope and mode",
+      "call list_records again without a cursor to start from the first page"
+    );
+  }
+  return { id: validatedId, updated_at };
 }
 
 export async function listRecords(
@@ -410,8 +439,12 @@ export async function listRecords(
     results.length > limit && last !== undefined
       ? encodeCursor(
           updatedAfter !== null
-            ? { id: String(last["id"]), updated_at: String(last["updated_at"]) }
-            : { id: String(last["id"]) }
+            ? {
+                kind: cursorKind(scope, true),
+                id: String(last["id"]),
+                updated_at: String(last["updated_at"]),
+              }
+            : { kind: cursorKind(scope, false), id: String(last["id"]) }
         )
       : null;
 
