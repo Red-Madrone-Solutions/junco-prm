@@ -41,7 +41,7 @@ describe("the defect: unknown arguments are dropped", () => {
   });
 
   it("refuses an unknown argument on a write without writing", async () => {
-    const spy = vi.spyOn(TOOLS.create_person, "run");
+    const spy = vi.spyOn(TOOLS.create_person!, "run");
     const before = await countPeople();
     const { isError } = await callTool("create_person", {
       full_name: "Ada Lovelace",
