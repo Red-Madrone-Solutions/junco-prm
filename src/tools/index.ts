@@ -2,7 +2,7 @@ import type { ToolContext } from "../context";
 import { envelope } from "../context";
 import { addContact, addLink, addTags, removeContact, removeLink, removeTags } from "./attributes";
 import { deleteEncounter, listEncounters, logEncounter, updateEncounter } from "./encounters";
-import { exportData } from "./export";
+import { listRecords } from "./export";
 import {
   cancelFollowup,
   completeFollowup,
@@ -139,9 +139,10 @@ const personFields = {
  * will index this map by a tool name that arrives over the wire. As a plain
  * object, `TOOLS["toString"]` resolves up the prototype chain to a function,
  * and any `=== undefined` guard on the lookup passes. The same shape was a live
- * defect in `export.ts`'s QUERIES: `export_data({scope: "toString"})` fed
- * `Function.prototype.toString`'s source text into the SQL and returned a raw
- * D1 error carrying no `code`. `Object.keys` and `for...in` are unaffected.
+ * defect in `export.ts`'s QUERIES: `list_records({scope: "toString"})` (then
+ * still named `export_data`) fed `Function.prototype.toString`'s source text
+ * into the SQL and returned a raw D1 error carrying no `code`. `Object.keys`
+ * and `for...in` are unaffected.
  */
 export const TOOLS: Record<string, ToolDefinition> = Object.assign(
   Object.create(null),
@@ -246,13 +247,16 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       getRosterEntry
     ),
     define(
-      "export_data",
-      "Return durable records a page at a time. For reading data back inside a conversation; " +
-        "it is not the backup.",
+      "list_records",
+      "List durable records a page at a time, filtered by scope. Use this to read back what is " +
+        "in Junco: all people, all encounters, or all open follow-ups. For one person with their " +
+        "tags, links, and contacts, use get_person. This is not the backup; backup and restore " +
+        "are run from the command line and are documented in docs/BACKUP.md.",
       READ,
       obj(
         {
           scope: enumOf(["people", "encounters", "followups"], "Which records to return."),
+          archived: bool("Include archived people. People scope only. Defaults to false."),
           // export.ts's own MAX_LIMIT is 500, not 200 - clampLimit there throws
           // limit_exceeded above it. The description states the real ceiling
           // rather than the plan's draft figure, since a client reads this
@@ -262,7 +266,7 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         },
         []
       ),
-      exportData
+      listRecords
     ),
 
     // --------------------------------------------------------------- writes

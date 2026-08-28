@@ -30,13 +30,13 @@ const EXPECTED = [
   "create_person",
   "delete_encounter",
   "delete_person",
-  "export_data",
   "finalize_import",
   "get_person",
   "get_roster_entry",
   "import_roster",
   "list_due",
   "list_encounters",
+  "list_records",
   "list_roster_sources",
   "log_encounter",
   "promote_roster_entry",
@@ -105,7 +105,7 @@ describe("tool registry", () => {
     // report.
     const writes = EXPECTED.filter(
       (name) => !name.startsWith("list_") && !name.startsWith("search_") &&
-        name !== "get_person" && name !== "export_data" && name !== "get_roster_entry"
+        name !== "get_person" && name !== "list_records" && name !== "get_roster_entry"
     );
     for (const name of writes) {
       const tool = TOOLS[name];
@@ -130,11 +130,11 @@ describe("tool registry", () => {
       .map((t) => t.name)
       .sort();
     expect(readOnly).toEqual([
-      "export_data",
       "get_person",
       "get_roster_entry",
       "list_due",
       "list_encounters",
+      "list_records",
       "list_roster_sources",
       "search_people",
       "search_roster_entries",
@@ -322,8 +322,9 @@ describe("tool registry", () => {
     // Plan 2's transport will index this map by a name that arrives over the
     // wire. As a plain object literal, TOOLS["toString"] is a function and any
     // `=== undefined` guard on the lookup passes. The same shape was a live
-    // defect in export.ts: `export_data({scope: "toString"})` concatenated
-    // Function.prototype.toString's source into the SQL.
+    // defect in export.ts: `list_records({scope: "toString"})` (then still
+    // named `export_data`) concatenated Function.prototype.toString's source
+    // into the SQL.
     for (const inherited of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
       expect(TOOLS[inherited], `TOOLS resolved ${inherited}`).toBeUndefined();
     }

@@ -29,7 +29,7 @@ export function toEncounter(row: EncounterRow): Encounter {
  * The keyset this list pages on, encoded with the SHARED cursor helpers in
  * `src/paginate.ts` rather than a local `date|id` string.
  *
- * The previous draft rolled its own here, and a second one in `exportData`, and
+ * The previous draft rolled its own here, and a second one in `listRecords`, and
  * a third convention in `searchPeople`. Three encodings of the same idea is how
  * one of them ends up parsed by a caller who noticed the format was readable.
  * These helpers only name the fields; the encoding is not theirs to choose.

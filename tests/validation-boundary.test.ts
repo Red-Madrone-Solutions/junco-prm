@@ -65,7 +65,7 @@ describe("the defect: unknown arguments are dropped", () => {
 
 describe("refusals that already work, and must keep working", () => {
   // These pass BEFORE the validator exists, because the handlers validate
-  // internally: search.ts:198 for query type, export.ts:83 for the scope enum.
+  // internally: search.ts:198 for query type, export.ts:85 for the scope enum.
   // They are here as regression guards, not as reproductions of the defect.
   it("refuses a wrong-typed query", async () => {
     const { payload } = await callTool("search_people", { query: 42 });
@@ -73,7 +73,7 @@ describe("refusals that already work, and must keep working", () => {
   });
 
   it("refuses a scope outside the enum", async () => {
-    const { payload } = await callTool("export_data", { scope: "toString" });
+    const { payload } = await callTool("list_records", { scope: "toString" });
     expect(payload.error.code).toBe("invalid_input");
   });
 
@@ -99,7 +99,7 @@ describe("calls that must keep succeeding", () => {
   });
 
   it("accepts a valid call that omits every optional argument", async () => {
-    const { isError } = await callTool("export_data", {});
+    const { isError } = await callTool("list_records", {});
     expect(isError).toBe(false);
   });
 
