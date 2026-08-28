@@ -16,10 +16,11 @@ export interface EncounterRow {
   event: string | null;
   summary: string;
   created_at: string;
+  updated_at: string;
 }
 
 export const COLUMNS =
-  "id, person_id, occurred_on, occurred_at, location, event, summary, created_at";
+  "id, person_id, occurred_on, occurred_at, location, event, summary, created_at, updated_at";
 
 export function toEncounter(row: EncounterRow): Encounter {
   return { record_kind: "encounter", ...row };

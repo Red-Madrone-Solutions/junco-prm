@@ -10,13 +10,34 @@ import { TOOLS } from "../src/tools/index";
 import { archivePerson, createPerson } from "../src/tools/people";
 import { encodeCursor } from "../src/paginate";
 
+// A MUTABLE clock. A frozen instant makes every updated_after boundary test
+// pass whether or not the filter actually compares against it.
+// Milliseconds are non-zero on purpose: truncating a watermark to whole
+// seconds must move it strictly backward for the truncation test below to
+// mean anything. A round-second start makes that truncation a no-op.
+let now = new Date("2026-08-20T12:00:00.250Z");
 const ctx: ToolContext = {
   db: env.DB,
   timezone: "UTC",
-  clock: () => new Date("2026-08-20T12:00:00Z"),
+  clock: () => now,
+};
+const clock = {
+  advance(ms: number) {
+    now = new Date(now.getTime() + ms);
+  },
+  now: () => now,
 };
 
+async function readUpdatedAt(personId: string): Promise<string> {
+  const row = await env.DB.prepare("SELECT updated_at FROM people WHERE id = ?")
+    .bind(personId)
+    .first<{ updated_at: string }>();
+  if (!row) throw new Error(`no person ${personId}`);
+  return row.updated_at;
+}
+
 beforeEach(async () => {
+  now = new Date("2026-08-20T12:00:00.250Z");
   await env.DB.prepare("DELETE FROM people").run();
 });
 
@@ -251,4 +272,106 @@ describe("list_records include", () => {
   // is active is deferred to Task 8, which is where the tags filter itself
   // lands. It is not written here per the controller ruling recorded in the
   // run ledger for this task.
+});
+
+describe("updated_after", () => {
+  // Task 2 exists for this test. Without the bump it returns nothing and
+  // reports that nothing changed, which is the exact check `include` was added
+  // to serve.
+  it("sees a tag added after the watermark", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    clock.advance(60_000);
+    const watermark = clock.now().toISOString();
+    clock.advance(60_000);
+    await addTags(ctx, { person_id: person.id, tags: ["speaker"] });
+
+    const result = await listRecords(ctx, { scope: "people", updated_after: watermark });
+    expect(result.records.map((r) => (r as { id: string }).id)).toContain(person.id);
+  });
+
+  it("excludes a record updated exactly at the watermark", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const at = await readUpdatedAt(person.id);
+    const result = await listRecords(ctx, { scope: "people", updated_after: at });
+    expect(result.records.map((r) => (r as { id: string }).id)).not.toContain(person.id);
+  });
+
+  // The silent one. updated_at is TEXT compared lexicographically, and
+  // isIsoInstant makes milliseconds optional. A caller sending
+  // 2026-08-27T12:00:00Z against a stored 2026-08-27T12:00:00.500Z compares
+  // "Z" (0x5A) with "." (0x2E), so the stored value sorts LOWER and vanishes.
+  // Every record updated in the same second as the watermark disappears from
+  // the delta, on every iteration of a watermark loop.
+  it("finds a record updated in the same second as a watermark with no milliseconds", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const stored = await readUpdatedAt(person.id); // ends .sssZ
+    const truncated = stored.replace(/\.\d+Z$/, "Z");
+    // Truncating moves the watermark BACKWARD, so the record must be included.
+    const result = await listRecords(ctx, { scope: "people", updated_after: truncated });
+    expect(result.records.map((r) => (r as { id: string }).id)).toContain(person.id);
+  });
+
+  it("refuses a timestamp it cannot parse", async () => {
+    await expect(
+      listRecords(ctx, { scope: "people", updated_after: "last Tuesday" })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("applies to encounters and follow-ups too", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const watermark = clock.now().toISOString();
+    clock.advance(60_000);
+    await logEncounter(ctx, { person_id: person.id, occurred_on: "2026-08-27", summary: "met" });
+    const result = await listRecords(ctx, { scope: "encounters", updated_after: watermark });
+    expect(result.records).toHaveLength(1);
+  });
+
+  it("returns every record when more than one page shares a timestamp", async () => {
+    // The clock does not advance, so all five share an instant.
+    const made = [];
+    for (let i = 0; i < 5; i++) made.push(await createPerson(ctx, { full_name: `P${i}` }));
+    const watermark = new Date(clock.now().getTime() - 1000).toISOString();
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page++) {
+      const r = await listRecords(ctx, { scope: "people", updated_after: watermark, limit: 2, cursor });
+      r.records.forEach((x) => seen.add((x as { id: string }).id));
+      if (!r.next_cursor) break;
+      cursor = r.next_cursor;
+    }
+    expect(seen.size).toBe(made.length);
+  });
+
+  it("does not return the same record twice across pages", async () => {
+    for (let i = 0; i < 4; i++) await createPerson(ctx, { full_name: `Q${i}` });
+    const watermark = new Date(clock.now().getTime() - 1000).toISOString();
+    const first = await listRecords(ctx, { scope: "people", updated_after: watermark, limit: 2 });
+    const second = await listRecords(ctx, {
+      scope: "people",
+      updated_after: watermark,
+      limit: 2,
+      cursor: first.next_cursor ?? undefined,
+    });
+    const ids = [...first.records, ...second.records].map((r) => (r as { id: string }).id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  // Date.parse accepts "2026-08-27", "08/27/2026", and "1". The project has an
+  // ISO-instant contract; use it rather than accepting whatever parses.
+  it("refuses a date with no time, which Date.parse would otherwise accept", async () => {
+    await expect(
+      listRecords(ctx, { scope: "people", updated_after: "2026-08-27" })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  // The first draft's test was named for encounters and follow-ups and
+  // exercised only encounters, leaving the follow-up path unguarded.
+  it("applies to follow-ups", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const watermark = clock.now().toISOString();
+    clock.advance(60_000);
+    await createFollowup(ctx, { person_id: person.id, due_on: "2026-09-09" });
+    const result = await listRecords(ctx, { scope: "followups", updated_after: watermark });
+    expect(result.records).toHaveLength(1);
+  });
 });

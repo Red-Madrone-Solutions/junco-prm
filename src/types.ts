@@ -66,6 +66,7 @@ export interface Encounter {
   event: string | null;
   summary: string;
   created_at: string;
+  updated_at: string;
 }
 
 export interface Followup {

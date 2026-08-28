@@ -2,6 +2,8 @@ import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { assertId } from "../ids";
 import { clampLimit, decodeCursor, encodeCursor } from "../paginate";
+import { isIsoInstant } from "../time";
+import { COLUMNS as ENCOUNTER_COLUMNS } from "./encounters_read";
 
 /**
  * The allowlist, and the only thing `scope` is ever checked against. Kept as an
@@ -44,9 +46,8 @@ const QUERIES: Record<ListScope, string> = Object.assign(Object.create(null), {
   people: `SELECT id, full_name, preferred_name, job_title, organization, notes,
                   archived_at, created_at, updated_at
            FROM people`,
-  encounters: `SELECT id, person_id, occurred_on, occurred_at, location, event, summary, created_at
-               FROM encounters`,
-  followups: `SELECT id, person_id, due_on, note, completed_at, cancelled_at, created_at
+  encounters: `SELECT ${ENCOUNTER_COLUMNS} FROM encounters`,
+  followups: `SELECT id, person_id, due_on, note, completed_at, cancelled_at, created_at, updated_at
               FROM followups`,
 });
 
@@ -63,9 +64,49 @@ const ID_PREFIX: Record<ListScope, "p" | "enc" | "fu"> = Object.assign(Object.cr
 export interface ListRecordsInput {
   scope?: ListScope;
   archived?: boolean;
+  updated_after?: string;
   limit?: number;
   cursor?: string;
   include?: string[];
+}
+
+/**
+ * Canonicalize before comparing. updated_at is TEXT and SQLite compares it
+ * lexicographically, which is correct between two stored values and wrong
+ * against caller input: `isIsoInstant` accepts a timestamp with no
+ * milliseconds, and "Z" sorts above ".", so a truncated watermark silently
+ * excludes every record written in that same second.
+ *
+ * THE KEYSET IS (updated_at, id), NOT updated_at ALONE. Exclusivity on a
+ * timestamp by itself loses records: if more rows share an instant than fit in
+ * a page, advancing the watermark past that instant drops the remainder
+ * permanently. The comparison is
+ *   WHERE (updated_at > ?) OR (updated_at = ? AND id > ?)
+ * which excludes exactly the last row returned rather than every row sharing
+ * its timestamp, and the cursor carries both halves.
+ *
+ * Validate against isIsoInstant before canonicalizing. Date.parse alone
+ * accepts "2026-08-27", "08/27/2026", and "1".
+ *
+ * Exclusive, which is what a watermark loop wants: a caller records the
+ * newest updated_at it saw and passes it back, and must not be handed the
+ * same record again.
+ */
+function canonicalInstant(value: string): string {
+  if (!isIsoInstant(value)) {
+    throw new ToolError(
+      "invalid_input",
+      "updated_after must be an ISO 8601 instant, for example 2026-08-27T12:00:00.000Z"
+    );
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    throw new ToolError(
+      "invalid_input",
+      "updated_after must be an ISO 8601 instant, for example 2026-08-27T12:00:00.000Z"
+    );
+  }
+  return new Date(parsed).toISOString();
 }
 
 /**
@@ -80,12 +121,18 @@ export interface ListRecordsInput {
  * Binding the filter's own values, never the ids that satisfy it, is what
  * keeps this off D1's 100 parameter ceiling: this binds one value per filter,
  * not one value per matched person.
+ *
+ * `updatedAfter`, once canonicalized by the caller, is the entry point for the
+ * delta filter and its keyset: it lands in this one predicate, so the main
+ * page query and every relation subquery in `loadRelations` pick it up
+ * automatically, with no second place to apply it.
  */
 function buildPagePredicate(
   scope: ListScope,
   input: ListRecordsInput,
-  after: { id: string } | null,
-  probeLimit: number
+  after: { id: string; updated_at?: string } | null,
+  probeLimit: number,
+  updatedAfter: string | null
 ): { sql: string; binds: unknown[] } {
   // `archived` only means anything for the people scope: encounters and
   // follow-ups carry no archived_at of their own. Excluding archived people by
@@ -97,13 +144,27 @@ function buildPagePredicate(
   if (scope === "people" && input.archived !== true) {
     filters.push("archived_at IS NULL");
   }
+  if (updatedAfter !== null) {
+    filters.push("updated_at > ?");
+    binds.push(updatedAfter);
+  }
   if (after !== null) {
-    filters.push("id > ?");
-    binds.push(after.id);
+    if (updatedAfter !== null) {
+      // The keyset for a delta page: strictly later timestamps, or the same
+      // timestamp further along in id order. `decodeListCursor` guarantees
+      // `after.updated_at` is present whenever `updatedAfter` is, so this
+      // never binds `undefined`.
+      filters.push("(updated_at > ? OR (updated_at = ? AND id > ?))");
+      binds.push(after.updated_at, after.updated_at, after.id);
+    } else {
+      filters.push("id > ?");
+      binds.push(after.id);
+    }
   }
   const clause = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
   binds.push(probeLimit);
-  return { sql: `SELECT id FROM ${scope} ${clause} ORDER BY id ASC LIMIT ?`, binds };
+  const orderBy = updatedAfter !== null ? "updated_at ASC, id ASC" : "id ASC";
+  return { sql: `SELECT id FROM ${scope} ${clause} ORDER BY ${orderBy} LIMIT ?`, binds };
 }
 
 /**
@@ -209,22 +270,33 @@ async function loadRelations(
 
 /**
  * `decodeCursor` only guarantees the token decodes to a plain object - it does
- * not know this tool's keyset is a bare `id`. Without this check a cursor that
- * decodes fine but carries no `id` field (or one of the wrong type) would bind
- * `undefined` into the query below instead of being refused up front.
+ * not know this tool's keyset is a bare `id`, or `(updated_at, id)` once a
+ * delta is in play. Without this check a cursor that decodes fine but carries
+ * no `id` field (or one of the wrong type) would bind `undefined` into the
+ * query below instead of being refused up front.
+ *
+ * `requireUpdatedAt` is true exactly when the current call passed
+ * `updated_after`: the keyset for a delta page needs both halves of the
+ * cursor, so a cursor missing `updated_at` here means it was issued by a
+ * plain (non-delta) page and is being replayed into the wrong mode, which is
+ * refused the same way a foreign-scope cursor is.
  */
-function decodeListCursor(scope: ListScope, cursor: string | undefined): { id: string } | null {
+function decodeListCursor(
+  scope: ListScope,
+  cursor: string | undefined,
+  requireUpdatedAt: boolean
+): { id: string; updated_at?: string } | null {
   const decoded = decodeCursor(cursor);
   if (decoded === null) return null;
-  const { id } = decoded as { id?: string };
-  if (typeof id !== "string") {
+  const { id, updated_at } = decoded as { id?: string; updated_at?: string };
+  if (typeof id !== "string" || (requireUpdatedAt && typeof updated_at !== "string")) {
     throw new ToolError(
       "invalid_input",
       "cursor is not a token this tool issued",
       "call list_records again without a cursor to start from the first page"
     );
   }
-  return { id: assertId(ID_PREFIX[scope], id) };
+  return { id: assertId(ID_PREFIX[scope], id), updated_at };
 }
 
 export async function listRecords(
@@ -247,16 +319,19 @@ export async function listRecords(
 
   const include = validateInclude(scope, input.include);
 
+  const updatedAfter = input.updated_after !== undefined ? canonicalInstant(input.updated_after) : null;
+
   const limit = clampLimit(input.limit, DEFAULT_LIMIT, include.length > 0 ? INCLUDE_MAX_LIMIT : MAX_LIMIT);
 
-  const after = decodeListCursor(scope, input.cursor);
+  const after = decodeListCursor(scope, input.cursor, updatedAfter !== null);
 
   // One extra row over `limit` is how "is there a next page" is answered
   // without a second COUNT query.
-  const predicate = buildPagePredicate(scope, input, after, limit + 1);
+  const predicate = buildPagePredicate(scope, input, after, limit + 1, updatedAfter);
 
+  const orderBy = updatedAfter !== null ? "updated_at ASC, id ASC" : "id ASC";
   const { results } = await ctx.db
-    .prepare(`${base} WHERE id IN (${predicate.sql}) ORDER BY id ASC`)
+    .prepare(`${base} WHERE id IN (${predicate.sql}) ORDER BY ${orderBy}`)
     .bind(...predicate.binds)
     .all<Record<string, unknown>>();
 
@@ -264,7 +339,11 @@ export async function listRecords(
   const last = page[page.length - 1];
   const next =
     results.length > limit && last !== undefined
-      ? encodeCursor({ id: String(last["id"]) })
+      ? encodeCursor(
+          updatedAfter !== null
+            ? { id: String(last["id"]), updated_at: String(last["updated_at"]) }
+            : { id: String(last["id"]) }
+        )
       : null;
 
   let records: unknown[] = page;

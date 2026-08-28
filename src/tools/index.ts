@@ -257,6 +257,11 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         {
           scope: enumOf(["people", "encounters", "followups"], "Which records to return."),
           archived: bool("Include archived people. People scope only. Defaults to false."),
+          updated_after: str(
+            "ISO instant. Returns only records updated strictly after it, so a watermark can be " +
+              "passed straight back. Deletions are not reported: a deleted record is simply absent " +
+              "from a full listing."
+          ),
           // export.ts's own MAX_LIMIT is 500, not 200 - clampLimit there throws
           // limit_exceeded above it. The description states the real ceiling
           // rather than the plan's draft figure, since a client reads this
