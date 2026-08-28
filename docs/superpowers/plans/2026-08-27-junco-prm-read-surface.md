@@ -4,7 +4,7 @@
 
 **Goal:** Make routine questions cost one call rather than one per record, let a roster row be matched back to its source, and let a follow-up be corrected without falsifying its history.
 
-**Architecture:** One organizing rule, applied throughout: search is for text, list is for filters. `search_people` splits so each search tool returns one array and pages with one plainly named `cursor`. `export_data` becomes `list_records` and gains `include`, `updated_after`, `tags`, and `archived`. Two new list tools and one new write tool. One migration, adding indexes only.
+**Architecture:** One organizing rule, applied throughout: search is for text, list is for filters. `search_people` splits so each search tool returns one array and pages with one plainly named `cursor`. `export_data` becomes `list_records` and gains `include`, `updated_after`, `tags`, and `archived`. Two new list tools and one new write tool. One migration, adding indexes and one one-time purge of `idempotency_keys`.
 
 **Tech Stack:** TypeScript, Cloudflare Workers, D1, vitest 4.1.11 with `@cloudflare/vitest-pool-workers`.
 
@@ -32,11 +32,13 @@ Eleven defects, each verified against the repository before being accepted. Two 
 
 **Two contract slips.** `list_tags` declared `cursor` and `limit` in its interface and registered neither. And `idx_roster_entries_role` leads with `roster_source_id`, so it cannot serve the role-only call the tool permits; that is now stated rather than implied.
 
-### Still open, and named rather than resolved
+### Decided 2026-08-28, with Matt
 
-The spec requires `person_name` inline on encounters and follow-ups. Task 7 Step 4 raises it as a decision because adding it to the shared `COLUMNS` changes five tools' response shapes at once and makes stored idempotency records replay the old shape. It is still a decision, not an implementation, and the spec lists it as an open question. A reviewer is right that this plan does not deliver that spec line.
+Both questions the previous revision left open are now closed. Matt ruled on each directly.
 
-`promote_roster_entry` writes `person_sources`, which `get_person` returns, without moving `people.updated_at`. Task 2 covers the six relation writers and not this one. Whether provenance counts as "something about this person changed" is a real question and it is left open here rather than answered in passing.
+**`person_name` goes into the shared shapes, not a separate column list.** Encounters and follow-ups carry `person_name` inline everywhere they are returned, resolved by a JOIN on `people` at read time so renames stay correct. This changes the response shape of every tool that returns either record kind at once, and that is accepted: Matt is the sole user, the instance has been live less than a week, and his ruling is that concerns about breaking changes must not drive design this early. The stored-replay inconsistency, where an idempotency record stored before the change replays the old shape on a retry, is removed at the root: migration 0009 purges `idempotency_keys` one time, so nothing stored before the deploy can replay at all. The cost of that purge is that a write made before the migration loses its replay protection, so a retried old key would re-execute; retries in practice happen seconds apart within a session, so deploying at a quiet moment closes the window. Task 9b implements the field, Task 3 carries the purge, and Task 7 Step 4's parallel decision about `updated_at` is settled the same way for the same reason.
+
+**`promote_roster_entry` bumps `people.updated_at` when it links provenance to an existing person.** The rule is now uniform: anything that changes what `get_person` returns moves `updated_at`, and `person_sources` is in `get_person`'s response. Task 2 covers it alongside the six relation writers. The create path needs no separate bump, because the person row is inserted in the same operation with fresh timestamps.
 
 ## Global Constraints
 
@@ -320,9 +322,13 @@ git commit -m "feat: add update_followup so a follow-up can be corrected without
 
 Without this, `updated_after` misses every tag, link, and contact change, and the failure is asymmetric and silent. `update_person` does bump the timestamp, so deltas look like they work. Run a tagging pass Monday, ask what changed Tuesday, and be told nothing did. That is precisely the check `include` exists to serve.
 
+**A seventh writer, per the decision of 2026-08-28:** `promoteRosterEntry`'s link path (`src/tools/promote.ts`) inserts a `person_sources` row for an existing person, and `get_person` returns `person_sources`, so promotion changes what `get_person` returns without moving `updated_at`. It gets the same bump, in the same batch as the provenance insert. Only the link path needs it: the create path inserts the person row in the same operation with fresh timestamps, so a bump there writes the value the row already has. Putting the bump inside the `provenance(personId)` statement array covers both paths and is harmless on the create path; say so in the commit message rather than special-casing it.
+
 **Files:**
 - Modify: `src/tools/attributes.ts`
+- Modify: `src/tools/promote.ts`
 - Modify: `tests/attributes.test.ts`
+- Modify: `tests/promote.test.ts`
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -407,14 +413,32 @@ describe("relation writes and people.updated_at", () => {
 
 Add `readUpdatedAt` as a helper selecting `updated_at` from `people` by id. **Use a mutable clock.** A frozen instant makes every one of these tests pass whether or not the bump happens, which is the exact failure that hid three live defects in this project.
 
+And in `tests/promote.test.ts`, the seventh writer:
+
+```typescript
+  it("linking a roster entry to an existing person moves people.updated_at", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada Lovelace" });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await promoteRosterEntry(ctx, {
+      roster_entry_id: entryId,
+      link_to_person_id: person.id,
+      expected_content_hash: entry.content_hash,
+    });
+    expect(await readUpdatedAt(person.id)).not.toBe(before);
+  });
+```
+
+Build `entryId` the way the existing promote tests stage a roster entry; the assertion is the point, not the fixture. Do not add a create-path counterpart asserting the timestamp stays put: on the create path the bump writes the row's own insertion instant, so there is nothing to observe either way.
+
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `npx vitest run tests/attributes.test.ts`
-Expected: FAIL on every case, because `updated_at` is unchanged.
+Run: `npx vitest run tests/attributes.test.ts tests/promote.test.ts`
+Expected: FAIL on every new case, because `updated_at` is unchanged.
 
 **If they pass, stop.** Either the clock is frozen or the bump already exists, and both mean this task's premise is wrong.
 
-- [ ] **Step 3: Add the bump to all six writers**
+- [ ] **Step 3: Add the bump to all seven writers**
 
 **Removals need a guard the additions do not.** A `DELETE` matching zero rows is not a SQL error, so it does not abort a batch. Putting the bump in the same batch as `DELETE FROM person_contacts WHERE id = ? AND person_id = ?` means a caller removing a contact that does not exist mutates the person's `updated_at` and then gets `not_found`. Throwing afterwards does not roll the batch back.
 
@@ -430,7 +454,7 @@ So for `removeContact` and `removeLink`, confirm the child row exists first, the
 
 **Decide what a no-op means and write it down.** Adding a contact the person already holds is `ON CONFLICT DO NOTHING`, and re-adding an existing tag or removing an absent one changes nothing either. An unconditional bump reports those as changes. `updated_at` means "something about this person changed", so a no-op must not move it. Where a writer can no-op, check `result.meta.changes` on the child statement and skip the bump when it is zero, which makes the bump a second statement rather than a batched one on those paths. Say in the commit message which writers take which shape.
 
-In each of `addContact`, `addLink`, `addTags`, `removeContact`, `removeLink`, and `removeTags`, include this statement in the same `db.batch` as the child write, subject to the two rules above:
+In each of `addContact`, `addLink`, `addTags`, `removeContact`, `removeLink`, and `removeTags`, and in `promoteRosterEntry`'s `provenance(personId)` statement array, include this statement in the same `db.batch` as the child write, subject to the two rules above:
 
 ```typescript
         ctx.db
@@ -444,7 +468,7 @@ Where a writer does not currently use `db.batch`, convert it to one. **The bump 
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `npx vitest run tests/attributes.test.ts`
+Run: `npx vitest run tests/attributes.test.ts tests/promote.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Confirm the tests are not blind**
@@ -457,22 +481,22 @@ Run: `npm test`
 Expected: PASS. Watch for existing tests that assert an exact `updated_at`; those need updating deliberately.
 
 ```bash
-git add src/tools/attributes.ts tests/attributes.test.ts
-git commit -m "fix: relation writes now move people.updated_at, so deltas can see them"
+git add src/tools/attributes.ts src/tools/promote.ts tests/attributes.test.ts tests/promote.test.ts
+git commit -m "fix: relation writes and promotion now move people.updated_at, so deltas can see them"
 ```
 
 ---
 
 ### Task 3: Migration 0009
 
-Indexes only. Additive, so either deploy order is safe: new code without the index is correct but slower, the index without new code is inert.
+Indexes, plus one one-time data statement: `DELETE FROM idempotency_keys`, per the decision of 2026-08-28. The indexes are additive, so either deploy order is safe for them: new code without an index is correct but slower, an index without new code is inert. The purge is safe in either order too, but its purpose is tied to the deploy: it must have run by the time the new-shape code serves its first replay, and applying the migration immediately before the deploy, as Task 10 does, satisfies that.
 
 **Files:**
 - Create: `migrations/0009_read_surface_indexes.sql`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: indexes Tasks 7, 8, and 9 rely on for speed, never for correctness.
+- Produces: indexes Tasks 7, 8, and 9 rely on for speed, never for correctness, and the guarantee Task 9b relies on that no stored response predating the shape change can replay.
 
 - [ ] **Step 1: Confirm what is already indexed**
 
@@ -487,9 +511,20 @@ Expected, and already established: `person_tags` has `PRIMARY KEY (person_id, ta
 ```sql
 -- migrations/0009_read_surface_indexes.sql
 --
--- Indexes only. Nothing here changes a table, so this migration and the deploy
--- that uses it are safe in either order: the new code is correct without these
--- and merely slower, and these are inert without the new code.
+-- Indexes, plus one one-time purge. The indexes change no table, so they and
+-- the deploy that uses them are safe in either order: the new code is correct
+-- without them and merely slower, and they are inert without the new code.
+
+-- Encounters and follow-ups gain person_name in this release, and updated_at
+-- joins the shared encounter columns. Stored idempotency responses predate
+-- both, so a replayed key would return the old shape. Decided with Matt on
+-- 2026-08-28: purge the store once instead of living with mixed shapes for
+-- the 30-day retention window. The cost is that writes made before this
+-- migration lose replay protection; retries arrive seconds apart in practice,
+-- so applying this at a quiet moment, immediately before the deploy, closes
+-- the window. This does not disturb the delete_person redaction rule from
+-- plan 1, which governs what gets stored, not what gets deleted.
+DELETE FROM idempotency_keys;
 
 -- list_records(updated_after: ...) on all three durable scopes.
 CREATE INDEX idx_people_updated ON people(updated_at);
@@ -536,7 +571,7 @@ Expected: the plan mentions `idx_people_updated`. If it does not, record that in
 
 ```bash
 git add migrations/0009_read_surface_indexes.sql
-git commit -m "feat: add migration 0009, indexes for the new read filters"
+git commit -m "feat: add migration 0009, indexes for the new read filters and the idempotency purge"
 ```
 
 ---
@@ -1153,7 +1188,7 @@ Append `AND updated_at > ?` to each scope's query when `updated_after` is presen
 
 `export.ts`'s `QUERIES` and `encounters_read.ts`'s exported `COLUMNS` both select encounters and neither carries `updated_at`. A caller cannot record a watermark from a field it never receives.
 
-**Decide and record which you are doing.** Adding `updated_at` to the shared `COLUMNS` changes the response shape of `log_encounter`, `update_encounter`, `delete_encounter`, `get_person`, and `list_encounters` at once, because `toEncounter` spreads the row. That is defensible and arguably right, and it means idempotency records stored before this change replay the old shape on a retry. The alternative is a separate column list for `list_records`. Pick one, do it, and say which in the commit message.
+**Decided 2026-08-28: the shared `COLUMNS`, not a separate list.** Adding `updated_at` there changes the response shape of `log_encounter`, `update_encounter`, `delete_encounter`, `get_person`, and `list_encounters` at once, because `toEncounter` spreads the row. That is accepted, per the decision recorded at the top of this plan: one shape everywhere, and the stale-replay concern is void because migration 0009 purged the idempotency store. Say in the commit message that this is the decided shape change, not a side effect.
 
 - [ ] **Step 5: Add to the schema and the description**
 
@@ -1431,6 +1466,106 @@ git commit -m "feat: add list_roster_entries, so the roster can be filtered rath
 
 ---
 
+### Task 9b: `person_name` inline on encounters and follow-ups
+
+**Added 2026-08-28, implementing the decision recorded at the top of this plan.** The spec says encounters and follow-ups "always carry `person_name` inline", and until this task only `list_due` did. A caller listing encounters gets rows pointing at `p_` ids and needs one more call per person to say whose encounter it is, which is exactly the per-record cost this plan exists to remove.
+
+The name is resolved by a JOIN on `people` at read time, never stored on the child row, so a rename is reflected everywhere immediately. It goes into the shared shapes: every tool that returns an `Encounter` or a `Followup` gains the field at once, because the shared loaders gain it. `list_due` already proves the pattern at `src/tools/followups.ts:188`.
+
+**Files:**
+- Modify: `src/types.ts`
+- Modify: `src/tools/encounters_read.ts`
+- Modify: `src/tools/followups.ts`
+- Modify: `src/tools/followups_read.ts`
+- Modify: `src/tools/export.ts`
+- Modify: `tests/` files covering those.
+
+**Interfaces:**
+- Consumes: the purge from Task 3, which is why no stored response can replay the old shape.
+- Produces: `Encounter` and `Followup` each gain `person_name: string`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```typescript
+  it("an encounter carries its person's name inline", async () => {
+    const person = await createPerson(ctx, { full_name: "Hedy Lamarr" });
+    const logged = await logEncounter(ctx, {
+      person_id: person.id,
+      occurred_on: "2026-08-27",
+      summary: "met at the hallway track",
+    });
+    expect(logged.encounter.person_name).toBe("Hedy Lamarr");
+
+    const listed = await listEncounters(ctx, { person_id: person.id });
+    expect(listed.results[0]!.person_name).toBe("Hedy Lamarr");
+  });
+
+  it("person_name follows a rename, because it is joined at read time", async () => {
+    const person = await createPerson(ctx, { full_name: "Hedy Lamarr" });
+    await logEncounter(ctx, { person_id: person.id, occurred_on: "2026-08-27", summary: "met" });
+    await updatePerson(ctx, { person_id: person.id, full_name: "Julia G. Golomb" });
+    const listed = await listEncounters(ctx, { person_id: person.id });
+    expect(listed.results[0]!.person_name).toBe("Julia G. Golomb");
+  });
+
+  it("a follow-up carries person_name from every reader", async () => {
+    const person = await createPerson(ctx, { full_name: "Bo Diddley" });
+    const created = await createFollowup(ctx, {
+      person_id: person.id,
+      due_on: "2026-09-10",
+      note: "email about the event",
+    });
+    expect(created.followup.person_name).toBe("Bo Diddley");
+
+    const fetched = await getPerson(ctx, { person_id: person.id });
+    expect(fetched.open_followups[0]!.person_name).toBe("Bo Diddley");
+  });
+```
+
+And one case per `list_records` scope that returns the field, asserting a row from `scope: "encounters"` and a row from `scope: "followups"` each carry `person_name`. Match the destructuring to the real return shapes: `logEncounter` returns `{ encounter, ... }` and `createFollowup` returns `{ followup, person }`, which is the mistake the four-agent review caught in Task 1's first draft. If `getPerson`'s follow-up field is named differently, follow the code, not this sketch.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Expected: FAIL on every new assertion, `person_name` being `undefined`.
+
+- [ ] **Step 3: Add the JOIN to the shared loaders**
+
+In `src/types.ts`, add `person_name: string` to both `Encounter` and `Followup`.
+
+In `src/tools/encounters_read.ts`, qualify `COLUMNS` and join:
+
+```typescript
+export const COLUMNS =
+  "e.id AS id, e.person_id AS person_id, e.occurred_on AS occurred_on, " +
+  "e.occurred_at AS occurred_at, e.location AS location, e.event AS event, " +
+  "e.summary AS summary, e.created_at AS created_at, p.full_name AS person_name";
+```
+
+with `FROM encounters e JOIN people p ON p.id = e.person_id` in both `loadEncounter` and `listEncounters`, and `EncounterRow` gaining `person_name: string`. **Qualify every column the queries reference once the JOIN is in place.** `people` also has `id`, `created_at`, and `updated_at`, so the keyset clause's bare `id` and the `ORDER BY` become ambiguous the moment the second table appears, and SQLite reports that as an error at query time, not at build time. The same applies to `updated_at` if Task 7 put it in these queries.
+
+In `src/tools/followups.ts` (`loadFollowup` and its `COLUMNS`) and `src/tools/followups_read.ts` (`loadOpenFollowups`), the same change. Then simplify `listDue`: its bespoke JOIN predates this task, so its row already carries `person_name` and the explicit `person_name: row.person_name` line in its mapper becomes redundant once `toFollowup` includes the field.
+
+In `src/tools/export.ts`, the encounters and followups scope queries gain the same JOIN and alias so `list_records` rows match the shapes everywhere else. The shared page predicate from Tasks 7 and 8 must keep applying to the joined query unchanged; qualify rather than restructure.
+
+- [ ] **Step 4: Run to verify they pass, then check the blast radius**
+
+Run: `npm test` and `npm run typecheck`.
+
+The typecheck is the real reviewer here: `person_name: string` being required on the types means any code path that builds an `Encounter` or `Followup` without it fails to compile, which is precisely the set of places the JOIN must reach. Chase every error it reports; do not weaken the field to optional to silence one.
+
+- [ ] **Step 5: Confirm erasure still holds**
+
+The stored idempotency response for `log_encounter` and the follow-up writers now carries the person's name. Confirm the `delete_person` scrub still reaches those rows: it deletes from `idempotency_keys` by `subject_id` (`src/tools/people.ts`), and the encounter and follow-up writers store the person's id as subject. If no test asserts that a deleted person's name is absent from `idempotency_keys` afterward, add one here; if one exists, cite it in the commit message instead.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/types.ts src/tools/encounters_read.ts src/tools/followups.ts src/tools/followups_read.ts src/tools/export.ts tests/
+git commit -m "feat: encounters and follow-ups carry person_name inline, joined at read time"
+```
+
+---
+
 ### Task 10: Migrate, deploy, and exercise it
 
 **Files:**
@@ -1451,7 +1586,7 @@ An archive must exist, from plan 1. Record the bookmark. **This is the first pla
 npx wrangler d1 migrations apply junco-prm --remote
 ```
 
-Expected: `0009_read_surface_indexes.sql` applied. Indexes only, so this is safe before the deploy and inert until it.
+Expected: `0009_read_surface_indexes.sql` applied. The indexes are inert until the deploy. The `idempotency_keys` purge in the same migration takes effect immediately, so run this at a quiet moment and go straight on to Step 3: between this step and the deploy, a retried pre-migration idempotency key would re-execute instead of replaying.
 
 - [ ] **Step 3: Deploy**
 
@@ -1472,10 +1607,11 @@ Not `curl`. Through Claude, against the live instance holding the real WCUS rost
 - `list_roster_entries({promoted: false, limit: 5})` returns unpromoted entries, and paging with the cursor advances.
 - `search_roster_entries({query: "Mark", limit: 3})` and then the same call with `cursor` set. **The second page must differ from the first.** This is the original reported defect, exercised against the shape that replaced it.
 - `export_data` is gone. Confirm the tool list shows 32 tools and no `export_data`.
+- `list_encounters` and `list_records(scope: "followups")` rows each carry `person_name`, and the names are real ones from the live data. This is the live proof of Task 9b.
 
 - [ ] **Step 5: Record it**
 
-In `docs/MEASUREMENTS.md`: the date, the version id, the migration, that all six checks above passed, and anything surprising. Record the `list_tags` output too; the tag vocabulary of a real roster is worth having written down.
+In `docs/MEASUREMENTS.md`: the date, the version id, the migration, that every check above passed, and anything surprising. Record the `list_tags` output too; the tag vocabulary of a real roster is worth having written down.
 
 - [ ] **Step 6: If anything fails**
 
@@ -1483,7 +1619,7 @@ In `docs/MEASUREMENTS.md`: the date, the version id, the migration, that all six
 npx wrangler rollback
 ```
 
-The migration does not need reverting. It adds indexes, which are inert without the code that uses them.
+The migration does not need reverting. The indexes are inert without the code that uses them, and the idempotency purge cannot be reverted and does not need to be: an empty store is a valid state, the same one the instance started in.
 
 - [ ] **Step 7: Commit**
 
@@ -1498,7 +1634,7 @@ git commit -m "docs: record the read surface deploy and its live exercise"
 
 **Spec coverage.** P4 maps as: the search split is Task 4, `list_records` and `archived` are Task 5, `include` with its stated no-id-list mechanism is Task 6, `updated_after` with canonicalization and exclusivity is Task 7 and depends on Task 2, the `tags` filter and `list_tags` with their two decided behaviours are Task 8, `list_roster_entries` with a full pagination contract is Task 9, `external_row_key` and its PII statement are in Tasks 4 and 9, and migration 0009 is Task 3. P5 is Task 1. The per-phase live verification is Task 10.
 
-**One spec item is implemented differently from how the spec describes it.** The spec says encounters and follow-ups "always carry `person_name` inline". Task 7 Step 4 raises this as a decision rather than doing it silently, because adding a column to the shared `COLUMNS` changes five tools' response shapes at once and makes stored idempotency records replay the old shape. The spec lists that exact trade as an open question, so it is surfaced at the point of decision rather than resolved here by assumption.
+**The `person_name` spec line is now delivered rather than deferred.** The spec says encounters and follow-ups "always carry `person_name` inline", and an earlier revision of this plan left that as an open question because of the shape change and the stale idempotency replays it implied. Matt decided it on 2026-08-28: shared shapes, with migration 0009 purging the idempotency store so no old-shape response survives to replay. Task 9b implements it. The spec's open-questions list still names this; it is answered there by this plan, not contradicted.
 
 **Placeholder scan.** No TBD or TODO. Task 4 Step 3 describes a code move rather than quoting the ~100 lines being moved, and names the exact line range and the three changes to make during the move; that is a procedure over existing code, not a placeholder. Task 9 Step 2 states the keyset, the derivation, the defaults, and the matching rules rather than quoting a full implementation, and every one of its behaviours is pinned by a test in Step 1.
 

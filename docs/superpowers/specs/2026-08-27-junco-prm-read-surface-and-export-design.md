@@ -265,7 +265,7 @@ Two further rules, both of which produce silent wrongness if left unstated:
 
 **The comparison is exclusive**, which is correct for a watermark loop, and the description says so, because a model choosing between `>` and `>=` on a re-poll will otherwise duplicate or skip.
 
-`updated_at` is added to the encounter and follow-up select lists, which currently omit it. `export.ts` and `encounters_read.ts` both select encounters through separate column lists and both must change. Adding `person_name` to the shared list changes the response shape of `log_encounter`, `update_encounter`, `delete_encounter`, `get_person`, and `list_encounters` at once, and means idempotency records stored before the change replay the old shape on retry. The plan states which is being done.
+`updated_at` is added to the encounter and follow-up select lists, which currently omit it. `export.ts` and `encounters_read.ts` both select encounters through separate column lists and both must change. Adding `person_name` to the shared list changes the response shape of `log_encounter`, `update_encounter`, `delete_encounter`, `get_person`, and `list_encounters` at once, and means idempotency records stored before the change replay the old shape on retry. Decided 2026-08-28, recorded in the plan: both fields go into the shared lists, and the replay concern is removed by a one-time purge of `idempotency_keys` in migration 0009 rather than tolerated for the retention window.
 
 **Deletions are not reported.** A delete becomes invisible to a delta caller, who sees only that the record is gone from a full list. Stated in the description rather than left to be discovered.
 
@@ -379,7 +379,7 @@ The migration in P4 is applied before the deploy that uses it, stated here so it
 - Whether the live database is on a D1 backend that supports Time Travel, settled by the first command in P0.
 - Whether `export_data`'s declared `required: ["scope"]` or its handler's default is correct, settled during P3's audit.
 - The exact `wrangler d1 execute` invocation and output shape per table, settled when the P1 script is written. The command and its `--remote`, `--json`, and `--command` flags are verified present in wrangler 4.125.0; the shape of large result sets is not.
-- Whether adding `person_name` to the shared encounter column list, and so changing five tools' response shapes at once, is preferable to a separate list for `list_records`.
+- Whether adding `person_name` to the shared encounter column list, and so changing five tools' response shapes at once, is preferable to a separate list for `list_records`. Answered 2026-08-28 by Matt: the shared list, everywhere both record kinds appear, with migration 0009 purging `idempotency_keys` so no stored response replays the old shape. The plan's decision section of 2026-08-28 carries the reasoning and its cost.
 
 ## Verification notes, 2026-08-27
 
