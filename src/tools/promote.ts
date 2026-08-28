@@ -261,6 +261,15 @@ export async function promoteRosterEntry(
     const snapshot = canonicalJson(parsed);
     const rawHash = entry.content_hash;
 
+    // The bump lives here, in the shared statement array, so it covers both
+    // the link path and the create path below with one definition.
+    //
+    // Only the link path needs it: get_person returns person_sources, so
+    // linking an existing person changes what get_person returns for them
+    // without this. The create path inserts the person row in the same
+    // operation with fresh created_at/updated_at values (`at`, above), so a
+    // bump there writes the value the row already has - harmless, not a
+    // special case to avoid.
     const provenance = (personId: string) => [
       ctx.db
         .prepare(
@@ -284,6 +293,7 @@ export async function promoteRosterEntry(
           rawHash,
           at
         ),
+      ctx.db.prepare("UPDATE people SET updated_at = ? WHERE id = ?").bind(at, personId),
     ];
 
     if (wantsLink) {

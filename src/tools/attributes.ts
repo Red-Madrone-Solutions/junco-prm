@@ -37,23 +37,25 @@ export async function addContact(ctx: ToolContext, input: AddContactInput): Prom
     const value = input.value.trim();
     const normalized =
       input.contact_type === "email" ? normalizeEmail(value) : normalizePhone(value);
+    const at = nowIso(ctx.clock);
 
-    await ctx.db
+    const result = await ctx.db
       .prepare(
         `INSERT INTO person_contacts (id, person_id, contact_type, value, normalized_value, label, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (person_id, contact_type, normalized_value) DO NOTHING`
       )
-      .bind(
-        newId("pc"),
-        personId,
-        input.contact_type,
-        value,
-        normalized,
-        input.label ?? null,
-        nowIso(ctx.clock)
-      )
+      .bind(newId("pc"), personId, input.contact_type, value, normalized, input.label ?? null, at)
       .run();
+
+    // ON CONFLICT DO NOTHING makes re-adding a contact the person already has
+    // a no-op. updated_at means "something about this person changed," so a
+    // no-op must not move it. The insert already ran, so this is a second
+    // statement rather than a batched one - there is nothing to batch it with
+    // that would not also risk bumping on a no-op.
+    if (result.meta.changes > 0) {
+      await ctx.db.prepare("UPDATE people SET updated_at = ? WHERE id = ?").bind(at, personId).run();
+    }
 
     return getPerson(ctx, { person_id: personId });
   }, personId);
@@ -70,13 +72,29 @@ export async function removeContact(ctx: ToolContext, input: RemoveContactInput)
   const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "remove_contact", idempotency_key, rest, async () => {
     const contactId = assertId("pc", input.contact_id);
-    const result = await ctx.db
-      .prepare("DELETE FROM person_contacts WHERE id = ? AND person_id = ?")
+
+    // A DELETE matching zero rows is not a SQL error, so it would not abort a
+    // batch. Checking existence first, before the batch, means a removal that
+    // matches nothing throws before anything is written - rather than the
+    // batch committing the bump and then throwing not_found afterward, which
+    // a throw cannot roll back.
+    const existing = await ctx.db
+      .prepare("SELECT id FROM person_contacts WHERE id = ? AND person_id = ?")
       .bind(contactId, personId)
-      .run();
-    if (result.meta.changes === 0) {
+      .first<{ id: string }>();
+    if (!existing) {
       throw new ToolError("not_found", `no contact ${contactId} on person ${personId}`);
     }
+
+    await ctx.db.batch([
+      ctx.db
+        .prepare("DELETE FROM person_contacts WHERE id = ? AND person_id = ?")
+        .bind(contactId, personId),
+      ctx.db
+        .prepare("UPDATE people SET updated_at = ? WHERE id = ?")
+        .bind(nowIso(ctx.clock), personId),
+    ]);
+
     return getPerson(ctx, { person_id: personId });
   }, personId);
 }
@@ -100,14 +118,22 @@ export async function addLink(ctx: ToolContext, input: AddLinkInput): Promise<Pe
     }
     await loadPerson(ctx, personId);
 
-    await ctx.db
+    const at = nowIso(ctx.clock);
+    const result = await ctx.db
       .prepare(
         `INSERT INTO person_links (id, person_id, link_type, url, created_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT (person_id, link_type, url) DO NOTHING`
       )
-      .bind(newId("pl"), personId, input.link_type.trim(), input.url.trim(), nowIso(ctx.clock))
+      .bind(newId("pl"), personId, input.link_type.trim(), input.url.trim(), at)
       .run();
+
+    // Same no-op rule as addContact: ON CONFLICT DO NOTHING means re-adding a
+    // link the person already has changes nothing, so it must not bump
+    // updated_at either.
+    if (result.meta.changes > 0) {
+      await ctx.db.prepare("UPDATE people SET updated_at = ? WHERE id = ?").bind(at, personId).run();
+    }
 
     return getPerson(ctx, { person_id: personId });
   }, personId);
@@ -124,13 +150,24 @@ export async function removeLink(ctx: ToolContext, input: RemoveLinkInput): Prom
   const personId = assertId("p", input.person_id);
   return withIdempotency(ctx, "remove_link", idempotency_key, rest, async () => {
     const linkId = assertId("pl", input.link_id);
-    const result = await ctx.db
-      .prepare("DELETE FROM person_links WHERE id = ? AND person_id = ?")
+
+    // Same TOCTOU concern as removeContact: check first so a removal
+    // matching nothing throws before anything is written.
+    const existing = await ctx.db
+      .prepare("SELECT id FROM person_links WHERE id = ? AND person_id = ?")
       .bind(linkId, personId)
-      .run();
-    if (result.meta.changes === 0) {
+      .first<{ id: string }>();
+    if (!existing) {
       throw new ToolError("not_found", `no link ${linkId} on person ${personId}`);
     }
+
+    await ctx.db.batch([
+      ctx.db.prepare("DELETE FROM person_links WHERE id = ? AND person_id = ?").bind(linkId, personId),
+      ctx.db
+        .prepare("UPDATE people SET updated_at = ? WHERE id = ?")
+        .bind(nowIso(ctx.clock), personId),
+    ]);
+
     return getPerson(ctx, { person_id: personId });
   }, personId);
 }
@@ -181,7 +218,7 @@ export async function addTags(ctx: ToolContext, input: TagsInput): Promise<Perso
     await loadPerson(ctx, personId);
 
     const at = nowIso(ctx.clock);
-    await ctx.db.batch(
+    const results = await ctx.db.batch(
       names.flatMap((name) => [
         ctx.db
           .prepare("INSERT INTO tags (id, name, created_at) VALUES (?, ?, ?) ON CONFLICT (name) DO NOTHING")
@@ -196,6 +233,17 @@ export async function addTags(ctx: ToolContext, input: TagsInput): Promise<Perso
           .bind(personId, name),
       ])
     );
+
+    // Each pair's second statement is the person_tags insert; the tags table
+    // insert is shared vocabulary and does not by itself mean this person
+    // changed. OR IGNORE makes re-adding a tag a no-op, and a no-op must not
+    // move updated_at - so the bump is a second statement, gated on at least
+    // one association actually being written, rather than a member of the
+    // batch above whose own results decide it.
+    const personTagChanged = results.some((r, i) => i % 2 === 1 && r.meta.changes > 0);
+    if (personTagChanged) {
+      await ctx.db.prepare("UPDATE people SET updated_at = ? WHERE id = ?").bind(at, personId).run();
+    }
 
     return getPerson(ctx, { person_id: personId });
   }, personId);
@@ -219,7 +267,7 @@ export async function removeTags(ctx: ToolContext, input: TagsInput): Promise<Pe
     await loadPerson(ctx, personId);
 
     const placeholders = names.map(() => "?").join(", ");
-    await ctx.db
+    const result = await ctx.db
       .prepare(
         `DELETE FROM person_tags
           WHERE person_id = ?
@@ -227,6 +275,17 @@ export async function removeTags(ctx: ToolContext, input: TagsInput): Promise<Pe
       )
       .bind(personId, ...names)
       .run();
+
+    // Removing a tag the person does not have is a no-op, not an error (see
+    // the doc comment above), so a DELETE matching nothing must not move
+    // updated_at either. The DELETE already ran, so this is a second
+    // statement rather than a batched one.
+    if (result.meta.changes > 0) {
+      await ctx.db
+        .prepare("UPDATE people SET updated_at = ? WHERE id = ?")
+        .bind(nowIso(ctx.clock), personId)
+        .run();
+    }
 
     return getPerson(ctx, { person_id: personId });
   }, personId);

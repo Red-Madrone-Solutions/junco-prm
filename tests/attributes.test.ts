@@ -13,13 +13,33 @@ import {
 } from "../src/tools/attributes";
 import { createPerson, getPerson } from "../src/tools/people";
 
+let now = new Date("2026-08-20T12:00:00Z");
 const ctx: ToolContext = {
   db: env.DB,
   timezone: "UTC",
-  clock: () => new Date("2026-08-20T12:00:00Z"),
+  clock: () => now,
 };
 
+// A MUTABLE clock. A frozen instant makes every updated_at assertion below
+// pass whether or not the bump actually happens, which is the exact failure
+// that hid three live defects in this project already (see
+// tests/idempotency-retention.test.ts).
+const clock = {
+  advance(ms: number) {
+    now = new Date(now.getTime() + ms);
+  },
+};
+
+async function readUpdatedAt(personId: string): Promise<string> {
+  const row = await env.DB.prepare("SELECT updated_at FROM people WHERE id = ?")
+    .bind(personId)
+    .first<{ updated_at: string }>();
+  if (!row) throw new Error(`no person ${personId}`);
+  return row.updated_at;
+}
+
 beforeEach(async () => {
+  now = new Date("2026-08-20T12:00:00Z");
   await env.DB.prepare("DELETE FROM people").run();
   await env.DB.prepare("DELETE FROM tags").run();
   await env.DB.prepare("DELETE FROM idempotency_keys").run();
@@ -253,5 +273,84 @@ describe("getPerson", () => {
     const detail = await getPerson(ctx, { person_id: person.id });
     expect(detail.contacts).toHaveLength(1);
     expect(detail.tags).toEqual(["wcus"]);
+  });
+});
+
+describe("relation writes and people.updated_at", () => {
+  // Table-driven so a seventh relation writer added later cannot quietly skip
+  // the bump. Each case is a separate live defect if it fails.
+  const cases: [string, (personId: string) => Promise<unknown>][] = [
+    ["add_contact", (p) => addContact(ctx, { person_id: p, contact_type: "email", value: "a@b.test" })],
+    ["add_link", (p) => addLink(ctx, { person_id: p, link_type: "website", url: "https://b.test" })],
+    ["add_tags", (p) => addTags(ctx, { person_id: p, tags: ["speaker"] })],
+    ["remove_tags", (p) => removeTags(ctx, { person_id: p, tags: ["speaker"] })],
+  ];
+
+  for (const [name, write] of cases) {
+    it(`${name} moves people.updated_at`, async () => {
+      const person = await createPerson(ctx, { full_name: "Ada Lovelace" });
+      if (name === "remove_tags") await addTags(ctx, { person_id: person.id, tags: ["speaker"] });
+      const before = await readUpdatedAt(person.id);
+      clock.advance(60_000);
+      await write(person.id);
+      expect(await readUpdatedAt(person.id)).not.toBe(before);
+    });
+  }
+
+  it("remove_contact moves it", async () => {
+    const person = await createPerson(ctx, { full_name: "Grace Hopper" });
+    const withContact = await addContact(ctx, {
+      person_id: person.id,
+      contact_type: "email",
+      value: "g@h.test",
+    });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await removeContact(ctx, { person_id: person.id, contact_id: withContact.contacts[0]!.id });
+    expect(await readUpdatedAt(person.id)).not.toBe(before);
+  });
+
+  // The first draft claimed to cover removeLink here and only called
+  // removeContact, leaving one of the six writers entirely unguarded.
+  it("remove_link moves it", async () => {
+    const person = await createPerson(ctx, { full_name: "Grace Hopper" });
+    const withLink = await addLink(ctx, {
+      person_id: person.id,
+      link_type: "website",
+      url: "https://g.test",
+    });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await removeLink(ctx, { person_id: person.id, link_id: withLink.links[0]!.id });
+    expect(await readUpdatedAt(person.id)).not.toBe(before);
+  });
+
+  // THE FAILURE PATH. A batch commits before the changes check runs, so a
+  // removal matching nothing must not have mutated the person first.
+  //
+  // Deviation from the brief's literal fixture: the brief's example used the
+  // placeholder contact_id "pc_does-not-exist", but that string fails
+  // assertId's UUID-shape check (see src/ids.ts) and throws invalid_id before
+  // removeContact's own not_found check ever runs. A syntactically valid
+  // pc_ id that simply matches no row is what actually exercises the
+  // not_found path this test is named for.
+  it("does not move updated_at when a removal matches nothing", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await expect(
+      removeContact(ctx, { person_id: person.id, contact_id: newId("pc") })
+    ).rejects.toMatchObject({ code: "not_found" });
+    expect(await readUpdatedAt(person.id)).toBe(before);
+  });
+
+  // A no-op is not a change. add_contact is ON CONFLICT DO NOTHING.
+  it("does not move updated_at when a write is a no-op", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada" });
+    await addContact(ctx, { person_id: person.id, contact_type: "email", value: "a@b.test" });
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await addContact(ctx, { person_id: person.id, contact_type: "email", value: "a@b.test" });
+    expect(await readUpdatedAt(person.id)).toBe(before);
   });
 });
