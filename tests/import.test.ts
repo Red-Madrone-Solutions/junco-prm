@@ -4,7 +4,7 @@ import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
 import { finalizeImport, importRoster } from "../src/tools/import";
 import { IMPORT_BATCH_LIMIT } from "../src/tools/import_state";
-import { searchPeople } from "../src/tools/search";
+import { searchRosterEntries } from "../src/tools/search_roster";
 
 const ctx: ToolContext = {
   db: env.DB,
@@ -437,8 +437,8 @@ describe("abandoned run staleness", () => {
       rows: [{ external_row_key: "1", full_name: "Ada Lovelace" }],
     });
 
-    const ada = await searchPeople(ctx, { query: "Lovelace", scope: "roster" });
-    const grace = await searchPeople(ctx, { query: "Hopper", scope: "roster" });
+    const ada = await searchRosterEntries(ctx, { query: "Lovelace" });
+    const grace = await searchRosterEntries(ctx, { query: "Hopper" });
 
     expect(ada.roster_entries[0]?.stale).toBe(false);
     expect(grace.roster_entries[0]?.stale).toBe(false);

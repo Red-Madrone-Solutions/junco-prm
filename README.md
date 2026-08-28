@@ -64,7 +64,7 @@ If you want, when the event is over, you can delete the staged list. The people 
 | Runtime | Cloudflare Workers, TypeScript |
 | Database | Cloudflare D1, with full-text search |
 | Sessions and tokens | Cloudflare KV |
-| Interface | MCP over Streamable HTTP, 28 tools |
+| Interface | MCP over Streamable HTTP, 32 tools |
 | Sign-in | GitHub OAuth, no scopes requested |
 
 ## What it costs

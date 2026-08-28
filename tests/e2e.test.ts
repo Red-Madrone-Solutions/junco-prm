@@ -47,13 +47,15 @@ describe("the conference path", () => {
     await call("finalize_import", { run_id: imported.run_id });
 
     // Find the roster entry the way an agent would.
-    const found = (await call("search_people", { query: "Hopper", scope: "roster" })) as {
+    const peopleSearch = (await call("search_people", { query: "Hopper" })) as {
       people: unknown[];
+    };
+    const found = (await call("search_roster_entries", { query: "Hopper" })) as {
       roster_entries: { id: string; record_kind: string; stale: boolean; promoted_person_id: string | null }[];
     };
-    // Two arrays, always. Nothing this agent could do would put a roster entry
+    // Two tools, always. Nothing this agent could do would put a roster entry
     // where it expects a person.
-    expect(found.people).toEqual([]);
+    expect(peopleSearch.people).toEqual([]);
     expect(found.roster_entries).toHaveLength(1);
     expect(found.roster_entries[0]?.stale).toBe(false);
     expect(found.roster_entries[0]?.promoted_person_id).toBeNull();
@@ -98,14 +100,16 @@ describe("the conference path", () => {
     const personId = promoted.person.id;
     expect(promoted.person.contacts[0]?.value).toBe("grace@example.test");
 
-    // The same search now links the two arrays, so the agent can see the roster
-    // row and the person it became without another call.
-    const after = (await call("search_people", { query: "Hopper", scope: "all" })) as {
+    // The two searches now link up, so the agent can see the roster row and the
+    // person it became with one call each.
+    const afterPeople = (await call("search_people", { query: "Hopper" })) as {
       people: { id: string }[];
+    };
+    const afterRoster = (await call("search_roster_entries", { query: "Hopper" })) as {
       roster_entries: { promoted_person_id: string | null }[];
     };
-    expect(after.people[0]?.id).toBe(personId);
-    expect(after.roster_entries[0]?.promoted_person_id).toBe(personId);
+    expect(afterPeople.people[0]?.id).toBe(personId);
+    expect(afterRoster.roster_entries[0]?.promoted_person_id).toBe(personId);
 
     await call("log_encounter", {
       person_id: personId,
@@ -171,7 +175,7 @@ describe("the conference path", () => {
     await call("finalize_import", { run_id: first.run_id });
 
     // Promote Grace, so she has provenance pointing at her roster row.
-    const found = (await call("search_people", { query: "Hopper", scope: "roster" })) as {
+    const found = (await call("search_roster_entries", { query: "Hopper" })) as {
       roster_entries: { id: string }[];
     };
     const promoted = (await call("promote_roster_entry", {
@@ -211,7 +215,7 @@ describe("the conference path", () => {
     expect(finalized.promoted).toBe(1);
 
     // The departed attendee is annotated, still searchable, still promotable.
-    const gone = (await call("search_people", { query: "Chris Smith", scope: "roster" })) as {
+    const gone = (await call("search_roster_entries", { query: "Chris Smith" })) as {
       roster_entries: { organization: string; stale: boolean }[];
     };
     const departed = gone.roster_entries.find((r) => r.organization === "Studio B");
@@ -237,7 +241,7 @@ describe("the conference path", () => {
     })) as { run_id: string };
     await call("finalize_import", { run_id: imported.run_id });
 
-    const found = (await call("search_people", { query: "Chris Smith", scope: "roster" })) as {
+    const found = (await call("search_roster_entries", { query: "Chris Smith" })) as {
       roster_entries: { id: string }[];
     };
     expect(found.roster_entries).toHaveLength(2);

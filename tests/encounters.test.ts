@@ -9,7 +9,7 @@ import {
   logEncounter,
   updateEncounter,
 } from "../src/tools/encounters";
-import { createPerson, getPerson } from "../src/tools/people";
+import { createPerson, getPerson, updatePerson } from "../src/tools/people";
 
 let now = new Date("2026-08-21T02:30:00Z"); // still the 20th in Los Angeles
 const ctx: ToolContext = {
@@ -257,5 +257,28 @@ describe("subject_id", () => {
     const { encounter } = await logEncounter(ctx, { person_id: person.id, summary: "met" });
     await deleteEncounter(ctx, { encounter_id: encounter.id, idempotency_key: "k1" });
     expect(await subjectIdFor("delete_encounter:k1")).toBe(person.id);
+  });
+});
+
+describe("person_name", () => {
+  it("an encounter carries its person's name inline", async () => {
+    const person = await createPerson(ctx, { full_name: "Hedy Lamarr" });
+    const logged = await logEncounter(ctx, {
+      person_id: person.id,
+      occurred_on: "2026-08-27",
+      summary: "met at the hallway track",
+    });
+    expect(logged.encounter.person_name).toBe("Hedy Lamarr");
+
+    const listed = await listEncounters(ctx, { person_id: person.id });
+    expect(listed.results[0]!.person_name).toBe("Hedy Lamarr");
+  });
+
+  it("person_name follows a rename, because it is joined at read time", async () => {
+    const person = await createPerson(ctx, { full_name: "Hedy Lamarr" });
+    await logEncounter(ctx, { person_id: person.id, occurred_on: "2026-08-27", summary: "met" });
+    await updatePerson(ctx, { person_id: person.id, full_name: "Julia G. Golomb" });
+    const listed = await listEncounters(ctx, { person_id: person.id });
+    expect(listed.results[0]!.person_name).toBe("Julia G. Golomb");
   });
 });

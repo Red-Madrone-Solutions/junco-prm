@@ -2,9 +2,17 @@ import type { ToolContext } from "../context";
 import { envelope } from "../context";
 import { addContact, addLink, addTags, removeContact, removeLink, removeTags } from "./attributes";
 import { deleteEncounter, listEncounters, logEncounter, updateEncounter } from "./encounters";
-import { exportData } from "./export";
-import { cancelFollowup, completeFollowup, createFollowup, listDue } from "./followups";
+import { listRecords } from "./export";
+import {
+  cancelFollowup,
+  completeFollowup,
+  createFollowup,
+  listDue,
+  updateFollowup,
+} from "./followups";
 import { finalizeImport, importRoster } from "./import";
+import { listRosterEntries } from "./list_roster";
+import { listTags } from "./list_tags";
 import {
   archivePerson,
   createPerson,
@@ -27,6 +35,7 @@ import {
   type JsonSchema,
 } from "./schema";
 import { searchPeople } from "./search";
+import { searchRosterEntries } from "./search_roster";
 
 /**
  * MCP's three static annotations. Clients use them to decide what to approve
@@ -132,9 +141,10 @@ const personFields = {
  * will index this map by a tool name that arrives over the wire. As a plain
  * object, `TOOLS["toString"]` resolves up the prototype chain to a function,
  * and any `=== undefined` guard on the lookup passes. The same shape was a live
- * defect in `export.ts`'s QUERIES: `export_data({scope: "toString"})` fed
- * `Function.prototype.toString`'s source text into the SQL and returned a raw
- * D1 error carrying no `code`. `Object.keys` and `for...in` are unaffected.
+ * defect in `export.ts`'s QUERIES: `list_records({scope: "toString"})` (then
+ * still named `export_data`) fed `Function.prototype.toString`'s source text
+ * into the SQL and returned a raw D1 error carrying no `code`. `Object.keys`
+ * and `for...in` are unaffected.
  */
 export const TOOLS: Record<string, ToolDefinition> = Object.assign(
   Object.create(null),
@@ -143,26 +153,59 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
     // ---------------------------------------------------------------- reads
     define(
       "search_people",
-      "Search people you have recorded and, on request, staged roster entries. " +
-        "Matches names, organization, title, notes, tags, and email addresses. " +
-        "Returns two separate arrays: `people` (durable records you can write to) " +
-        "and `roster_entries` (imported rows that must be promoted first).",
+      "Search people you have recorded. Matches names, organization, title, " +
+        "notes, tags, and email addresses. Returns durable records you can write to. " +
+        "For staged roster entries, use search_roster_entries instead.",
       READ,
       obj(
         {
           query: str("Search text. Treated as literal text, never as query syntax."),
-          scope: enumOf(
-            ["people", "roster", "all"],
-            "Which records to search. Defaults to people."
-          ),
           include_archived: bool("Include archived people. Defaults to false."),
-          limit: int("Maximum results per array, 1 to 50. Defaults to 20."),
-          people_cursor: str("Page token from a previous people_next_cursor."),
-          roster_cursor: str("Page token from a previous roster_next_cursor."),
+          limit: int("Maximum results, 1 to 50. Defaults to 20."),
+          cursor: str("Page token from a previous next_cursor."),
         },
         ["query"]
       ),
       searchPeople
+    ),
+    define(
+      "search_roster_entries",
+      "Free-text search over staged roster entries: names, organizations, and job titles. " +
+        "Returns external_row_key, the identity the import assigned each row, so a source row " +
+        "can be matched back to its entry. NOTE: when no source id was supplied at import, that " +
+        "key is derived from the person's email address and therefore contains it. " +
+        "For filtering by role or promotion state rather than text, use list_roster_entries.",
+      READ,
+      obj(
+        {
+          query: str("Search text. Treated as literal text, never as query syntax."),
+          limit: int("Maximum results, 1 to 50. Defaults to 20."),
+          cursor: str("Page token from a previous next_cursor."),
+        },
+        ["query"]
+      ),
+      searchRosterEntries
+    ),
+    define(
+      "list_roster_entries",
+      "Staged roster entries by filter rather than by text: source, role, organization, and " +
+        "whether each has been promoted. promoted: false is the working queue of people not yet " +
+        "recorded. role and organization match exactly, including case, because roster rows are " +
+        "stored as imported. Returns external_row_key, which can contain an email address when " +
+        "the import supplied no source id. For text search, use search_roster_entries.",
+      READ,
+      obj(
+        {
+          source_key: str("Limit to one roster source."),
+          role: str("Exact role as imported, for example \"speaker\"."),
+          organization: str("Exact organization as imported."),
+          promoted: bool("True for entries already promoted, false for those not yet promoted."),
+          limit: int("Page size, 1 to 50. Defaults to 20."),
+          cursor: str("Page token from a previous next_cursor."),
+        },
+        []
+      ),
+      listRosterEntries
     ),
     define(
       "get_person",
@@ -227,23 +270,48 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       getRosterEntry
     ),
     define(
-      "export_data",
-      "Return durable records a page at a time. For reading data back inside a conversation; " +
-        "it is not the backup.",
+      "list_records",
+      "List durable records a page at a time, filtered by scope. Use this to read back what is " +
+        "in Junco: all people, all encounters, or all open follow-ups. For one person with their " +
+        "tags, links, and contacts, use get_person. This is not the backup; backup and restore " +
+        "are run from the command line and are documented in docs/BACKUP.md.",
       READ,
       obj(
         {
           scope: enumOf(["people", "encounters", "followups"], "Which records to return."),
+          archived: bool("Include archived people. People scope only. Defaults to false."),
+          updated_after: str(
+            "ISO instant. Returns only records updated strictly after it, so a watermark can be " +
+              "passed straight back. Deletions are not reported: a deleted record is simply absent " +
+              "from a full listing."
+          ),
+          tags: strArray(
+            "People scope only. Require all of these tags (AND, not OR), matched case- and " +
+              "whitespace-insensitively. At most 10."
+          ),
           // export.ts's own MAX_LIMIT is 500, not 200 - clampLimit there throws
           // limit_exceeded above it. The description states the real ceiling
           // rather than the plan's draft figure, since a client reads this
           // string to decide what to send.
           limit: int("Page size, 1 to 500. Defaults to 100."),
           cursor: str("Page token from a previous next_cursor."),
+          include: strArray(
+            'Relations to return inline on people. Any of "tags", "links", "contacts". ' +
+              "Page size is capped at 100 when this is used."
+          ),
         },
         []
       ),
-      exportData
+      listRecords
+    ),
+    define(
+      "list_tags",
+      "Every tag in use, with how many people carry it. Tags with a count of zero are included " +
+        "on purpose: seeing 'speaker' beside 'speakers' is what makes this useful. Archived " +
+        "people are not counted.",
+      READ,
+      obj({}, []),
+      listTags
     ),
 
     // --------------------------------------------------------------- writes
@@ -469,6 +537,27 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
       WRITE_IDEMPOTENT,
       obj({ followup_id: id("fu", "Follow-up") }, ["followup_id"], { idempotent: true }),
       cancelFollowup
+    ),
+    define(
+      "update_followup",
+      "Change an open follow-up's note or due date. Send note or due_on or both; " +
+        "send note as null to clear it. A completed or cancelled follow-up cannot be " +
+        "edited, because a closed follow-up is a record of what happened.",
+      // DESTRUCTIVE, not WRITE_IDEMPOTENT, for the same reason as update_person
+      // and update_encounter: it overwrites a note the user wrote and nothing
+      // retains the previous text. A client using these hints to decide what
+      // to run without asking would otherwise auto-approve destroying a note.
+      DESTRUCTIVE,
+      obj(
+        {
+          followup_id: id("fu", "Follow-up"),
+          note: nullableStr("Replaces the existing note. Null clears it."),
+          due_on: str("New due date, YYYY-MM-DD."),
+        },
+        ["followup_id"],
+        { idempotent: true }
+      ),
+      updateFollowup
     ),
     define(
       "import_roster",

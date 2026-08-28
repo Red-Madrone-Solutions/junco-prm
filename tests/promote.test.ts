@@ -9,11 +9,29 @@ import { createPerson, getPerson } from "../src/tools/people";
 import { promoteRosterEntry } from "../src/tools/promote";
 import { loadPersonSources } from "../src/tools/promote_read";
 
+let now = new Date("2026-08-20T12:00:00Z");
 const ctx: ToolContext = {
   db: env.DB,
   timezone: "UTC",
-  clock: () => new Date("2026-08-20T12:00:00Z"),
+  clock: () => now,
 };
+
+// A mutable clock for the updated_at test below, the way tests/attributes.test.ts
+// does it. A frozen instant makes an updated_at assertion pass whether or not
+// the bump actually happens.
+const clock = {
+  advance(ms: number) {
+    now = new Date(now.getTime() + ms);
+  },
+};
+
+async function readUpdatedAt(personId: string): Promise<string> {
+  const row = await env.DB.prepare("SELECT updated_at FROM people WHERE id = ?")
+    .bind(personId)
+    .first<{ updated_at: string }>();
+  if (!row) throw new Error(`no person ${personId}`);
+  return row.updated_at;
+}
 
 const SOURCE = {
   source_key: "wcus-2026",
@@ -32,6 +50,7 @@ async function importOne(row: Record<string, unknown>): Promise<string> {
 }
 
 beforeEach(async () => {
+  now = new Date("2026-08-20T12:00:00Z");
   await env.DB.prepare("DELETE FROM roster_sources").run();
   await env.DB.prepare("DELETE FROM people").run();
 });
@@ -222,6 +241,24 @@ describe("promoteRosterEntry, second phase", () => {
     expect(out.person.sources).toEqual([
       expect.objectContaining({ source_key: "wcus-2026", external_row_key: "k:1" }),
     ]);
+  });
+
+  it("linking a roster entry to an existing person moves people.updated_at", async () => {
+    const person = await createPerson(ctx, { full_name: "Ada Lovelace" });
+    const entryId = await importOne({ external_row_key: "1", full_name: "Ada Lovelace" });
+    const entry = await env.DB.prepare("SELECT content_hash FROM roster_entries WHERE id = ?")
+      .bind(entryId)
+      .first<{ content_hash: string }>();
+    if (!entry) throw new Error("importOne staged no roster entry");
+
+    const before = await readUpdatedAt(person.id);
+    clock.advance(60_000);
+    await promoteRosterEntry(ctx, {
+      roster_entry_id: entryId,
+      link_to_person_id: person.id,
+      expected_content_hash: entry.content_hash,
+    });
+    expect(await readUpdatedAt(person.id)).not.toBe(before);
   });
 
   it("links to an existing person without creating a second one", async () => {

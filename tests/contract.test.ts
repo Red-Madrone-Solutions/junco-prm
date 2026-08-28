@@ -12,9 +12,14 @@ const ctx: ToolContext = {
 };
 
 /**
- * All 28, sorted. The spec counts its own surface and so does this list: the
+ * All 32, sorted. The spec counts its own surface and so does this list: the
  * previous draft's registry had 26, carrying `set_tags` where the spec has
- * `add_tags` and `remove_tags`, and no `get_roster_entry` at all.
+ * `add_tags` and `remove_tags`, and no `get_roster_entry` at all. Task 1 of
+ * the read-surface plan added `update_followup`, bringing the count from 28
+ * to 29. Task 4 split `search_people` into `search_people` and
+ * `search_roster_entries`, bringing the count to 30. Task 8 added `list_tags`,
+ * bringing the count to 31. Task 9 added `list_roster_entries`, bringing the
+ * count to 32.
  */
 const EXPECTED = [
   "add_contact",
@@ -27,14 +32,16 @@ const EXPECTED = [
   "create_person",
   "delete_encounter",
   "delete_person",
-  "export_data",
   "finalize_import",
   "get_person",
   "get_roster_entry",
   "import_roster",
   "list_due",
   "list_encounters",
+  "list_records",
+  "list_roster_entries",
   "list_roster_sources",
+  "list_tags",
   "log_encounter",
   "promote_roster_entry",
   "purge_roster_source",
@@ -42,8 +49,10 @@ const EXPECTED = [
   "remove_link",
   "remove_tags",
   "search_people",
+  "search_roster_entries",
   "unarchive_person",
   "update_encounter",
+  "update_followup",
   "update_person",
 ];
 
@@ -52,8 +61,8 @@ describe("tool registry", () => {
     expect(Object.keys(TOOLS).sort()).toEqual(EXPECTED);
   });
 
-  it("has 28 of them, which is the number the spec states", () => {
-    expect(Object.keys(TOOLS)).toHaveLength(28);
+  it("has 32 of them, after task 9's list_roster_entries", () => {
+    expect(Object.keys(TOOLS)).toHaveLength(32);
   });
 
   it("carries no tool name the fifth spec revision renamed away", () => {
@@ -100,7 +109,7 @@ describe("tool registry", () => {
     // report.
     const writes = EXPECTED.filter(
       (name) => !name.startsWith("list_") && !name.startsWith("search_") &&
-        name !== "get_person" && name !== "export_data" && name !== "get_roster_entry"
+        name !== "get_person" && name !== "list_records" && name !== "get_roster_entry"
     );
     for (const name of writes) {
       const tool = TOOLS[name];
@@ -125,13 +134,16 @@ describe("tool registry", () => {
       .map((t) => t.name)
       .sort();
     expect(readOnly).toEqual([
-      "export_data",
       "get_person",
       "get_roster_entry",
       "list_due",
       "list_encounters",
+      "list_records",
+      "list_roster_entries",
       "list_roster_sources",
+      "list_tags",
       "search_people",
+      "search_roster_entries",
     ]);
   });
 
@@ -155,6 +167,7 @@ describe("tool registry", () => {
       "remove_link",
       "remove_tags",
       "update_encounter",
+      "update_followup",
       "update_person",
     ]);
   });
@@ -315,8 +328,9 @@ describe("tool registry", () => {
     // Plan 2's transport will index this map by a name that arrives over the
     // wire. As a plain object literal, TOOLS["toString"] is a function and any
     // `=== undefined` guard on the lookup passes. The same shape was a live
-    // defect in export.ts: `export_data({scope: "toString"})` concatenated
-    // Function.prototype.toString's source into the SQL.
+    // defect in export.ts: `list_records({scope: "toString"})` (then still
+    // named `export_data`) concatenated Function.prototype.toString's source
+    // into the SQL.
     for (const inherited of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
       expect(TOOLS[inherited], `TOOLS resolved ${inherited}`).toBeUndefined();
     }

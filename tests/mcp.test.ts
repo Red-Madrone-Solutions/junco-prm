@@ -24,10 +24,10 @@ beforeEach(async () => {
 });
 
 describe("tools/list", () => {
-  it("advertises all 28 tools from the registry", async () => {
+  it("advertises all 32 tools from the registry", async () => {
     const { body } = await rpc("tools/list", {});
     const tools = (body.result as { tools: { name: string }[] }).tools;
-    expect(tools).toHaveLength(28);
+    expect(tools).toHaveLength(32);
     expect(tools.map((t) => t.name).sort()).toEqual(Object.keys(TOOLS).sort());
   });
 
@@ -215,8 +215,8 @@ describe("statelessness", () => {
     // once, and discards it.
     const first = await rpc("tools/list", {});
     const second = await rpc("tools/list", {});
-    expect((first.body.result as { tools: unknown[] }).tools).toHaveLength(28);
-    expect((second.body.result as { tools: unknown[] }).tools).toHaveLength(28);
+    expect((first.body.result as { tools: unknown[] }).tools).toHaveLength(32);
+    expect((second.body.result as { tools: unknown[] }).tools).toHaveLength(32);
   });
 });
 

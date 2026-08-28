@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../src/context";
 import { addContact } from "../src/tools/attributes";
 import { logEncounter } from "../src/tools/encounters";
-import { exportData as listOrExport } from "../src/tools/export";
+import { listRecords } from "../src/tools/export";
 import { createFollowup } from "../src/tools/followups";
 import { createPerson } from "../src/tools/people";
 
@@ -23,8 +23,8 @@ beforeEach(async () => {
 });
 
 describe("behaviours the schemas must be made to agree with", () => {
-  it("export_data defaults scope to people when omitted", async () => {
-    const result = await listOrExport(ctx, {} as never);
+  it("list_records defaults scope to people when omitted", async () => {
+    const result = await listRecords(ctx, {} as never);
     expect(result.scope).toBe("people");
   });
 

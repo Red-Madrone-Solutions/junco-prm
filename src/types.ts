@@ -60,22 +60,27 @@ export interface Encounter {
   id: string;
   record_kind: "encounter";
   person_id: string;
+  person_name: string;
   occurred_on: string;
   occurred_at: string | null;
   location: string | null;
   event: string | null;
   summary: string;
   created_at: string;
+  updated_at: string;
 }
 
 export interface Followup {
   id: string;
   record_kind: "followup";
   person_id: string;
+  person_name: string;
   due_on: string;
   note: string | null;
   completed_at: string | null;
   cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface PersonDetail extends Person {

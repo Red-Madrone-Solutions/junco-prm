@@ -515,3 +515,70 @@ remains unexercised for that specific case.
 
 The throwaway person, its contact, and its encounter were deleted through
 `delete_person`'s two-phase confirmation. No smoke-test data remains.
+
+---
+
+## Run of 2026-08-28: Migration 0009 index planner check
+
+Task 3. Confirms whether SQLite's query planner will use the new indexes added
+for the read-surface filters. Run locally against the test database with
+migrations 0001-0008 applied.
+
+Wrangler 4.125.0.
+
+    npx wrangler d1 execute junco-prm --local --command \
+      "EXPLAIN QUERY PLAN SELECT id FROM people WHERE updated_at > '2026-01-01' ORDER BY id LIMIT 10"
+
+Verbatim output:
+
+```json
+[
+  {
+    "results": [
+      {
+        "id": 5,
+        "parent": 0,
+        "notused": 223,
+        "detail": "SCAN people USING INDEX sqlite_autoindex_people_1"
+      }
+    ],
+    "success": true,
+    "meta": {
+      "duration": 1
+    }
+  }
+]
+```
+
+**Verdict: the local D1 state has not applied migration 0009.** The EXPLAIN
+found no `idx_people_updated` index; it scanned using only the primary key. A
+PRAGMA index_list check confirms it:
+
+    PRAGMA index_list('people')
+
+Result (3 indexes total):
+
+```json
+{
+  "results": [
+    { "seq": 0, "name": "idx_people_organization", "unique": 0, "origin": "c", "partial": 0 },
+    { "seq": 1, "name": "idx_people_archived", "unique": 0, "origin": "c", "partial": 0 },
+    { "seq": 2, "name": "sqlite_autoindex_people_1", "unique": 1, "origin": "pk", "partial": 0 }
+  ]
+}
+```
+
+`idx_people_updated` is absent from this list. The table holds 0 rows.
+
+**Why:** wrangler's `d1 execute` against the local database does not dynamically
+discover or apply new migration files during an active session. The migrations
+were committed to disk and are applied by the test suite's harness (which passes
+599 tests), but wrangler's local D1 state was initialized before 0009 existed and
+has not re-scanned or re-applied migrations. This means the EXPLAIN test says
+nothing about planner choice - the index simply is not present to be chosen.
+
+**What this means for the deploy:** The index exists in the migration file
+(committed and tested). Once deployed, whether the planner uses it on a live
+database is a question for the next measurement run. The filter is correct
+without the index (it scans instead of seeks); the index is for speed, not
+correctness, per the migration's own comments.
