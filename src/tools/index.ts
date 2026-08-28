@@ -241,7 +241,7 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
           limit: int("Page size, 1 to 500. Defaults to 100."),
           cursor: str("Page token from a previous next_cursor."),
         },
-        ["scope"]
+        []
       ),
       exportData
     ),
@@ -317,7 +317,7 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
           person_id: personId,
           contact_type: enumOf(["email", "phone"], "Which kind of contact method."),
           value: str("The address or number, as the person gave it."),
-          label: str('Optional, e.g. "work" or "mobile".'),
+          label: nullableStr('Optional, e.g. "work" or "mobile".'),
         },
         ["person_id", "contact_type", "value"],
         { idempotent: true }
@@ -401,10 +401,10 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
             "Optional exact instant, ISO-8601 UTC, when the time of day matters. The date above is what reads sort by."
           ),
           summary: str("What happened."),
-          location: str("Where, if worth recording."),
-          event: str('Event name, e.g. "WordCamp US 2026".'),
+          location: nullableStr("Where, if worth recording."),
+          event: nullableStr('Event name, e.g. "WordCamp US 2026".'),
         },
-        ["person_id", "occurred_on", "summary"],
+        ["person_id", "summary"],
         { idempotent: true }
       ),
       logEncounter
@@ -449,7 +449,7 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         {
           person_id: personId,
           due_on: str("Due date, as YYYY-MM-DD in the owner's time zone."),
-          note: str("What is owed."),
+          note: nullableStr("What is owed."),
         },
         ["person_id", "due_on"],
         { idempotent: true }
