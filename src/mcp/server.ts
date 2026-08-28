@@ -8,6 +8,7 @@ import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { logToolCall } from "../log";
 import { TOOLS } from "../tools/index";
+import { validateInput } from "../validate";
 import { toolErrorResult, unexpectedErrorResult } from "./errors";
 
 /**
@@ -79,7 +80,12 @@ export function buildServer(config: Config, env: Env, requestId: string): Server
 
     const startedAt = Date.now();
     try {
-      const result = await tool.run(ctx, (request.params.arguments ?? {}) as never);
+      // Before anything else. A refused call must not reach a handler, must not
+      // touch D1, and must not consume an idempotency key: a claim recorded for
+      // a call that never produced a result is a key that can never replay.
+      const args = request.params.arguments ?? {};
+      validateInput(tool.name, tool.inputSchema, args);
+      const result = await tool.run(ctx, args as never);
       logToolCall({
         requestId,
         tool: tool.name,
