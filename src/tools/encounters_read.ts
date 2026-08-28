@@ -10,6 +10,7 @@ export type { Encounter } from "../types";
 export interface EncounterRow {
   id: string;
   person_id: string;
+  person_name: string;
   occurred_on: string;
   occurred_at: string | null;
   location: string | null;
@@ -19,8 +20,14 @@ export interface EncounterRow {
   updated_at: string;
 }
 
+// Qualified because the JOIN below adds `people`, which also has id,
+// created_at, and updated_at - bare column references become ambiguous the
+// moment the second table appears, and SQLite reports that at query time.
 export const COLUMNS =
-  "id, person_id, occurred_on, occurred_at, location, event, summary, created_at, updated_at";
+  "e.id AS id, e.person_id AS person_id, e.occurred_on AS occurred_on, " +
+  "e.occurred_at AS occurred_at, e.location AS location, e.event AS event, " +
+  "e.summary AS summary, e.created_at AS created_at, e.updated_at AS updated_at, " +
+  "p.full_name AS person_name";
 
 export function toEncounter(row: EncounterRow): Encounter {
   return { record_kind: "encounter", ...row };
@@ -55,7 +62,7 @@ function decodeEncounterCursor(cursor: string | undefined): { occurred_on: strin
 
 export async function loadEncounter(ctx: ToolContext, id: string): Promise<Encounter> {
   const row = await ctx.db
-    .prepare(`SELECT ${COLUMNS} FROM encounters WHERE id = ?`)
+    .prepare(`SELECT ${COLUMNS} FROM encounters e JOIN people p ON p.id = e.person_id WHERE e.id = ?`)
     .bind(id)
     .first<EncounterRow>();
   if (!row) throw new ToolError("not_found", `no encounter with id ${id}`);
@@ -80,11 +87,11 @@ export async function listEncounters(
   const values: (string | number)[] = [];
 
   if (input.person_id !== undefined) {
-    clauses.push("person_id = ?");
+    clauses.push("e.person_id = ?");
     values.push(assertId("p", input.person_id));
   }
   if (input.event !== undefined) {
-    clauses.push("event = ?");
+    clauses.push("e.event = ?");
     values.push(input.event);
   }
   for (const [key, op] of [["since", ">="], ["until", "<="]] as const) {
@@ -93,14 +100,14 @@ export async function listEncounters(
     if (!isLocalDate(value)) {
       throw new ToolError("invalid_input", `${key} must be a YYYY-MM-DD local date`);
     }
-    clauses.push(`occurred_on ${op} ?`);
+    clauses.push(`e.occurred_on ${op} ?`);
     values.push(value);
   }
   const after = decodeEncounterCursor(input.cursor);
   if (after !== null) {
     // Keyset on the full sort key: strictly older dates, or the same date further
     // along in id order.
-    clauses.push("(occurred_on < ? OR (occurred_on = ? AND id > ?))");
+    clauses.push("(e.occurred_on < ? OR (e.occurred_on = ? AND e.id > ?))");
     values.push(after.occurred_on, after.occurred_on, after.id);
   }
 
@@ -108,9 +115,9 @@ export async function listEncounters(
 
   const { results } = await ctx.db
     .prepare(
-      `SELECT ${COLUMNS} FROM encounters
+      `SELECT ${COLUMNS} FROM encounters e JOIN people p ON p.id = e.person_id
        ${where}
-       ORDER BY occurred_on DESC, id ASC
+       ORDER BY e.occurred_on DESC, e.id ASC
        LIMIT ?`
     )
     .bind(...values, limit + 1)

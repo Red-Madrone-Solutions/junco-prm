@@ -5,6 +5,7 @@ import { normalizeText } from "../normalize";
 import { clampLimit, decodeCursor, encodeCursor } from "../paginate";
 import { isIsoInstant } from "../time";
 import { COLUMNS as ENCOUNTER_COLUMNS } from "./encounters_read";
+import { COLUMNS as FOLLOWUP_COLUMNS } from "./followups";
 
 /**
  * The allowlist, and the only thing `scope` is ever checked against. Kept as an
@@ -53,9 +54,18 @@ const QUERIES: Record<ListScope, string> = Object.assign(Object.create(null), {
   people: `SELECT id, full_name, preferred_name, job_title, organization, notes,
                   archived_at, created_at, updated_at
            FROM people`,
-  encounters: `SELECT ${ENCOUNTER_COLUMNS} FROM encounters`,
-  followups: `SELECT id, person_id, due_on, note, completed_at, cancelled_at, created_at, updated_at
-              FROM followups`,
+  encounters: `SELECT ${ENCOUNTER_COLUMNS} FROM encounters e JOIN people p ON p.id = e.person_id`,
+  followups: `SELECT ${FOLLOWUP_COLUMNS} FROM followups f JOIN people p ON p.id = f.person_id`,
+});
+
+// The outer page query's own WHERE/ORDER BY reference `id` and `updated_at`
+// bare (see below). Unqualified, those become ambiguous the moment the JOIN
+// above lands, since `people` has both columns too. `people` itself has no
+// join, so it keeps the empty prefix and its query text is untouched.
+const OUTER_ALIAS: Record<ListScope, string> = Object.assign(Object.create(null), {
+  people: "",
+  encounters: "e.",
+  followups: "f.",
 });
 
 // The keyset id is prefixed differently per table, so a cursor issued for one
@@ -382,9 +392,15 @@ export async function listRecords(
   // without a second COUNT query.
   const predicate = buildPagePredicate(scope, input, after, limit + 1, updatedAfter, tags);
 
-  const orderBy = updatedAfter !== null ? "updated_at ASC, id ASC" : "id ASC";
+  // Qualified with the outer query's own alias, not the bare names
+  // `buildPagePredicate` uses inside its unaliased, single-table subquery:
+  // once encounters/followups join `people`, a bare `id` or `updated_at` out
+  // here is ambiguous between the two tables.
+  const outerAlias = OUTER_ALIAS[scope];
+  const orderBy =
+    updatedAfter !== null ? `${outerAlias}updated_at ASC, ${outerAlias}id ASC` : `${outerAlias}id ASC`;
   const { results } = await ctx.db
-    .prepare(`${base} WHERE id IN (${predicate.sql}) ORDER BY ${orderBy}`)
+    .prepare(`${base} WHERE ${outerAlias}id IN (${predicate.sql}) ORDER BY ${orderBy}`)
     .bind(...predicate.binds)
     .all<Record<string, unknown>>();
 

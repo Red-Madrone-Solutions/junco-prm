@@ -286,3 +286,18 @@ describe("subject_id", () => {
     expect(await subjectIdFor("cancel_followup:k1")).toBe(person.id);
   });
 });
+
+describe("person_name", () => {
+  it("a follow-up carries person_name from every reader", async () => {
+    const person = await createPerson(ctx, { full_name: "Bo Diddley" });
+    const created = await createFollowup(ctx, {
+      person_id: person.id,
+      due_on: "2026-09-10",
+      note: "email about the event",
+    });
+    expect(created.followup.person_name).toBe("Bo Diddley");
+
+    const fetched = await getPerson(ctx, { person_id: person.id });
+    expect(fetched.open_followups[0]!.person_name).toBe("Bo Diddley");
+  });
+});

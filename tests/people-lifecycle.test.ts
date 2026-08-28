@@ -5,6 +5,7 @@ import { ToolError } from "../src/errors";
 import { archivePerson, createPerson, deletePerson, unarchivePerson } from "../src/tools/people";
 import { addContact } from "../src/tools/attributes";
 import { logEncounter } from "../src/tools/encounters";
+import { createFollowup } from "../src/tools/followups";
 
 const ctx: ToolContext = {
   db: env.DB,
@@ -254,6 +255,47 @@ describe("deletePerson", () => {
       .bind("%distinctive%")
       .first<{ n: number }>();
     expect(remaining?.n).toBe(0);
+  });
+
+  it("scrubs a joined person_name out of log_encounter and create_followup responses too", async () => {
+    // person_name is joined onto Encounter and Followup at read time (this
+    // task), so log_encounter's and create_followup's stored idempotency
+    // responses now carry it where they did not before. Both writers pass the
+    // person's id as subject_id, so the same subject_id scrub that already
+    // covers create_person and add_contact must reach these two as well.
+    const person = await createPerson(ctx, { full_name: "Henrietta Lacks" });
+    await logEncounter(ctx, {
+      person_id: person.id,
+      occurred_on: "2026-08-20",
+      summary: "met",
+      idempotency_key: "k-encounter",
+    });
+    await createFollowup(ctx, {
+      person_id: person.id,
+      due_on: "2026-09-01",
+      idempotency_key: "k-followup",
+    });
+
+    const before = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM idempotency_keys WHERE subject_id = ? AND response_json LIKE ?"
+    )
+      .bind(person.id, "%Henrietta%")
+      .first<{ n: number }>();
+    expect(before?.n).toBeGreaterThan(0);
+
+    const token = await deletePerson(ctx, { person_id: person.id });
+    if (token.status !== "confirmation_required") throw new Error("expected a preview");
+    await deletePerson(ctx, {
+      person_id: person.id,
+      confirmation_token: token.confirmation_token,
+    });
+
+    const after = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM idempotency_keys WHERE response_json LIKE ?"
+    )
+      .bind("%Henrietta%")
+      .first<{ n: number }>();
+    expect(after?.n).toBe(0);
   });
 
   it("does not touch an unrelated person's idempotency row just because that person's id appears nested inside it", async () => {

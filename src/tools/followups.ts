@@ -12,13 +12,18 @@ export type { Followup } from "../types";
 export { loadOpenFollowups } from "./followups_read";
 
 export interface DueItem extends Followup {
-  person_name: string;
   days_overdue: number;
 }
 
 type FollowupRow = Omit<Followup, "record_kind">;
 
-const COLUMNS = "id, person_id, due_on, note, completed_at, cancelled_at, created_at, updated_at";
+// Qualified because the JOIN below adds `people`, which also has id,
+// created_at, and updated_at - bare column references become ambiguous the
+// moment the second table appears, and SQLite reports that at query time.
+export const COLUMNS =
+  "f.id AS id, f.person_id AS person_id, f.due_on AS due_on, f.note AS note, " +
+  "f.completed_at AS completed_at, f.cancelled_at AS cancelled_at, " +
+  "f.created_at AS created_at, f.updated_at AS updated_at, p.full_name AS person_name";
 
 function requireLocalDate(value: unknown, field: string): string {
   if (!isLocalDate(value)) {
@@ -97,7 +102,7 @@ export async function createFollowup(
 
 export async function loadFollowup(ctx: ToolContext, id: string): Promise<Followup> {
   const row = await ctx.db
-    .prepare(`SELECT ${COLUMNS} FROM followups WHERE id = ?`)
+    .prepare(`SELECT ${COLUMNS} FROM followups f JOIN people p ON p.id = f.person_id WHERE f.id = ?`)
     .bind(id)
     .first<FollowupRow>();
   if (!row) throw new ToolError("not_found", `no follow-up with id ${id}`);
@@ -279,7 +284,7 @@ export async function listDue(
        LIMIT ?`
     )
     .bind(through, ...keysetValues, limit + 1)
-    .all<FollowupRow & { person_name: string }>();
+    .all<FollowupRow>();
 
   const page = results.slice(0, limit);
   const last = page[page.length - 1];
@@ -287,7 +292,6 @@ export async function listDue(
   return {
     results: page.map((row) => ({
       ...toFollowup(row),
-      person_name: row.person_name,
       days_overdue: Math.max(daysBetween(row.due_on, asOf), 0),
     })),
     as_of: asOf,

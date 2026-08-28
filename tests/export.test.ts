@@ -108,9 +108,11 @@ describe("listRecords", () => {
 
     const encounters = await listRecords(ctx, { scope: "encounters" });
     expect(encounters.records).toHaveLength(1);
+    expect((encounters.records[0] as { person_name: string }).person_name).toBe("Ada");
 
     const followups = await listRecords(ctx, { scope: "followups" });
     expect(followups.records).toHaveLength(1);
+    expect((followups.records[0] as { person_name: string }).person_name).toBe("Ada");
   });
 
   it("never lists staged roster data", async () => {
