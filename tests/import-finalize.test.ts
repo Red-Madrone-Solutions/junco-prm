@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
 import { finalizeImport, importRoster } from "../src/tools/import";
-import { searchPeople } from "../src/tools/search";
+import { searchRosterEntries } from "../src/tools/search_roster";
 
 const ctx: ToolContext = {
   db: env.DB,
@@ -136,7 +136,7 @@ describe("finalizeImport", () => {
       .bind(run2Id, run2Id)
       .run();
 
-    const found = await searchPeople(ctx, { query: "Ordering", scope: "roster" });
+    const found = await searchRosterEntries(ctx, { query: "Ordering" });
     const kept = found.roster_entries.find((e) => e.full_name === "Ordering Kept");
     const dropped = found.roster_entries.find((e) => e.full_name === "Ordering Dropped");
 
@@ -167,7 +167,7 @@ describe("finalizeImport", () => {
     await finalizeImport(ctx, { run_id: second.run_id });
 
     // A person who left the attendee list is still someone you met.
-    const found = await searchPeople(ctx, { query: "Hopper", scope: "roster" });
+    const found = await searchRosterEntries(ctx, { query: "Hopper" });
     expect(found.roster_entries).toHaveLength(1);
     expect(found.roster_entries[0]?.stale).toBe(true);
   });
@@ -237,8 +237,8 @@ describe("finalizeImport", () => {
       rows: [{ external_row_key: "1", full_name: "Ada Lovelace" }],
     });
 
-    const ada = await searchPeople(ctx, { query: "Lovelace", scope: "roster" });
-    const grace = await searchPeople(ctx, { query: "Hopper", scope: "roster" });
+    const ada = await searchRosterEntries(ctx, { query: "Lovelace" });
+    const grace = await searchRosterEntries(ctx, { query: "Hopper" });
 
     // Neither is stale. August is still the latest committed run and it saw
     // both rows; an open run is inert and must not change what either reads as.
@@ -266,7 +266,7 @@ describe("finalizeImport", () => {
 
     // An abandoned run is inert. Grace is not stale, because nothing has
     // declared a newer complete picture of this roster.
-    const found = await searchPeople(ctx, { query: "Hopper", scope: "roster" });
+    const found = await searchRosterEntries(ctx, { query: "Hopper" });
     expect(found.roster_entries[0]?.stale).toBe(false);
   });
 

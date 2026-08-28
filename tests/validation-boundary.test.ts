@@ -21,23 +21,26 @@ async function idempotencyKeyExists(key: string): Promise<boolean> {
 }
 
 describe("the defect: unknown arguments are dropped", () => {
-  // THE REPORTED BUG. A caller passed `cursor` to search_people, which declares
-  // people_cursor and roster_cursor and no cursor. The argument was dropped,
-  // the query restarted, and the identical page and identical token came back.
-  // Filed as a pagination defect. Pagination was correct.
+  // THE REPORTED BUG, ORIGINALLY. A caller passed `cursor` to search_people,
+  // which at the time declared people_cursor and roster_cursor and no cursor.
+  // The argument was dropped, the query restarted, and the identical page and
+  // identical token came back. Filed as a pagination defect. Pagination was
+  // correct. Task 4 gave search_people a real `cursor` field and retired
+  // people_cursor and roster_cursor, so this test now demonstrates the same
+  // defect shape with those retired names instead.
   it("refuses an unknown argument instead of ignoring it", async () => {
     const { isError, payload } = await callTool("search_people", {
       query: "Mark",
-      cursor: "eyJraW5kIjoi",
+      people_cursor: "eyJraW5kIjoi",
     });
     expect(isError).toBe(true);
     expect(payload.error.code).toBe("invalid_input");
-    expect(payload.error.reason).toContain("cursor");
+    expect(payload.error.reason).toContain("people_cursor");
   });
 
   it("names what it would have accepted", async () => {
-    const { payload } = await callTool("search_people", { query: "Mark", cursor: "x" });
-    expect(payload.error.reason).toMatch(/people_cursor|roster_cursor/);
+    const { payload } = await callTool("search_people", { query: "Mark", people_cursor: "x" });
+    expect(payload.error.reason).toMatch(/cursor/);
   });
 
   it("refuses an unknown argument on a write without writing", async () => {

@@ -33,6 +33,7 @@ import {
   type JsonSchema,
 } from "./schema";
 import { searchPeople } from "./search";
+import { searchRosterEntries } from "./search_roster";
 
 /**
  * MCP's three static annotations. Clients use them to decide what to approve
@@ -149,26 +150,38 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
     // ---------------------------------------------------------------- reads
     define(
       "search_people",
-      "Search people you have recorded and, on request, staged roster entries. " +
-        "Matches names, organization, title, notes, tags, and email addresses. " +
-        "Returns two separate arrays: `people` (durable records you can write to) " +
-        "and `roster_entries` (imported rows that must be promoted first).",
+      "Search people you have recorded. Matches names, organization, title, " +
+        "notes, tags, and email addresses. Returns durable records you can write to. " +
+        "For staged roster entries, use search_roster_entries instead.",
       READ,
       obj(
         {
           query: str("Search text. Treated as literal text, never as query syntax."),
-          scope: enumOf(
-            ["people", "roster", "all"],
-            "Which records to search. Defaults to people."
-          ),
           include_archived: bool("Include archived people. Defaults to false."),
-          limit: int("Maximum results per array, 1 to 50. Defaults to 20."),
-          people_cursor: str("Page token from a previous people_next_cursor."),
-          roster_cursor: str("Page token from a previous roster_next_cursor."),
+          limit: int("Maximum results, 1 to 50. Defaults to 20."),
+          cursor: str("Page token from a previous next_cursor."),
         },
         ["query"]
       ),
       searchPeople
+    ),
+    define(
+      "search_roster_entries",
+      "Free-text search over staged roster entries: names, organizations, and job titles. " +
+        "Returns external_row_key, the identity the import assigned each row, so a source row " +
+        "can be matched back to its entry. NOTE: when no source id was supplied at import, that " +
+        "key is derived from the person's email address and therefore contains it. " +
+        "For filtering by role or promotion state rather than text, use list_roster_entries.",
+      READ,
+      obj(
+        {
+          query: str("Search text. Treated as literal text, never as query syntax."),
+          limit: int("Maximum results, 1 to 50. Defaults to 20."),
+          cursor: str("Page token from a previous next_cursor."),
+        },
+        ["query"]
+      ),
+      searchRosterEntries
     ),
     define(
       "get_person",
