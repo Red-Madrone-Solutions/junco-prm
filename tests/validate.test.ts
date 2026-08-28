@@ -151,6 +151,12 @@ describe("validateInput", () => {
 // silently, unchecked by `withoutPatterns`, which only strips top-level
 // patterns - exactly the failure this guard exists to prevent. No nested
 // pattern exists today; the point is that adding one later cannot be silent.
+//
+// `pattern` is only in SUPPORTED because `withoutPatterns` strips it - and
+// `withoutPatterns` only strips the TOP level (src/validate.ts:31-42). A
+// `pattern` found at any nested path is therefore not covered by that
+// stripping and would be enforced by the library, so it is allowed here only
+// when `path` names a top-level property (no `/`).
 describe("every registered schema is safe to hand to the validator", () => {
   const SUPPORTED = new Set([
     "type", "description", "enum", "pattern", "items", "properties", "required",
@@ -160,7 +166,14 @@ describe("every registered schema is safe to hand to the validator", () => {
   function walk(spec: unknown, toolName: string, path: string): void {
     if (spec === null || typeof spec !== "object" || Array.isArray(spec)) return;
     const record = spec as Record<string, unknown>;
+    const topLevel = !path.includes("/");
     for (const keyword of Object.keys(record)) {
+      if (keyword === "pattern" && !topLevel) {
+        expect(false, `${toolName} uses nested pattern at ${path}, unstripped by withoutPatterns`).toBe(
+          true
+        );
+        continue;
+      }
       expect(SUPPORTED.has(keyword), `${toolName} uses ${keyword} at ${path}`).toBe(true);
     }
     if (record.items !== undefined) walk(record.items, toolName, `${path}/items`);
@@ -170,6 +183,19 @@ describe("every registered schema is safe to hand to the validator", () => {
       }
     }
   }
+
+  // Proves the guard actually catches what it claims to: a `pattern` nested
+  // inside `items` is enforced by the library (withoutPatterns only strips
+  // the top level), so it must fail here even though `pattern` is itself a
+  // SUPPORTED keyword at the top level.
+  it("fails on a nested pattern, which withoutPatterns cannot strip", () => {
+    const fakeTagsSchema = {
+      type: "array",
+      description: "Tag names.",
+      items: { type: "string", pattern: "^x_" },
+    };
+    expect(() => walk(fakeTagsSchema, "fake_tool", "tags")).toThrow();
+  });
 
   it("declares no keyword outside the supported set, at any depth", async () => {
     const { TOOLS } = await import("../src/tools/index");
