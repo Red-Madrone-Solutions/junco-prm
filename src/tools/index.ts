@@ -263,6 +263,10 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
           // string to decide what to send.
           limit: int("Page size, 1 to 500. Defaults to 100."),
           cursor: str("Page token from a previous next_cursor."),
+          include: strArray(
+            'Relations to return inline on people. Any of "tags", "links", "contacts". ' +
+              "Page size is capped at 100 when this is used."
+          ),
         },
         []
       ),

@@ -2,6 +2,7 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ToolContext } from "../src/context";
 import { ToolError } from "../src/errors";
+import { addContact, addLink, addTags } from "../src/tools/attributes";
 import { logEncounter } from "../src/tools/encounters";
 import { listRecords } from "../src/tools/export";
 import { createFollowup } from "../src/tools/followups";
@@ -170,4 +171,84 @@ describe("listRecords", () => {
       expect((e as ToolError).code).toBe("invalid_id");
     }
   });
+});
+
+describe("list_records include", () => {
+  // THE TEST THAT MATTERS. The obvious implementation joins the relation
+  // tables, which makes row count stop meaning person count: a person with
+  // three tags eats three rows of the limit, the page returns fewer people
+  // than asked for, and the cursor lands on a row rather than a person.
+  it("returns exactly the requested number of distinct people when they carry many relations", async () => {
+    for (let i = 0; i < 5; i++) {
+      const p = await createPerson(ctx, { full_name: `Person ${i}` });
+      await addTags(ctx, { person_id: p.id, tags: ["a", "b", "c"] });
+      await addLink(ctx, { person_id: p.id, link_type: "website", url: "https://a.test" });
+      await addLink(ctx, { person_id: p.id, link_type: "linkedin", url: "https://b.test" });
+      await addContact(ctx, { person_id: p.id, contact_type: "email", value: `p${i}@t.test` });
+    }
+    const result = await listRecords(ctx, {
+      scope: "people",
+      include: ["tags", "links", "contacts"],
+      limit: 3,
+    });
+    expect(result.records).toHaveLength(3);
+    expect(new Set(result.records.map((r) => (r as { id: string }).id)).size).toBe(3);
+  });
+
+  it("pages without repeating or skipping a person", async () => {
+    for (let i = 0; i < 5; i++) {
+      const p = await createPerson(ctx, { full_name: `Person ${i}` });
+      await addTags(ctx, { person_id: p.id, tags: ["a", "b"] });
+    }
+    const first = await listRecords(ctx, { scope: "people", include: ["tags"], limit: 3 });
+    const second = await listRecords(ctx, {
+      scope: "people",
+      include: ["tags"],
+      limit: 3,
+      cursor: first.next_cursor ?? undefined,
+    });
+    const ids = [...first.records, ...second.records].map((r) => (r as { id: string }).id);
+    expect(new Set(ids).size).toBe(5);
+  });
+
+  it("attaches each relation to the right person", async () => {
+    const ada = await createPerson(ctx, { full_name: "Ada" });
+    const grace = await createPerson(ctx, { full_name: "Grace" });
+    await addTags(ctx, { person_id: ada.id, tags: ["speaker"] });
+    await addTags(ctx, { person_id: grace.id, tags: ["organizer"] });
+    const result = await listRecords(ctx, { scope: "people", include: ["tags"] });
+    const byId = Object.fromEntries(
+      result.records.map((r) => [(r as { id: string }).id, r as { tags: string[] }])
+    );
+    expect(byId[ada.id]?.tags).toEqual(["speaker"]);
+    expect(byId[grace.id]?.tags).toEqual(["organizer"]);
+  });
+
+  it("returns an empty array, not a missing key, for a person with no relations", async () => {
+    const p = await createPerson(ctx, { full_name: "Nobody" });
+    const result = await listRecords(ctx, { scope: "people", include: ["tags", "links"] });
+    const row = result.records.find((r) => (r as { id: string }).id === p.id) as {
+      tags: string[];
+      links: unknown[];
+    };
+    expect(row.tags).toEqual([]);
+    expect(row.links).toEqual([]);
+  });
+
+  it("caps the page size lower when include is used", async () => {
+    await expect(
+      listRecords(ctx, { scope: "people", include: ["tags"], limit: 500 })
+    ).rejects.toMatchObject({ code: "limit_exceeded" });
+  });
+
+  it("refuses include on scopes that have no relations", async () => {
+    await expect(
+      listRecords(ctx, { scope: "encounters", include: ["tags"] })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  // The Task 8 test covering a filter (tags) narrowing the page while include
+  // is active is deferred to Task 8, which is where the tags filter itself
+  // lands. It is not written here per the controller ruling recorded in the
+  // run ledger for this task.
 });
