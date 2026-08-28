@@ -75,8 +75,9 @@ describe("refusals that already work, and must keep working", () => {
   });
 
   // THE CONTRACT THE VALIDATOR MUST NOT BREAK. src/ids.ts distinguishes a
-  // malformed id from a bad argument, and tests/mcp.test.ts:140 depends on it.
-  // A validator enforcing the ^p_ pattern would return invalid_input here.
+  // malformed id from a bad argument, and tests/mcp.test.ts's "maps an id of
+  // the wrong kind to invalid_id, not to a crash" depends on it. A validator
+  // enforcing the ^p_ pattern would return invalid_input here.
   it("still reports invalid_id for an id of the wrong kind", async () => {
     const { payload } = await callTool("log_encounter", {
       person_id: "re_1",

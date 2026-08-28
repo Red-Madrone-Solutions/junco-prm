@@ -14,6 +14,15 @@ type was used instead. Id patterns from `id()` were not treated as drift:
 Task 6 strips patterns before validating on purpose, so `assertId` keeps
 reporting `invalid_id` regardless of what the JSON Schema says.
 
+**What this method cannot see.** Comparing declared schema types against
+declared TypeScript interfaces only catches a mismatch that both sides wrote
+down. It cannot see **runtime null tolerance** - a handler that treats
+`null` as absent (`value ?? default`, `value === null ? x : value`) even
+though neither its interface nor the schema says the property is nullable.
+That behaviour lived entirely in code the comparison never read. Three
+handlers have it, and they are drift rows the table below does not carry.
+See "Accepted strictness increases beyond the table" below.
+
 Four verdicts:
 
 - **clean** - every property the handler reads is declared, every `required`
@@ -72,6 +81,60 @@ interface accepting null is deliberate: null is how a caller clears a field.
 (two separate rows), `add_contact`, `create_followup`. That is 5 drift rows
 total, matching the five already known and listed in the brief - this audit
 found no additional drift beyond them.
+
+**These five are the complete count for the method described above: declared
+schema type versus declared interface type.** They are not the complete
+count of behaviour that changed when validation switched on. See the next
+section.
+
+## Accepted strictness increases beyond the table: runtime null tolerance
+
+These three were not caught by the table's method because they are not a
+disagreement between two declarations. In each case the schema and the
+interface agree that the property is non-nullable, but the handler's code
+treated `null` the same as "not sent" anyway. Validation now refuses `null`
+before the handler ever sees it. **Do not loosen these schemas** - a loud,
+actionable refusal is the outcome this branch wanted, and none of the three
+has a real caller tripping it yet. Loosening any of them should wait for
+that.
+
+- **`limit` / `encounter_limit`, five tools.** `clampLimit` (`src/paginate.ts:45-46`)
+  returned the default for `limit: undefined` **and** `limit: null`. The
+  schema declares `limit` with `int(...)`, which is non-nullable. Before:
+  `search_people({query: "Mark", limit: null})` returned 20 results. After:
+  it is refused with `invalid_input, "limit must be integer"`. Same shape for
+  `list_encounters`, `list_due`, `export_data`, and `get_person`'s
+  `encounter_limit` (`src/tools/people.ts:234`, `input.encounter_limit ?? 10`
+  runs before `clampLimit` is ever reached, but the effect at the boundary is
+  identical: `null` used to resolve to the default, now it is refused first).
+
+- **`occurred_on` on `log_encounter` and `update_encounter`.**
+  `resolveOccurredOn` (`src/tools/encounters.ts:25-26`) treated
+  `occurred_on: null` the same as omitting it - today. The schema declares
+  `occurred_on` with `str(...)`, non-nullable. Before: `occurred_on: null`
+  logged or updated an encounter dated today. After: refused with
+  `invalid_input`.
+
+- **`event` on `import_roster`.** `ensureSource` (`src/tools/import_state.ts:220`)
+  reads `input.event ?? null` when inserting the roster source row.
+  `ImportRosterInput.event` is typed `string` (not `string | null`), so the
+  table's declared-versus-declared method marked `import_roster` clean - the
+  interface itself claims `event` is never null, even though the line right
+  below tolerates it. Before: `import_roster({..., event: null})` inserted a
+  source row with `event = NULL`. After: refused with `invalid_input`.
+
+By the audit's own definition, these are drift rows six through eight - just
+not the kind the table's method can find.
+
+**The positive case, for balance.** `list_encounters({event: null})` used to
+reach `listEncounters` (`src/tools/encounters_read.ts:83-86`), which only
+skips the `event` filter when the value is `undefined` - not `null` - so
+`event: null` bound `event = NULL` in SQL, matched no row (SQL `NULL`
+compares equal to nothing, including itself), and returned an empty list. An
+empty list reads as a plausible, if wrong, answer: "no encounters have that
+event." It is now refused with `invalid_input` instead, which is the design
+goal working as intended - the caller finds out their filter was malformed
+instead of trusting a silently-empty result.
 
 ## A near-miss that is not drift: `update_person` and `full_name`
 

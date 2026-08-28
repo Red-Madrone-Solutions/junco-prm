@@ -50,6 +50,17 @@ describe("validateInput", () => {
     expect(msg).toContain("person_id");
   });
 
+  // A `__proto__` key must become an own property of `cleaned`, not set its
+  // prototype. Plain assignment (`cleaned[key] = value`) does the latter,
+  // which would hide the key from `additionalProperties: false` entirely -
+  // this call would not throw at all if that regressed.
+  it("refuses a caller-sent __proto__ as an unknown argument", () => {
+    const input = JSON.parse('{"person_id": "p_1", "__proto__": {"polluted": true}}');
+    const msg = reason(() => validateInput("t", schema, input));
+    expect(msg).toContain("__proto__");
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
   it("refuses a missing required property", () => {
     expect(reason(() => validateInput("t", schema, {}))).toContain("person_id");
   });
@@ -88,7 +99,8 @@ describe("validateInput", () => {
   // THE ONE THAT PROTECTS THE ERROR DESIGN. `id()` puts a ^p_ pattern in the
   // schema, and src/ids.ts reports a wrong-kind id as invalid_id. If this
   // validator enforced the pattern, that id would become invalid_input and
-  // tests/mcp.test.ts:140 would break along with the distinction it guards.
+  // tests/mcp.test.ts's "maps an id of the wrong kind to invalid_id, not to
+  // a crash" would break along with the distinction it guards.
   it("does not enforce id patterns, leaving them to assertId", () => {
     expect(() => validateInput("t", schema, { person_id: "re_1" })).not.toThrow();
   });
@@ -132,18 +144,38 @@ describe("validateInput", () => {
 // Guards the seam between this project's schema helpers and the library.
 // A helper added later that emits a keyword the stripper does not know about
 // would otherwise be enforced silently, including a new pattern.
+//
+// Walks nested schema objects (an array's `items`, an object's nested
+// `properties`) rather than only the top level. A `pattern` (or any other
+// unsupported keyword) added inside `items` would otherwise be enforced
+// silently, unchecked by `withoutPatterns`, which only strips top-level
+// patterns - exactly the failure this guard exists to prevent. No nested
+// pattern exists today; the point is that adding one later cannot be silent.
 describe("every registered schema is safe to hand to the validator", () => {
-  it("declares no keyword outside the supported set", async () => {
+  const SUPPORTED = new Set([
+    "type", "description", "enum", "pattern", "items", "properties", "required",
+    "additionalProperties",
+  ]);
+
+  function walk(spec: unknown, toolName: string, path: string): void {
+    if (spec === null || typeof spec !== "object" || Array.isArray(spec)) return;
+    const record = spec as Record<string, unknown>;
+    for (const keyword of Object.keys(record)) {
+      expect(SUPPORTED.has(keyword), `${toolName} uses ${keyword} at ${path}`).toBe(true);
+    }
+    if (record.items !== undefined) walk(record.items, toolName, `${path}/items`);
+    if (record.properties !== null && typeof record.properties === "object") {
+      for (const [key, child] of Object.entries(record.properties as Record<string, unknown>)) {
+        walk(child, toolName, `${path}/properties/${key}`);
+      }
+    }
+  }
+
+  it("declares no keyword outside the supported set, at any depth", async () => {
     const { TOOLS } = await import("../src/tools/index");
-    const SUPPORTED = new Set([
-      "type", "description", "enum", "pattern", "items", "properties", "required",
-      "additionalProperties",
-    ]);
     for (const tool of Object.values(TOOLS)) {
-      for (const spec of Object.values(tool.inputSchema.properties)) {
-        for (const keyword of Object.keys(spec as object)) {
-          expect(SUPPORTED.has(keyword), `${tool.name} uses ${keyword}`).toBe(true);
-        }
+      for (const [key, spec] of Object.entries(tool.inputSchema.properties)) {
+        walk(spec, tool.name, key);
       }
     }
   });

@@ -89,10 +89,15 @@ export function validateInput(toolName: string, schema: JsonSchema, input: unkno
   // undefined is absence, not a wrong value. JSON cannot express it, but a
   // client building arguments in JavaScript can, and `{query: undefined}`
   // means a call with no query.
-  const cleaned: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-    if (value !== undefined) cleaned[key] = value;
-  }
+  //
+  // Object.fromEntries defines own properties. `cleaned[key] = value` would
+  // not: a caller-sent `__proto__` key is special-cased by plain assignment
+  // to set the copy's prototype instead of becoming an own property, which
+  // both hides it from `additionalProperties: false` and lets it satisfy the
+  // `key in cleaned` check below via the prototype chain.
+  const cleaned: Record<string, unknown> = Object.fromEntries(
+    Object.entries(input as Record<string, unknown>).filter(([, value]) => value !== undefined)
+  );
 
   const result = validatorFor(toolName, schema)(cleaned);
   if (result.valid) return;
