@@ -1,6 +1,7 @@
 import type { ToolContext } from "../context";
 import { ToolError } from "../errors";
 import { assertId } from "../ids";
+import { normalizeText } from "../normalize";
 import { clampLimit, decodeCursor, encodeCursor } from "../paginate";
 import { isIsoInstant } from "../time";
 import { COLUMNS as ENCOUNTER_COLUMNS } from "./encounters_read";
@@ -29,6 +30,12 @@ type IncludeRelation = (typeof INCLUDE_RELATIONS)[number];
 // have no person_tags/person_links/person_contacts join point, so include is
 // refused there rather than silently returning nothing.
 const INCLUDE_SCOPES: readonly ListScope[] = ["people"];
+
+// Each tag is one bound parameter and one EXISTS subquery in the page
+// predicate. D1's parameter ceiling (docs/MEASUREMENTS.md) is 100; ten tags
+// plus every other filter this tool can combine stays nowhere near it, so the
+// cap is refused up front rather than left reachable from this direction.
+const MAX_TAGS = 10;
 
 /**
  * NULL PROTOTYPE, NOT A PLAIN OBJECT LITERAL, and the difference was a live
@@ -65,6 +72,7 @@ export interface ListRecordsInput {
   scope?: ListScope;
   archived?: boolean;
   updated_after?: string;
+  tags?: string[];
   limit?: number;
   cursor?: string;
   include?: string[];
@@ -126,13 +134,22 @@ function canonicalInstant(value: string): string {
  * delta filter and its keyset: it lands in this one predicate, so the main
  * page query and every relation subquery in `loadRelations` pick it up
  * automatically, with no second place to apply it.
+ *
+ * `tags`, once validated and normalized by the caller, lands here too, as one
+ * `EXISTS` clause per tag rather than a `JOIN` - a join makes row count stop
+ * meaning person count, the same defect `loadRelations`'s doc comment
+ * describes for relations. `EXISTS` per tag gives AND semantics without a
+ * `GROUP BY ... HAVING COUNT` and without binding a list of matched ids, so
+ * this stays off D1's parameter ceiling the same way every other filter here
+ * does: one bound value per filter, never one per matched person.
  */
 function buildPagePredicate(
   scope: ListScope,
   input: ListRecordsInput,
   after: { id: string; updated_at?: string } | null,
   probeLimit: number,
-  updatedAfter: string | null
+  updatedAfter: string | null,
+  tags: string[]
 ): { sql: string; binds: unknown[] } {
   // `archived` only means anything for the people scope: encounters and
   // follow-ups carry no archived_at of their own. Excluding archived people by
@@ -147,6 +164,12 @@ function buildPagePredicate(
   if (updatedAfter !== null) {
     filters.push("updated_at > ?");
     binds.push(updatedAfter);
+  }
+  for (const tag of tags) {
+    filters.push(
+      `EXISTS (SELECT 1 FROM person_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.person_id = ${scope}.id AND t.name = ?)`
+    );
+    binds.push(tag);
   }
   if (after !== null) {
     if (updatedAfter !== null) {
@@ -194,6 +217,35 @@ function validateInclude(scope: ListScope, raw: string[] | undefined): IncludeRe
     );
   }
   return [...new Set(raw)] as IncludeRelation[];
+}
+
+/**
+ * Refuses and normalizes `tags` before anything downstream sees it, the same
+ * way `validateInclude` does for `include`. Only the people scope has a
+ * person_tags join point, so `tags` is refused elsewhere rather than silently
+ * matching nothing.
+ */
+function validateTags(scope: ListScope, raw: string[] | undefined): string[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.some((r) => typeof r !== "string")) {
+    throw new ToolError("invalid_input", "tags must be an array of strings");
+  }
+  if (raw.length === 0) return [];
+  if (!INCLUDE_SCOPES.includes(scope)) {
+    throw new ToolError(
+      "invalid_input",
+      `tags is not supported for scope "${scope}"; only "people" carries tags`,
+      'call list_records again with scope: "people", or without tags'
+    );
+  }
+  if (raw.length > MAX_TAGS) {
+    throw new ToolError(
+      "limit_exceeded",
+      `tags accepts at most ${MAX_TAGS} names`,
+      `call list_records again with ${MAX_TAGS} or fewer tags`
+    );
+  }
+  return raw.map((t) => normalizeText(t));
 }
 
 /**
@@ -318,6 +370,7 @@ export async function listRecords(
   const base = QUERIES[scope];
 
   const include = validateInclude(scope, input.include);
+  const tags = validateTags(scope, input.tags);
 
   const updatedAfter = input.updated_after !== undefined ? canonicalInstant(input.updated_after) : null;
 
@@ -327,7 +380,7 @@ export async function listRecords(
 
   // One extra row over `limit` is how "is there a next page" is answered
   // without a second COUNT query.
-  const predicate = buildPagePredicate(scope, input, after, limit + 1, updatedAfter);
+  const predicate = buildPagePredicate(scope, input, after, limit + 1, updatedAfter, tags);
 
   const orderBy = updatedAfter !== null ? "updated_at ASC, id ASC" : "id ASC";
   const { results } = await ctx.db

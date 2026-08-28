@@ -11,6 +11,7 @@ import {
   updateFollowup,
 } from "./followups";
 import { finalizeImport, importRoster } from "./import";
+import { listTags } from "./list_tags";
 import {
   archivePerson,
   createPerson,
@@ -262,6 +263,10 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
               "passed straight back. Deletions are not reported: a deleted record is simply absent " +
               "from a full listing."
           ),
+          tags: strArray(
+            "People scope only. Require all of these tags (AND, not OR), matched case- and " +
+              "whitespace-insensitively. At most 10."
+          ),
           // export.ts's own MAX_LIMIT is 500, not 200 - clampLimit there throws
           // limit_exceeded above it. The description states the real ceiling
           // rather than the plan's draft figure, since a client reads this
@@ -276,6 +281,15 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         []
       ),
       listRecords
+    ),
+    define(
+      "list_tags",
+      "Every tag in use, with how many people carry it. Tags with a count of zero are included " +
+        "on purpose: seeing 'speaker' beside 'speakers' is what makes this useful. Archived " +
+        "people are not counted.",
+      READ,
+      obj({}, []),
+      listTags
     ),
 
     // --------------------------------------------------------------- writes

@@ -268,10 +268,119 @@ describe("list_records include", () => {
     ).rejects.toMatchObject({ code: "invalid_input" });
   });
 
-  // The Task 8 test covering a filter (tags) narrowing the page while include
-  // is active is deferred to Task 8, which is where the tags filter itself
-  // lands. It is not written here per the controller ruling recorded in the
-  // run ledger for this task.
+  // THE COMBINATION THE DESIGN FAILS ON, and which nothing else here covers.
+  // If the relation subquery does not carry the tag filter, the page and the
+  // relations select different people and B comes back with no contacts.
+  it("attaches relations to the right people when a filter narrows the page", async () => {
+    const a = await createPerson(ctx, { full_name: "AAA First" });
+    const b = await createPerson(ctx, { full_name: "BBB Second" });
+    await addTags(ctx, { person_id: b.id, tags: ["speaker"] });
+    await addContact(ctx, { person_id: b.id, contact_type: "email", value: "b@t.test" });
+    await addContact(ctx, { person_id: a.id, contact_type: "email", value: "a@t.test" });
+
+    const result = await listRecords(ctx, {
+      scope: "people",
+      tags: ["speaker"],
+      include: ["contacts"],
+      limit: 1,
+    });
+    expect(result.records).toHaveLength(1);
+    const record = result.records[0] as { id: string; contacts: unknown[] };
+    expect(record.id).toBe(b.id);
+    expect(record.contacts).toHaveLength(1);
+  });
+});
+
+describe("tags filter", () => {
+  // Tag names are stored lowercased through normalizeText, and add_tags and
+  // remove_tags both normalize on the way in. A literal match against
+  // "Speaker" returns a well-formed empty page: a model echoing list_tags
+  // output would be fine, a model working from a human's phrasing would not.
+  it("matches regardless of the case the caller sends", async () => {
+    const p = await createPerson(ctx, { full_name: "Ada" });
+    await addTags(ctx, { person_id: p.id, tags: ["speaker"] });
+    const result = await listRecords(ctx, { scope: "people", tags: ["Speaker"] });
+    expect(result.records.map((r) => (r as { id: string }).id)).toContain(p.id);
+  });
+
+  it("requires all tags, not any of them", async () => {
+    const both = await createPerson(ctx, { full_name: "Both" });
+    const one = await createPerson(ctx, { full_name: "One" });
+    await addTags(ctx, { person_id: both.id, tags: ["speaker", "sponsor"] });
+    await addTags(ctx, { person_id: one.id, tags: ["speaker"] });
+    const result = await listRecords(ctx, { scope: "people", tags: ["speaker", "sponsor"] });
+    const ids = result.records.map((r) => (r as { id: string }).id);
+    expect(ids).toContain(both.id);
+    expect(ids).not.toContain(one.id);
+  });
+
+  it("refuses tags on scopes that have none", async () => {
+    await expect(
+      listRecords(ctx, { scope: "encounters", tags: ["speaker"] })
+    ).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("refuses more than 10 tags", async () => {
+    const p = await createPerson(ctx, { full_name: "Ada" });
+    await addTags(ctx, { person_id: p.id, tags: ["t"] });
+    const tags = Array.from({ length: 11 }, (_, i) => `t${i}`);
+    await expect(listRecords(ctx, { scope: "people", tags })).rejects.toMatchObject({
+      code: "limit_exceeded",
+    });
+  });
+
+  // The plan's four-agent review found nothing combining include, tags,
+  // updated_after, and a cursor together, "which is precisely where the
+  // design failed": each filter alone reaches the shared page predicate, but
+  // only a test exercising all of them together catches one that was wired
+  // to the main page query and forgotten on a relation subquery, or a keyset
+  // that drops or repeats a person once a tag filter is layered on top of a
+  // delta watermark.
+  it("combines include, tags, updated_after, and a cursor without repeating or dropping a person", async () => {
+    const watermark = clock.now().toISOString();
+    clock.advance(60_000);
+
+    const matching: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const p = await createPerson(ctx, { full_name: `Speaker ${i}` });
+      await addTags(ctx, { person_id: p.id, tags: ["speaker"] });
+      await addContact(ctx, { person_id: p.id, contact_type: "email", value: `s${i}@t.test` });
+      matching.push(p.id);
+    }
+    // A distractor updated after the watermark but without the tag, and one
+    // with the tag but updated before the watermark - neither belongs in
+    // any page.
+    const untagged = await createPerson(ctx, { full_name: "Untagged" });
+    await addContact(ctx, { person_id: untagged.id, contact_type: "email", value: "u@t.test" });
+    clock.advance(-120_000);
+    const stale = await createPerson(ctx, { full_name: "Stale" });
+    await addTags(ctx, { person_id: stale.id, tags: ["speaker"] });
+    clock.advance(120_000);
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page = await listRecords(ctx, {
+        scope: "people",
+        tags: ["speaker"],
+        include: ["contacts"],
+        updated_after: watermark,
+        limit: 2,
+        cursor,
+      });
+      for (const record of page.records as { id: string; contacts: unknown[] }[]) {
+        expect(record.contacts).toHaveLength(1);
+      }
+      seen.push(...page.records.map((r) => (r as { id: string }).id));
+      cursor = page.next_cursor ?? undefined;
+      pages++;
+      if (pages > 10) throw new Error("list_records did not terminate");
+    } while (cursor !== undefined);
+
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.sort()).toEqual([...matching].sort());
+  });
 });
 
 describe("updated_after", () => {
