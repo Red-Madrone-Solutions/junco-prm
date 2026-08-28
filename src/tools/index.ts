@@ -11,6 +11,7 @@ import {
   updateFollowup,
 } from "./followups";
 import { finalizeImport, importRoster } from "./import";
+import { listRosterEntries } from "./list_roster";
 import { listTags } from "./list_tags";
 import {
   archivePerson,
@@ -184,6 +185,27 @@ export const TOOLS: Record<string, ToolDefinition> = Object.assign(
         ["query"]
       ),
       searchRosterEntries
+    ),
+    define(
+      "list_roster_entries",
+      "Staged roster entries by filter rather than by text: source, role, organization, and " +
+        "whether each has been promoted. promoted: false is the working queue of people not yet " +
+        "recorded. role and organization match exactly, including case, because roster rows are " +
+        "stored as imported. Returns external_row_key, which can contain an email address when " +
+        "the import supplied no source id. For text search, use search_roster_entries.",
+      READ,
+      obj(
+        {
+          source_key: str("Limit to one roster source."),
+          role: str("Exact role as imported, for example \"speaker\"."),
+          organization: str("Exact organization as imported."),
+          promoted: bool("True for entries already promoted, false for those not yet promoted."),
+          limit: int("Page size, 1 to 50. Defaults to 20."),
+          cursor: str("Page token from a previous next_cursor."),
+        },
+        []
+      ),
+      listRosterEntries
     ),
     define(
       "get_person",

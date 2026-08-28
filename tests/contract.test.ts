@@ -12,13 +12,14 @@ const ctx: ToolContext = {
 };
 
 /**
- * All 31, sorted. The spec counts its own surface and so does this list: the
+ * All 32, sorted. The spec counts its own surface and so does this list: the
  * previous draft's registry had 26, carrying `set_tags` where the spec has
  * `add_tags` and `remove_tags`, and no `get_roster_entry` at all. Task 1 of
  * the read-surface plan added `update_followup`, bringing the count from 28
  * to 29. Task 4 split `search_people` into `search_people` and
  * `search_roster_entries`, bringing the count to 30. Task 8 added `list_tags`,
- * bringing the count to 31.
+ * bringing the count to 31. Task 9 added `list_roster_entries`, bringing the
+ * count to 32.
  */
 const EXPECTED = [
   "add_contact",
@@ -38,6 +39,7 @@ const EXPECTED = [
   "list_due",
   "list_encounters",
   "list_records",
+  "list_roster_entries",
   "list_roster_sources",
   "list_tags",
   "log_encounter",
@@ -59,8 +61,8 @@ describe("tool registry", () => {
     expect(Object.keys(TOOLS).sort()).toEqual(EXPECTED);
   });
 
-  it("has 31 of them, after task 8's list_tags", () => {
-    expect(Object.keys(TOOLS)).toHaveLength(31);
+  it("has 32 of them, after task 9's list_roster_entries", () => {
+    expect(Object.keys(TOOLS)).toHaveLength(32);
   });
 
   it("carries no tool name the fifth spec revision renamed away", () => {
@@ -137,6 +139,7 @@ describe("tool registry", () => {
       "list_due",
       "list_encounters",
       "list_records",
+      "list_roster_entries",
       "list_roster_sources",
       "list_tags",
       "search_people",
