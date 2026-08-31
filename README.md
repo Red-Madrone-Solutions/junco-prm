@@ -78,6 +78,14 @@ A contact's name never does; remove the name from the file instead.
 The commit hook warns and allows when no backup archive exists locally. The push
 hook refuses, because a push is the point at which a mistake becomes public.
 
+A git hook is only as good as the absence of `--no-verify`, so
+`scripts/deny-verify-bypass.mjs` runs as a Claude Code `PreToolUse` hook and
+refuses any shell command that would skip these hooks - including
+`git commit -m "x" --no-verify`, where the flag trails the command and a
+prefix-matching permission rule never sees it. It reads the whole command,
+each half of a compound one included, and treats `git push -n` as the dry run
+it is rather than a bypass. Wire it up in `.claude/settings.local.json`.
+
 ## How it is built
 
 | Piece | What it uses |
