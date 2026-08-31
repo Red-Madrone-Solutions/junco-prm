@@ -582,3 +582,73 @@ nothing about planner choice - the index simply is not present to be chosen.
 database is a question for the next measurement run. The filter is correct
 without the index (it scans instead of seeks); the index is for speed, not
 correctness, per the migration's own comments.
+
+---
+
+## Run of 2026-08-31: the read surface deployed and exercised
+
+Plan 3's Task 10. The read-surface work went live and was verified against the
+real roster through a Claude MCP client, not `curl`.
+
+Deployed version `e06b75b1-1f53-47c3-9b81-ce7cea9f2410`, rollback target
+`fbbc1e29-b09c-4247-8fa6-21558cabb85d`. A fresh archive was taken first
+(`junco-backup-2026-08-31T17-23.json.bz2`, 126,158 bytes). Migration 0009
+applied to the remote database about a minute before the deploy, so the window
+in which a pre-migration idempotency key could re-execute was roughly that long.
+
+**Verification could not run from the session that deployed.** A Claude Code
+session fetches an MCP server's tool list once at start, so the deploying
+session still resolved `export_data` and could not see `list_records`. A
+subagent inherits that same list. The checks below were run from a separately
+spawned agent process, which performed its own MCP handshake and saw all 32
+tools. Worth knowing for every future deploy of this server.
+
+### What was exercised
+
+| Check | Result |
+|---|---|
+| Tool list is 32, `export_data` absent | Pass |
+| `list_tags` returns the real vocabulary | Pass, 19 tags |
+| `search_roster_entries` cursor advances | Pass, no overlap between pages |
+| `person_name` inline on `list_encounters` | Pass, 5 of 5 populated |
+| `updated_after` sees a tag write | Pass |
+| `include` relations, counts unchanged | Pass, 65 people both ways |
+
+The `updated_after` check is the one that matters. A tag was added to one
+person, `list_records(scope: "people", updated_after: <five minutes earlier>)`
+returned exactly that person, and the tag was then removed leaving their prior
+tags intact. Before this deploy the relation writers did not move
+`people.updated_at`, so that query would have returned nothing and reported no
+error. This is the live proof of Task 2.
+
+`include` was checked for count parity rather than trusted: 65 people with
+relations inline and 65 without, with identical id ordering, so the relation
+subqueries do not drop or duplicate rows across a page boundary.
+
+### The tag vocabulary was reviewed, and is deliberately not recorded here
+
+`list_tags` was called and the full vocabulary read. No near-duplicates of the
+kind worth merging: no singular/plural pair, no case variant, no hyphenation
+variant. Three tags exist that carry no people, so that part of the vocabulary
+is defined but unused, and one event tag covers close to half the roster, which
+is worth remembering before treating tag counts as a measure of anything other
+than one event.
+
+**The tags themselves are not written down here, and should not be.** This
+repository is public. Tag names on a real roster are personal information about
+the people in it: they carry client and vendor relationships, organizational
+affiliations, conference attendance, and geography. The plan for this task asked
+for the vocabulary to be recorded, which was the right instinct for a private
+working note and the wrong one for a published file. Read it live with
+`list_tags` when it is needed.
+
+### Two things this run did NOT establish
+
+The paging check used the query `"Mark"`, which matched the substring inside
+`"Marketing"` in job titles rather than anyone named Mark. Paging is proven;
+name matching specifically is not, and was not the point of the check.
+
+Two `list_records` calls carrying `include` were refused by the verifying
+client's own permission classifier, not by the Worker. The same calls succeeded
+at a smaller `limit`, which points at response size on the client side. No
+conclusion about the server should be drawn from those two refusals.
