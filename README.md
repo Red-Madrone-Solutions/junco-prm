@@ -10,7 +10,7 @@ Modern LLMs are great at interpreting what we say into action. Junco builds on t
 
 You describe what happened and the LLM works with Junco to record it.
 
-> "I met Julia Golomb at WordCamp. She's an event manager and her Vistara event looks great. Remind me to signup for it."
+> "I met Hedy Lamarr at WordCamp. She's an event manager and her Frequency Summit event looks great. Remind me to signup for it."
 
 > "Who do I know at Kinsta?"
 
