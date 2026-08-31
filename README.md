@@ -84,7 +84,12 @@ refuses any shell command that would skip these hooks - including
 `git commit -m "x" --no-verify`, where the flag trails the command and a
 prefix-matching permission rule never sees it. It reads the whole command,
 each half of a compound one included, and treats `git push -n` as the dry run
-it is rather than a bypass. Wire it up in `.claude/settings.local.json`.
+it is rather than a bypass. It is wired up in `.claude/settings.json`, which is
+committed, so it arrives with a clone rather than having to be rebuilt on each
+machine.
+
+`docs/DEVELOPER.md` covers setup, the everyday commands, and what to do when the
+check blocks you.
 
 ## How it is built
 
