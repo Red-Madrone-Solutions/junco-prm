@@ -1,0 +1,19 @@
+#!/bin/sh
+# Blocks live PRM personal data from becoming public. This is the real gate:
+# a commit is local and reversible, a push is neither.
+#
+# git feeds one line per ref on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>
+ZERO=$(git hash-object -t tree /dev/null | tr '0-9a-f' '0')
+status=0
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$ZERO" ] && continue   # branch deletion, nothing to scan
+  if [ "$remote_sha" = "$ZERO" ]; then
+    base=$(git merge-base origin/main "$local_sha" 2>/dev/null) || base=""
+    [ -n "$base" ] || base=$(git hash-object -t tree /dev/null)
+    range="$base..$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+  node scripts/check-private-data.mjs --range "$range" --require-backup || status=1
+done
+exit $status

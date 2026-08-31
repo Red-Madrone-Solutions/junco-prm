@@ -57,6 +57,27 @@ If you want, when the event is over, you can delete the staged list. The people 
 **Where do you get a list like that?** It varies more than you would want. Some communities publish full attendee lists, and WordPress is one of them, which is where this feature came from. More often the public part is the speaker list, the sponsors and exhibitors, or the session lineup, and any of those is worth loading on its own. Many conference apps have an attendee directory. Failing all of it, a list you type yourself of the twenty people you are hoping to find works exactly the same way. Junco does not care where the rows came from.
 
 
+## Keeping real data out of this repository
+
+This repository is public; the database it manages is not. `.githooks/pre-commit`
+and `.githooks/pre-push` refuse any added line containing live personal data -
+a contact's full name, an email address, an organization, a tag slug - matched
+against the newest local `junco-backup-*.json.bz2`, which is gitignored. Nothing
+sensitive is stored to run the check.
+
+Enable them once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Only added lines are scanned, so existing content never trips the check. A term
+that is genuinely legitimate here goes in `.githooks/allowlist.txt` with a reason.
+A contact's name never does; remove the name from the file instead.
+
+The commit hook warns and allows when no backup archive exists locally. The push
+hook refuses, because a push is the point at which a mistake becomes public.
+
 ## How it is built
 
 | Piece | What it uses |

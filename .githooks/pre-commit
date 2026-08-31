@@ -1,0 +1,5 @@
+#!/bin/sh
+# Blocks live PRM personal data from entering history. See
+# scripts/check-private-data.mjs. Warns but allows when no backup archive
+# exists locally; pre-push refuses in that case.
+exec node scripts/check-private-data.mjs

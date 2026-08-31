@@ -1611,7 +1611,11 @@ Not `curl`. Through Claude, against the live instance holding the real WCUS rost
 
 - [ ] **Step 5: Record it**
 
-In `docs/MEASUREMENTS.md`: the date, the version id, the migration, that every check above passed, and anything surprising. Record the `list_tags` output too; the tag vocabulary of a real roster is worth having written down.
+In `docs/MEASUREMENTS.md`: the date, the version id, the migration, that every check above passed, and anything surprising.
+
+**Do NOT record the `list_tags` output.** An earlier revision of this step asked for it, on the reasoning that a real roster's tag vocabulary is worth having written down. That is true of a private note and false here: this repository is public, and tag names on a real roster carry client and vendor relationships, organizational affiliations, event attendance, and geography. Record findings about the vocabulary - near-duplicates, unused tags, a tag covering most of the roster - and leave the names themselves out. Read them live with `list_tags` when they are needed.
+
+Corrected 2026-08-31, after following the original wording put the real vocabulary into `docs/MEASUREMENTS.md`. It was caught before the push and removed. `.githooks/pre-commit` now blocks a repeat.
 
 - [ ] **Step 6: If anything fails**
 

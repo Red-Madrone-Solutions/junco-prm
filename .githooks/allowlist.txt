@@ -1,0 +1,29 @@
+# Terms the private-data check must not block.
+#
+# Each entry is a value that really is in the PRM database but is also
+# legitimate content in this repository. Add a term ONLY with a reason.
+# Never add a contact's name here to silence a warning - remove the name
+# from the file instead.
+#
+# Seeded 2026-08-31 by scanning everything already committed.
+
+# Matt's own identity, deliberately published in LICENSE and package.json.
+matt vanderpol
+matt@redmadronesolutions.com
+
+# Generic job titles and roles that are also ordinary English. These are real
+# `job_title` values on the roster, and each is a word this codebase uses in
+# its own right.
+independent
+personal
+operations
+engineer
+developer
+designer
+marketing
+website owner
+
+# A real organization on the roster, and also the fictional employer used in
+# test fixtures ("Jane Roe at Automattic"). The company name alone identifies
+# no one.
+automattic
