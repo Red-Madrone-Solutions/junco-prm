@@ -105,6 +105,28 @@ This layer constrains Claude Code only. It does nothing about the same flag
 typed into your own terminal - the git hooks are the layer that catches
 everyone.
 
+## Tests use invented people, always
+
+Every person, organization, and email in a test or fixture is made up. Never a
+real contact, not even one whose name seems harmless, and not as a convenience
+when a realistic name is close to hand.
+
+The suite already has a convention worth staying inside: computing pioneers for
+people (`Ada Lovelace`, `Grace Hopper`, `Hedy Lamarr`), placeholder names where
+a generic one reads better (`Jane Roe`, `Chris Smith`), and `example.test`
+addresses for email. `tests/fixtures/roster.csv` is invented end to end.
+
+The reason is that a test fixture is published the moment it is committed, and
+it is the least likely place anyone thinks to look for personal data. On
+2026-08-31 a real contact's name was used as a fixture in
+`tests/encounters.test.ts`. It reached neither the remote nor a reviewer, but
+only because a check caught it before the push; nothing about writing or
+reviewing the test would have.
+
+The private-data hook enforces this against the live database, so a real
+contact's name will be refused. Do not rely on that alone - it can only match
+names that are already stored.
+
 ## Everyday commands
 
 | Command | What it does |
